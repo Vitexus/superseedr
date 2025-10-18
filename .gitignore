@@ -1,0 +1,6 @@
+/target
+/temp
+/src/temp
+
+.DS_Store
+*.mkv

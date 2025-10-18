@@ -80,4 +80,5 @@ Selective Downloading: Now that multi-file support is implemented, the next majo
 GNU GENERAL PUBLIC LICENSE
 Version 3, 29 June 2007
 
-Copyright (C) 2025 Jaga Tranvo <jagatranvo@gmail.com>
+Copyright (C) 2025 The superseedr Contributors
+
