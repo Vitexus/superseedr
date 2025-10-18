@@ -405,14 +405,12 @@ impl TorrentManager {
                         let _ = peer_tx.send(TorrentCommand::PeerUnchoke).await;
                     });
                 }
-            } else {
-                if peer.am_choking == ChokeStatus::Unchoke {
-                    peer.am_choking = ChokeStatus::Choke;
-                    let peer_tx = peer.peer_tx.clone();
-                    tokio::spawn(async move {
-                        let _ = peer_tx.send(TorrentCommand::PeerChoke).await;
-                    });
-                }
+            } else if peer.am_choking == ChokeStatus::Unchoke {
+                peer.am_choking = ChokeStatus::Choke;
+                let peer_tx = peer.peer_tx.clone();
+                tokio::spawn(async move {
+                    let _ = peer_tx.send(TorrentCommand::PeerChoke).await;
+                });
             }
         }
 

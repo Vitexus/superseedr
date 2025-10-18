@@ -33,6 +33,7 @@ use tracing_appender::rolling;
 
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::stdout;
+use std::env;
 
 use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
 
@@ -62,23 +63,22 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if let Err(e) = fs::create_dir_all("./temp/logs/") {
-        eprintln!("Failed to create log directory: {}", e);
-    }
-    let general_log = rolling::never("./temp/logs", "app.log");
-    let error_log = rolling::never("./temp/logs", "errors.log");
+    let base_data_dir = config::get_app_paths()
+        .map(|(_, data_dir)| data_dir)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let log_dir = base_data_dir.join("logs");
+    let general_log = rolling::never(&log_dir, "app.log");
     let (non_blocking_general, _guard_general) = tracing_appender::non_blocking(general_log);
-    let (non_blocking_error, _guard_error) = tracing_appender::non_blocking(error_log);
-    let general_layer = fmt::layer()
-        .with_writer(non_blocking_general)
-        .with_filter(LevelFilter::INFO);
-    let error_layer = fmt::layer()
-        .with_writer(non_blocking_error)
-        .with_filter(LevelFilter::WARN);
-    tracing_subscriber::registry()
-        .with(general_layer)
-        .with(error_layer)
-        .init();
+    let _subscriber_result = {
+        if fs::create_dir_all(&log_dir).is_ok() {
+            let general_layer = fmt::layer()
+                .with_writer(non_blocking_general)
+                .with_filter(LevelFilter::INFO);
+            tracing_subscriber::registry().with(general_layer).try_init()
+        } else {
+            tracing_subscriber::registry().try_init()
+        }
+    };
 
     if let Err(e) = config::create_watch_directories() {
         eprintln!(
@@ -176,12 +176,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+
 fn get_lock_path() -> Option<PathBuf> {
-    if let Some((_, data_dir)) = config::get_app_paths() {
-        Some(data_dir.join("superseedr.lock"))
-    } else {
-        None
-    }
+    let base_data_dir = config::get_app_paths()
+        .map(|(_, data_dir)| data_dir)
+        .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    Some(base_data_dir.join("superseedr.lock"))
 }
 
 fn cleanup_terminal() -> Result<(), Box<dyn std::error::Error>> {
