@@ -481,6 +481,7 @@ impl PeerSession {
                         Ok(Message::KeepAlive) => {
                             event!(Level::TRACE, "PEER KEEP SENT KEEP ALIVE.");
                         }
+                        Ok(Message::Port(_)) => {}
                         Err(e) => {
                             break 'session Err(e.into());
                         }

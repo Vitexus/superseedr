@@ -702,7 +702,7 @@ impl App {
                         let _permit = match resource_manager_clone.acquire_peer_connection().await {
                             Ok(p) => p,
                             Err(_) => {
-                                tracing_event!(Level::WARN, "Connection limit reached. Rejecting incoming peer.");
+                                tracing_event!(Level::DEBUG, "Connection limit reached. Rejecting incoming peer.");
                                 return;
                             }
                         };
