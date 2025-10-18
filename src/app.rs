@@ -1189,7 +1189,7 @@ impl App {
         }
 
         // --- Run Shutdown UI for a Fixed Duration (e.g., 1 second) ---
-        let hard_limit_timeout = Duration::from_secs(2); // e.g., 5 seconds total max shutdown time
+        let hard_limit_timeout = Duration::from_secs(1); // e.g., 5 seconds total max shutdown time
         let shutdown_ui_future = self.run_shutdown_ui(terminal, hard_limit_timeout); // Pass duration
                                                                                      // --- Apply the HARD LIMIT TIMEOUT ---
         match tokio::time::timeout(hard_limit_timeout, shutdown_ui_future).await {

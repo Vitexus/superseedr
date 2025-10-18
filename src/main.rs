@@ -136,10 +136,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let lock_path =
-        get_lock_path().expect("Could not determine application data directory for lock file.");
-    let lock_file = File::create(&lock_path)?;
-    if lock_file.try_lock_exclusive().is_ok() {
+    let mut proceed_to_app = true;
+    let mut lock_file_handle: Option<File> = None;
+    
+    if let Some(lock_path) = get_lock_path() {
+        if let Ok(file) = File::create(&lock_path) {
+            if file.try_lock_exclusive().is_ok() {
+                lock_file_handle = Some(file); 
+            } else {
+                proceed_to_app = false;
+            }
+        }
+    }
+    if proceed_to_app {
         let mut client_configs = load_settings();
 
         if client_configs.client_id.is_empty() {
