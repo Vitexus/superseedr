@@ -137,12 +137,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let mut proceed_to_app = true;
-    let mut lock_file_handle: Option<File> = None;
+    let mut _lock_file_handle: Option<File> = None;
     
     if let Some(lock_path) = get_lock_path() {
         if let Ok(file) = File::create(&lock_path) {
             if file.try_lock_exclusive().is_ok() {
-                lock_file_handle = Some(file); 
+                _lock_file_handle = Some(file); 
             } else {
                 proceed_to_app = false;
             }
