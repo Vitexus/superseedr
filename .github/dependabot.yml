@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Monitor the Rust/Cargo ecosystem
+  - package-ecosystem: "cargo" 
+    # Dependabot looks for Cargo.toml in the root directory
+    directory: "/" 
+    schedule:
+      # Check for updates once per week
+      interval: "weekly" 
+      # Optional: Set a specific day to run updates
+      day: "monday" 
+    
+    # BEST PRACTICE: Limit open pull requests to prevent spam
+    open-pull-requests-limit: 5 
+    
+    # Optional: Group minor/patch updates into a single PR for less noise
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Optional: Also monitor GitHub Actions (if you use them)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
