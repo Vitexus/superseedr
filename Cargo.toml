@@ -23,7 +23,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_bencode = "0.2"
 serde_bytes = "0.11"
 magnet-url = "3.0.0"
-mainline = "5.4.0"
+mainline = "6.0.0"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
 data-encoding = "2.9.0"
 bendy = { version = "0.4.0", features = ["serde"] }
