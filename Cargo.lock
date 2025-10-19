@@ -2833,6 +2833,7 @@ dependencies = [
  "strum 0.27.2",
  "strum_macros 0.26.4",
  "sysinfo",
+ "tempfile",
  "thiserror 1.0.65",
  "tokio",
  "tokio-stream",
