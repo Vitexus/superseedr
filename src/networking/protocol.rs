@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::consume_tokens;
-use crate::app::TokenBucket;
+
+use crate::token_bucket::TokenBucket;
+use crate::token_bucket::consume_tokens;
 
 use tokio::sync::Mutex;
 

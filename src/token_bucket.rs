@@ -89,3 +89,229 @@ pub async fn consume_tokens(bucket_arc: &Arc<Mutex<TokenBucket>>, amount_bytes: 
         tokio::time::sleep(wait_time).await;
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{sleep, Instant};
+
+    // --- TokenBucket struct tests ---
+
+    #[test]
+    fn test_token_bucket_new() {
+        let bucket = TokenBucket::new(100.0, 10.0);
+        assert_eq!(bucket.capacity, 100.0);
+        assert_eq!(bucket.fill_rate, 10.0);
+        assert_eq!(bucket.get_tokens(), 100.0); // Starts full
+    }
+
+    #[test]
+    fn test_token_bucket_consume_success() {
+        let mut bucket = TokenBucket::new(100.0, 10.0);
+        
+        assert!(bucket.consume(50.0));
+        assert_eq!(bucket.get_tokens(), 50.0);
+        
+        assert!(bucket.consume(50.0));
+        assert_eq!(bucket.get_tokens(), 0.0);
+    }
+
+    #[test]
+    fn test_token_bucket_consume_fail() {
+        let mut bucket = TokenBucket::new(100.0, 10.0);
+
+        // Try to consume more than capacity
+        assert!(!bucket.consume(101.0));
+        assert_eq!(bucket.get_tokens(), 100.0); // Tokens unchanged
+
+        // Consume some, then try to consume more than remaining
+        assert!(bucket.consume(60.0));
+        assert_eq!(bucket.get_tokens(), 40.0);
+        assert!(!bucket.consume(41.0));
+        assert_eq!(bucket.get_tokens(), 40.0); // Tokens unchanged
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_refill() {
+        let mut bucket = TokenBucket::new(100.0, 10.0); // 10 tokens/sec
+        
+        // Empty the bucket
+        assert!(bucket.consume(100.0));
+        assert_eq!(bucket.get_tokens(), 0.0);
+        
+        // Wait for 2 seconds
+        sleep(Duration::from_secs(2)).await;
+        
+        // Refill happens inside consume. 
+        // Should have refilled 2 * 10.0 = 20.0 tokens
+        assert!(bucket.consume(15.0));
+        assert_eq!(bucket.get_tokens(), 5.0); // 20.0 - 15.0 = 5.0
+    }
+
+    #[tokio::test]
+    async fn test_token_bucket_refill_capacity_clamp() {
+        let mut bucket = TokenBucket::new(100.0, 10.0); // 10 tokens/sec
+        
+        // Consume some
+        assert!(bucket.consume(50.0));
+        assert_eq!(bucket.get_tokens(), 50.0);
+        
+        // Wait for 10 seconds (which would generate 10 * 10.0 = 100.0 tokens)
+        sleep(Duration::from_secs(10)).await;
+        
+        // Manually refill
+        bucket.refill();
+        
+        // Tokens should be clamped at capacity (50.0 + 100.0 = 150.0, clamped to 100.0)
+        assert_eq!(bucket.get_tokens(), 100.0);
+    }
+
+    #[test]
+    fn test_token_bucket_set_rate() {
+        let mut bucket = TokenBucket::new(100.0, 10.0);
+        assert!(bucket.consume(50.0));
+        assert_eq!(bucket.get_tokens(), 50.0);
+        
+        // Set new rate
+        bucket.set_rate(200.0);
+        
+        // Check that rate, capacity, and tokens are all reset
+        assert_eq!(bucket.fill_rate, 200.0);
+        assert_eq!(bucket.capacity, 200.0);
+        assert_eq!(bucket.get_tokens(), 200.0); // Resets to full
+    }
+
+    // --- consume_tokens async function tests ---
+
+    #[tokio::test]
+    async fn test_consume_tokens_unlimited() {
+        let bucket = Arc::new(Mutex::new(TokenBucket::new(100.0, 0.0))); // 0.0 rate = unlimited
+        let start = Instant::now();
+        
+        consume_tokens(&bucket, 1_000_000.0).await;
+        
+        let elapsed = start.elapsed();
+        // Should return immediately
+        assert!(elapsed < Duration::from_millis(10));
+        
+        // Tokens are unchanged because the function returns early
+        assert_eq!(bucket.lock().await.get_tokens(), 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_consume_tokens_immediate_success() {
+        let bucket = Arc::new(Mutex::new(TokenBucket::new(1000.0, 100.0)));
+        
+        consume_tokens(&bucket, 500.0).await;
+        
+        // Tokens should be consumed
+        assert_eq!(bucket.lock().await.get_tokens(), 500.0);
+    }
+
+    #[tokio::test]
+    async fn test_consume_tokens_waits_for_refill() {
+        // Rate = 1000.0 "bps"
+        // Capacity = 1000.0 "tokens"
+        let bucket = Arc::new(Mutex::new(TokenBucket::new(1000.0, 1000.0)));
+
+        // Empty the bucket
+        bucket.lock().await.consume(1000.0);
+        assert_eq!(bucket.lock().await.get_tokens(), 0.0);
+        
+        let start = Instant::now();
+        
+        // Request 500.0 "bytes"
+        // Tokens needed = 500.0
+        // Wait time = (tokens_needed * 8.0) / rate_bps 
+        //           = (500.0 * 8.0) / 1000.0 = 4.0 seconds
+        consume_tokens(&bucket, 500.0).await;
+        
+        let elapsed = start.elapsed();
+        
+        // Check that it slept for ~4 seconds
+        assert!(elapsed >= Duration::from_secs_f64(4.0));
+        assert!(elapsed < Duration::from_secs_f64(4.1)); // Add 100ms buffer for scheduling
+
+        // After 4s, refill adds: 4.0 * 1000.0 = 4000.0 tokens
+        // Clamped to capacity: 1000.0 tokens
+        // Consumed 500.0 tokens
+        // Remaining: 1000.0 - 500.0 = 500.0
+        assert_eq!(bucket.lock().await.get_tokens(), 500.0);
+    }
+
+    #[tokio::test]
+    async fn test_consume_tokens_large_request() {
+        // Rate = 1000.0 "bps"
+        // Capacity = 100.0 "tokens"
+        let bucket = Arc::new(Mutex::new(TokenBucket::new(100.0, 1000.0)));
+        let initial_tokens = bucket.lock().await.get_tokens();
+        
+        assert_eq!(initial_tokens, 100.0);
+
+        let start = Instant::now();
+        
+        // Request 500.0 "bytes", which is > capacity (100.0)
+        // This should trigger the special "large request" branch
+        // Required duration = (amount_bytes * 8.0) / rate_bps
+        //                 = (500.0 * 8.0) / 1000.0 = 4.0 seconds
+        consume_tokens(&bucket, 500.0).await;
+        
+        let elapsed = start.elapsed();
+
+        // Check that it slept for ~4 seconds
+        assert!(elapsed >= Duration::from_secs_f64(4.0));
+        assert!(elapsed < Duration::from_secs_f64(4.1));
+
+        // This branch *only sleeps* and does not consume tokens
+        // The bucket *will* have refilled in this time, but we just check
+        // that no tokens were *consumed*. The refill logic is tested separately.
+        // We'll call refill manually to check the state.
+        let mut bucket_locked = bucket.lock().await;
+        bucket_locked.refill();
+        // It started at 100.0, slept for 4s (refilling 4000.0), so it should be full.
+        assert_eq!(bucket_locked.get_tokens(), 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_consume_tokens_multiple_consumers() {
+        // Rate = 1000.0, Capacity = 1000.0
+        let bucket = Arc::new(Mutex::new(TokenBucket::new(1000.0, 1000.0)));
+        
+        // Empty the bucket
+        bucket.lock().await.consume(1000.0);
+        assert_eq!(bucket.lock().await.get_tokens(), 0.0);
+
+        let bucket_1 = Arc::clone(&bucket);
+        let bucket_2 = Arc::clone(&bucket);
+        
+        let start = Instant::now();
+
+        // Task 1: request 500.0. Needs (500*8)/1000 = 4.0s
+        let task_1 = tokio::spawn(async move {
+            consume_tokens(&bucket_1, 500.0).await;
+        });
+
+        // Task 2: request 1000.0. Needs (1000*8)/1000 = 8.0s
+        let task_2 = tokio::spawn(async move {
+            consume_tokens(&bucket_2, 1000.0).await;
+        });
+        
+        // Wait for both to complete
+        let (res1, res2) = tokio::join!(task_1, task_2);
+        assert!(res1.is_ok());
+        assert!(res2.is_ok());
+        
+        let elapsed = start.elapsed();
+
+        // The whole process should take ~8 seconds, as T2 needs to wait the longest
+        assert!(elapsed >= Duration::from_secs_f64(8.0));
+        assert!(elapsed < Duration::from_secs_f64(8.2)); // 200ms buffer
+
+        // Check final state:
+        // t=4.0: T1 wakes, locks. Bucket refills to 1000. T1 consumes 500. Tokens = 500.
+        // t=8.0: T2 wakes, locks. Bucket refills (4s elapsed) -> 500 + 4000 = 4500. Clamped to 1000.
+        //        T2 consumes 1000. Tokens = 0.
+        assert_eq!(bucket.lock().await.get_tokens(), 0.0);
+    }
+}

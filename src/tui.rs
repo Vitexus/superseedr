@@ -1367,15 +1367,6 @@ fn draw_config_screen(
     for (i, item) in items.iter().enumerate() {
         let (name_str, value_str) = match item {
             ConfigItem::ClientPort => ("Listen Port", settings.client_port.to_string()),
-            ConfigItem::UploadSlots => ("Upload Slots", settings.upload_slots.to_string()),
-            ConfigItem::PeerUploadInFlightLimit => (
-                "Requests per Peer",
-                settings.peer_upload_in_flight_limit.to_string(),
-            ),
-            ConfigItem::MaxConcurrentValidations => (
-                "Max Piece Validations",
-                settings.max_concurrent_validations.to_string(),
-            ),
             ConfigItem::DefaultDownloadFolder => (
                 "Default Download Folder",
                 path_to_string(settings.default_download_folder.as_deref()),

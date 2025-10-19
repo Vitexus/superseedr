@@ -46,9 +46,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                         KeyCode::Char('c') => {
                             let items = vec![
                                 ConfigItem::ClientPort,
-                                ConfigItem::UploadSlots,
-                                ConfigItem::PeerUploadInFlightLimit,
-                                ConfigItem::MaxConcurrentValidations,
                                 ConfigItem::DefaultDownloadFolder,
                                 ConfigItem::WatchFolder,
                                 ConfigItem::GlobalDownloadLimit,
@@ -344,7 +341,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                         ),
                                     }
                                 }
-                                _ => {}
                             }
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
@@ -359,13 +355,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                             let item = items[*selected_index];
                             let increment = 10_000 * 8;
                             match item {
-                                ConfigItem::UploadSlots => settings_edit.upload_slots += 1,
-                                ConfigItem::PeerUploadInFlightLimit => {
-                                    settings_edit.peer_upload_in_flight_limit += 1
-                                }
-                                ConfigItem::MaxConcurrentValidations => {
-                                    settings_edit.max_concurrent_validations += 1
-                                }
                                 ConfigItem::GlobalDownloadLimit => {
                                     let new_rate = settings_edit
                                         .global_download_limit_bps
@@ -394,22 +383,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                             let decrement = 10_000 * 8;
                             match item {
                                 ConfigItem::ClientPort => {}
-                                ConfigItem::UploadSlots => {
-                                    settings_edit.upload_slots =
-                                        settings_edit.upload_slots.saturating_sub(1).max(1)
-                                }
-                                ConfigItem::PeerUploadInFlightLimit => {
-                                    settings_edit.peer_upload_in_flight_limit = settings_edit
-                                        .peer_upload_in_flight_limit
-                                        .saturating_sub(1)
-                                        .max(1)
-                                }
-                                ConfigItem::MaxConcurrentValidations => {
-                                    settings_edit.max_concurrent_validations = settings_edit
-                                        .max_concurrent_validations
-                                        .saturating_sub(1)
-                                        .max(1)
-                                }
                                 ConfigItem::GlobalDownloadLimit => {
                                     let new_rate = settings_edit
                                         .global_download_limit_bps
@@ -447,9 +420,6 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                 let items = || {
                     vec![
                         ConfigItem::ClientPort,
-                        ConfigItem::UploadSlots,
-                        ConfigItem::PeerUploadInFlightLimit,
-                        ConfigItem::MaxConcurrentValidations,
                         ConfigItem::DefaultDownloadFolder,
                         ConfigItem::WatchFolder,
                     ]
