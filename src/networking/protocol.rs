@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::consume_tokens;
-use crate::app::TokenBucket;
+
+use crate::token_bucket::TokenBucket;
+use crate::token_bucket::consume_tokens;
 
 use tokio::sync::Mutex;
 
@@ -176,7 +177,7 @@ pub async fn writer_task(
     while let Some(message) = write_rx.recv().await {
         if let Message::Piece(_, _, data) = &message {
             if !data.is_empty() {
-                consume_tokens(&global_ul_bucket, data.len() as u64).await;
+                consume_tokens(&global_ul_bucket, data.len() as f64).await;
             }
         }
 

@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::app::PeerInfo;
-use crate::app::TokenBucket;
 use crate::app::TorrentState;
 use crate::resource_manager::ResourceManagerClient;
 
 use crate::networking::ConnectionType;
+
+use crate::token_bucket::TokenBucket;
 
 use crate::torrent_manager::DiskIoOperation;
 

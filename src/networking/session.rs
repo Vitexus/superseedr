@@ -9,8 +9,8 @@ use super::protocol::{
     ExtendedHandshakePayload, Message, MessageSummary, MetadataMessage, PexMessage,
 };
 
-use crate::app::consume_tokens;
-use crate::app::TokenBucket;
+use crate::token_bucket::TokenBucket;
+use crate::token_bucket::consume_tokens;
 
 use crate::command::TorrentCommand;
 
@@ -307,7 +307,7 @@ impl PeerSession {
                             });
                         },
                         Ok(Message::Piece(piece_index, block_offset , block_data)) => {
-                            consume_tokens(&self.global_dl_bucket, block_data.len() as u64).await;
+                            consume_tokens(&self.global_dl_bucket, block_data.len() as f64).await;
                             self.block_request_limit_semaphore.add_permits(1);
 
                             let received_block = BlockInfo {

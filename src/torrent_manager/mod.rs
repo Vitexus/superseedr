@@ -7,7 +7,8 @@ pub mod state;
 
 use crate::Settings;
 
-use crate::app::TokenBucket;
+use crate::token_bucket::TokenBucket;
+
 use crate::app::TorrentState;
 
 use tokio::sync::mpsc::{Receiver, Sender};

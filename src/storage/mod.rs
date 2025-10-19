@@ -184,3 +184,212 @@ pub async fn write_data_to_disk(
         "Failed to write all data, offset likely out of bounds",
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*; // Our module's functions
+    use crate::errors::StorageError; // As used in your file
+    use crate::torrent_file::InfoFile; // As used in your file
+
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+    use tokio::fs::{self, File};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+
+    /// Helper to create a single-file setup
+    fn setup_single_file() -> (tempfile::TempDir, MultiFileInfo) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let torrent_name = "single_file.txt";
+        let length = 100;
+        let mfi = MultiFileInfo::new(root, torrent_name, None, Some(length)).unwrap();
+        (dir, mfi)
+    }
+
+    /// Helper to create a multi-file setup
+    fn setup_multi_file() -> (tempfile::TempDir, MultiFileInfo) {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let torrent_name = "multi_file_torrent";
+        let files = vec![
+            InfoFile {
+                path: vec!["file_a.txt".to_string()],
+                length: 50, // Ends at 49
+                md5sum: None,
+            },
+            InfoFile {
+                path: vec!["subdir".to_string(), "file_b.txt".to_string()],
+                length: 70, // Starts at 50
+                md5sum: None,
+            },
+        ];
+        // Total size 120
+        let mfi = MultiFileInfo::new(root, torrent_name, Some(&files), None).unwrap();
+        (dir, mfi)
+    }
+
+    #[tokio::test]
+    async fn test_multi_file_info_new_single() {
+        let (dir, mfi) = setup_single_file();
+        assert_eq!(mfi.files.len(), 1);
+        assert_eq!(mfi.total_size, 100);
+        assert_eq!(mfi.files[0].length, 100);
+        assert_eq!(mfi.files[0].global_start_offset, 0);
+        assert_eq!(mfi.files[0].path, dir.path().join("single_file.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_multi_file_info_new_multi() {
+        let (dir, mfi) = setup_multi_file();
+        assert_eq!(mfi.files.len(), 2);
+        assert_eq!(mfi.total_size, 120); // 50 + 70
+
+        // File 1
+        assert_eq!(mfi.files[0].length, 50);
+        assert_eq!(mfi.files[0].global_start_offset, 0);
+        assert_eq!(mfi.files[0].path, dir.path().join("file_a.txt"));
+
+        // File 2
+        assert_eq!(mfi.files[1].length, 70);
+        assert_eq!(mfi.files[1].global_start_offset, 50); // Offset of file 1
+        assert_eq!(
+            mfi.files[1].path,
+            dir.path().join("subdir").join("file_b.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_and_allocate_files_single() {
+        let (_dir, mfi) = setup_single_file();
+        create_and_allocate_files(&mfi).await.unwrap();
+
+        let file_path = &mfi.files[0].path;
+        assert!(tokio::fs::try_exists(file_path).await.unwrap());
+        let metadata = tokio::fs::metadata(file_path).await.unwrap();
+        assert_eq!(metadata.len(), 100);
+    }
+
+    #[tokio::test]
+    async fn test_create_and_allocate_files_multi() {
+        let (dir, mfi) = setup_multi_file();
+        create_and_allocate_files(&mfi).await.unwrap();
+
+        let file_a_path = &mfi.files[0].path;
+        let file_b_path = &mfi.files[1].path;
+        let subdir_path = dir.path().join("subdir");
+
+        // Check that subdir was created
+        assert!(tokio::fs::try_exists(subdir_path).await.unwrap());
+
+        // Check file A
+        assert!(tokio::fs::try_exists(file_a_path).await.unwrap());
+        let metadata_a = tokio::fs::metadata(file_a_path).await.unwrap();
+        assert_eq!(metadata_a.len(), 50);
+
+        // Check file B
+        assert!(tokio::fs::try_exists(file_b_path).await.unwrap());
+        let metadata_b = tokio::fs::metadata(file_b_path).await.unwrap();
+        assert_eq!(metadata_b.len(), 70);
+    }
+
+    #[tokio::test]
+    async fn test_write_read_single_file() {
+        let (_dir, mfi) = setup_single_file();
+        create_and_allocate_files(&mfi).await.unwrap();
+
+        let data1: Vec<u8> = (0..20).collect(); // 20 bytes
+        let data2: Vec<u8> = (20..50).collect(); // 30 bytes
+
+        // Write data1 at offset 10
+        write_data_to_disk(&mfi, 10, &data1).await.unwrap();
+        // Write data2 at offset 50
+        write_data_to_disk(&mfi, 50, &data2).await.unwrap();
+
+        // Read data1 back
+        let read_data1 = read_data_from_disk(&mfi, 10, 20).await.unwrap();
+        assert_eq!(data1, read_data1);
+
+        // Read data2 back
+        let read_data2 = read_data_from_disk(&mfi, 50, 30).await.unwrap();
+        assert_eq!(data2, read_data2);
+
+        // Read pre-allocated (empty) space
+        let empty_data = read_data_from_disk(&mfi, 0, 10).await.unwrap();
+        assert_eq!(empty_data, vec![0; 10]);
+    }
+
+    #[tokio::test]
+    async fn test_write_read_across_files() {
+        let (_dir, mfi) = setup_multi_file(); // FileA: [0-49], FileB: [50-119]
+        create_and_allocate_files(&mfi).await.unwrap();
+
+        // Data that will span the boundary (offset 50)
+        // We'll write 30 bytes starting at offset 40.
+        // 10 bytes should go to file A [40-49]
+        // 20 bytes should go to file B [0-19] (global [50-69])
+        let write_data: Vec<u8> = (0..30).collect();
+        write_data_to_disk(&mfi, 40, &write_data).await.unwrap();
+
+        // Read the 30 bytes back
+        let read_data = read_data_from_disk(&mfi, 40, 30).await.unwrap();
+        assert_eq!(write_data, read_data);
+
+        // --- Verify manually ---
+        // 1. Read last 10 bytes from file A
+        let mut file_a = File::open(&mfi.files[0].path).await.unwrap();
+        file_a.seek(SeekFrom::Start(40)).await.unwrap();
+        let mut buf_a = vec![0; 10];
+        file_a.read_exact(&mut buf_a).await.unwrap();
+        assert_eq!(buf_a, &write_data[0..10]);
+
+        // 2. Read first 20 bytes from file B
+        let mut file_b = File::open(&mfi.files[1].path).await.unwrap();
+        let mut buf_b = vec![0; 20];
+        file_b.read_exact(&mut buf_b).await.unwrap();
+        assert_eq!(buf_b, &write_data[10..30]);
+    }
+
+    #[tokio::test]
+    async fn test_read_out_of_bounds() {
+        let (_dir, mfi) = setup_single_file(); // total_size = 100
+        create_and_allocate_files(&mfi).await.unwrap();
+
+        // Try to read 10 bytes starting at offset 95 (would read 95-104)
+        let res = read_data_from_disk(&mfi, 95, 10).await;
+        assert!(res.is_err());
+        if let Err(StorageError::Io(err)) = res {
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        } else {
+            panic!("Expected Io Error");
+        }
+
+        // A read right up to the boundary should be fine
+        let res_ok = read_data_from_disk(&mfi, 90, 10).await;
+        assert!(res_ok.is_ok());
+        assert_eq!(res_ok.unwrap().len(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_write_out_of_bounds() {
+        let (_dir, mfi) = setup_single_file(); // total_size = 100
+        create_and_allocate_files(&mfi).await.unwrap();
+
+        let data = vec![1; 10];
+        // Try to write 10 bytes starting at offset 95 (would write 95-104)
+        let res = write_data_to_disk(&mfi, 95, &data).await;
+        assert!(res.is_err());
+        if let Err(StorageError::Io(err)) = res {
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        } else {
+            panic!("Expected Io Error");
+        }
+
+        // A write right up to the boundary should be fine
+        let res_ok = write_data_to_disk(&mfi, 90, &data).await;
+        assert!(res_ok.is_ok());
+
+        // And we should be able to read it back
+        let read_back = read_data_from_disk(&mfi, 90, 10).await.unwrap();
+        assert_eq!(read_back, data);
+    }
+}

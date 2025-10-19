@@ -13,6 +13,7 @@ use magnet_url::Magnet;
 use crate::torrent_manager::DiskIoOperation;
 
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSettings, TorrentSortColumn};
+use crate::token_bucket::TokenBucket;
 
 use crate::tui_events;
 
@@ -161,89 +162,6 @@ impl GraphDisplayMode {
     }
 }
 
-#[derive(Debug)]
-pub struct TokenBucket {
-    capacity: u64,
-    tokens: u64,
-    rate_bps: u64,
-    last_refill: Instant,
-}
-
-impl TokenBucket {
-    pub fn new(rate_bps: u64) -> Self {
-        Self {
-            capacity: if rate_bps > 0 { rate_bps } else { u64::MAX },
-            tokens: if rate_bps > 0 { rate_bps } else { u64::MAX },
-            rate_bps,
-            last_refill: Instant::now(),
-        }
-    }
-
-    pub fn set_rate(&mut self, new_rate_bps: u64) {
-        self.rate_bps = new_rate_bps;
-        let new_capacity = if new_rate_bps > 0 {
-            new_rate_bps
-        } else {
-            u64::MAX
-        };
-        self.capacity = new_capacity;
-        // Reset tokens to avoid strange behaviour when changing limits
-        self.tokens = new_capacity;
-        self.last_refill = Instant::now();
-    }
-
-    fn refill(&mut self) {
-        if self.rate_bps == 0 {
-            self.tokens = self.capacity;
-            return;
-        }
-
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill);
-        let tokens_to_add = (self.rate_bps as f64 * elapsed.as_secs_f64()) as u64 / 8; // rate is in bits, convert to bytes
-
-        if tokens_to_add > 0 {
-            self.tokens = self.tokens.saturating_add(tokens_to_add).min(self.capacity);
-            self.last_refill = now;
-        }
-    }
-}
-pub async fn consume_tokens(bucket_arc: &Arc<Mutex<TokenBucket>>, amount_bytes: u64) {
-    let rate_bps = { bucket_arc.lock().await.rate_bps };
-    if rate_bps == 0 {
-        return; // Unlimited
-    }
-
-    // If the request is larger than the bucket, sleep for the average time required
-    // This prevents a single large request from hogging the bucket's refill logic
-    let capacity = { bucket_arc.lock().await.capacity };
-    if amount_bytes > capacity {
-        let required_duration =
-            Duration::from_secs_f64((amount_bytes * 8) as f64 / rate_bps as f64);
-        tokio::time::sleep(required_duration).await;
-        return;
-    }
-
-    loop {
-        let wait_time = {
-            let mut bucket = bucket_arc.lock().await;
-            bucket.refill();
-
-            if let Some(new_tokens) = bucket.tokens.checked_sub(amount_bytes) {
-                bucket.tokens = new_tokens;
-                break; // Success! Exit the loop.
-            }
-
-            // Not enough tokens, calculate wait time and release the lock
-            let tokens_needed = amount_bytes - bucket.tokens;
-            Duration::from_secs_f64(((tokens_needed * 8) as f64 / rate_bps as f64).max(0.001))
-        }; // The lock on `bucket` is dropped here
-
-        // Sleep for the calculated duration WITHOUT holding the lock
-        tokio::time::sleep(wait_time).await;
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SelectedHeader {
     Torrent(usize), // index within torrent headers
@@ -273,9 +191,6 @@ pub enum AppCommand {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ConfigItem {
     ClientPort,
-    UploadSlots,
-    PeerUploadInFlightLimit,
-    MaxConcurrentValidations,
     DefaultDownloadFolder,
     WatchFolder,
     GlobalDownloadLimit,
@@ -516,12 +431,10 @@ impl App {
         let (torrent_tx, torrent_rx) = mpsc::channel::<TorrentState>(100);
 
         // --- 3. Create S
-        let global_dl_bucket = Arc::new(Mutex::new(TokenBucket::new(
-            client_configs.global_download_limit_bps,
-        )));
-        let global_ul_bucket = Arc::new(Mutex::new(TokenBucket::new(
-            client_configs.global_upload_limit_bps,
-        )));
+        let dl_limit = client_configs.global_download_limit_bps as f64;
+        let ul_limit = client_configs.global_upload_limit_bps as f64;
+        let global_dl_bucket = Arc::new(Mutex::new(TokenBucket::new(dl_limit, dl_limit)));
+        let global_ul_bucket = Arc::new(Mutex::new(TokenBucket::new(ul_limit, ul_limit)));
 
         // --- 4. Initialize AppState from Configs ---
         let app_state = AppState {

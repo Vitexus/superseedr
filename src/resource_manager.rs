@@ -251,3 +251,301 @@ impl ResourceManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
+
+    /// Helper function to create a map of limits for the manager.
+    fn create_limits(
+        peer: (usize, usize),
+        read: (usize, usize),
+        write: (usize, usize),
+    ) -> HashMap<ResourceType, (usize, usize)> {
+        let mut limits = HashMap::new();
+        limits.insert(ResourceType::PeerConnection, peer);
+        limits.insert(ResourceType::DiskRead, read);
+        limits.insert(ResourceType::DiskWrite, write);
+        limits
+    }
+
+    /// Helper function to spawn the resource manager actor and return a client.
+    /// The JoinHandle is returned so the actor task can be aborted if needed.
+    fn setup_manager(
+        limits: HashMap<ResourceType, (usize, usize)>,
+    ) -> (ResourceManagerClient, tokio::task::JoinHandle<()>) {
+        let (actor, client) = ResourceManager::new(limits);
+        let handle = tokio::spawn(actor.run());
+        (client, handle)
+    }
+
+    #[tokio::test]
+    async fn test_acquire_release_success() {
+        // Limit 1, Queue 1 for PeerConnection
+        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        // Acquire once, should succeed
+        let guard1 = client.acquire_peer_connection().await;
+        assert!(guard1.is_ok());
+
+        // Drop the guard, releasing the permit
+        drop(guard1);
+
+        // Acquire again, should succeed
+        let guard2 = client.acquire_peer_connection().await;
+        assert!(guard2.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_blocks_and_wakes() {
+        // Limit 1, Queue 1
+        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        // 1. Acquire the only permit
+        let guard1 = client.acquire_peer_connection().await.unwrap();
+
+        // 2. Spawn a task to acquire the next one.
+        let client_clone = client.clone();
+        let acquire_task = tokio::spawn(async move {
+            client_clone.acquire_peer_connection().await
+        });
+
+        // 3. Assert that it is blocking (by checking it's not finished)
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !acquire_task.is_finished(),
+            "Acquire did not block when it should have"
+        );
+
+        // 4. Drop the first guard, which should unblock the task
+        drop(guard1);
+
+        // 5. The task should now complete successfully
+        let result = timeout(Duration::from_millis(100), acquire_task).await;
+        assert!(result.is_ok(), "Task timed out, did not unblock");
+        let inner_result = result.unwrap(); // This is Result<JoinResult<...>>
+        assert!(inner_result.is_ok(), "Task join failed"); // JoinError
+        assert!(inner_result.unwrap().is_ok(), "Acquire task failed"); // ResourceManagerError
+    }
+
+    #[tokio::test]
+    async fn test_queue_full_rejection() {
+        // Limit 1, Queue 1
+        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        // 1. Acquire the permit
+        let guard1 = client.acquire_peer_connection().await.unwrap();
+
+        // 2. Spawn a task to take the only queue slot
+        let client_clone = client.clone();
+        let acquire_task2 = tokio::spawn(async move {
+            client_clone.acquire_peer_connection().await
+        });
+        
+        // Give it time to run and block
+        sleep(Duration::from_millis(50)).await;
+        assert!(!acquire_task2.is_finished());
+
+        // 3. Attempt to acquire again, should fail immediately with QueueFull
+        let result = client.acquire_peer_connection().await;
+        match result {
+            Err(ResourceManagerError::QueueFull) => { /* This is the expected success */ }
+            _ => panic!("Expected QueueFull, got {:?}", result),
+        }
+
+        // Cleanup
+        drop(guard1);
+        let _ = acquire_task2.await;
+    }
+
+    #[tokio::test]
+    async fn test_update_limit_increase_wakes_waiters() {
+        // Limit 1, Queue 1
+        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        // 1. Acquire the permit
+        let _guard1 = client.acquire_peer_connection().await.unwrap();
+
+        // 2. Spawn task, it should block
+        let client_clone = client.clone();
+        let acquire_task = tokio::spawn(async move {
+            client_clone.acquire_peer_connection().await
+        });
+        
+        // Assert it's blocking
+        sleep(Duration::from_millis(50)).await;
+        assert!(!acquire_task.is_finished());
+
+        // 3. Update limit to 2
+        let mut new_limits = HashMap::new();
+        new_limits.insert(ResourceType::PeerConnection, 2);
+        client.update_limits(new_limits).await.unwrap();
+
+        // 4. The task should now unblock because the limit was increased
+        let result = timeout(Duration::from_millis(100), acquire_task).await;
+        assert!(
+            result.is_ok(),
+            "Task timed out, did not unblock after limit update"
+        );
+        let inner_result = result.unwrap();
+        assert!(inner_result.is_ok(), "Task join failed");
+        assert!(inner_result.unwrap().is_ok(), "Acquire task failed");
+    }
+
+    #[tokio::test]
+    async fn test_update_limit_decrease() {
+        // Limit 2, Queue 1
+        let limits = create_limits((2, 1), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        // 1. Acquire 2 permits
+        let guard1 = client.acquire_peer_connection().await.unwrap();
+        let guard2 = client.acquire_peer_connection().await.unwrap();
+
+        // 2. Update limit to 1
+        let mut new_limits = HashMap::new();
+        new_limits.insert(ResourceType::PeerConnection, 1);
+        client.update_limits(new_limits).await.unwrap();
+
+        // 3. Spawn task, it should block (in_use is 2, limit is 1)
+        let client_clone = client.clone();
+        let acquire_task = tokio::spawn(async move {
+            client_clone.acquire_peer_connection().await
+        });
+        
+        sleep(Duration::from_millis(50)).await;
+        assert!(!acquire_task.is_finished());
+
+        // 4. Drop guard1. in_use becomes 1. Limit is 1. Task should still block.
+        drop(guard1);
+        sleep(Duration::from_millis(50)).await; // Give manager time to process
+        assert!(!acquire_task.is_finished(), "Task unblocked too early");
+
+        // 5. Drop guard2. in_use becomes 0. Limit is 1. Task should unblock.
+        drop(guard2);
+        let result = timeout(Duration::from_millis(100), acquire_task).await;
+        assert!(
+            result.is_ok(),
+            "Task did not unblock after second guard dropped"
+        );
+        let inner_result = result.unwrap();
+        assert!(inner_result.is_ok(), "Task join failed");
+        assert!(inner_result.unwrap().is_ok(), "Acquire task failed");
+    }
+
+    #[tokio::test]
+    async fn test_resources_are_independent() {
+        // Limit 1 for Peer, Limit 1 for Read
+        let limits = create_limits((1, 1), (1, 1), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        // 1. Acquire PeerConnection
+        let _peer_guard = client.acquire_peer_connection().await.unwrap();
+
+        // 2. Spawn task for another PeerConnection, it should block
+        let client_clone = client.clone();
+        let peer_task = tokio::spawn(async move {
+            client_clone.acquire_peer_connection().await
+        });
+        
+        sleep(Duration::from_millis(50)).await;
+        assert!(
+            !peer_task.is_finished(),
+            "Peer connection acquire did not block"
+        );
+
+        // 3. Acquire DiskRead, it should succeed immediately
+        let read_result = client.acquire_disk_read().await;
+        assert!(
+            read_result.is_ok(),
+            "DiskRead acquire failed, was blocked by PeerConnection"
+        );
+        
+        // 4. Acquire DiskWrite, should fail (limit is 0, queue is 0)
+        let write_result = client.acquire_disk_write().await;
+        match write_result {
+            Err(ResourceManagerError::QueueFull) => { /* Success, queue size is 0 */ },
+            _ => panic!("Expected QueueFull for 0-limit resource"),
+        }
+
+        // Cleanup
+        drop(_peer_guard);
+        let _ = peer_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_manager_shutdown() {
+        let limits = create_limits((1, 1), (0, 0), (0, 0));
+        let (client, handle) = setup_manager(limits);
+
+        // 1. Abort the manager task
+        handle.abort();
+
+        // 2. Wait for the task to fully stop
+        sleep(Duration::from_millis(20)).await;
+
+        // 3. Try to acquire. Should fail with ManagerShutdown.
+        let result = client.acquire_peer_connection().await;
+        match result {
+            Err(ResourceManagerError::ManagerShutdown) => { /* Success */ }
+            _ => panic!("Expected ManagerShutdown, got {:?}", result),
+        }
+
+        // 4. Try to update limits. Should also fail.
+        let result_update = client.update_limits(HashMap::new()).await;
+        match result_update {
+            Err(ResourceManagerError::ManagerShutdown) => { /* Success */ }
+            _ => panic!("Expected ManagerShutdown, got {:?}", result_update),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_waiters_are_woken() {
+        // Test that the processing loop wakes multiple waiters
+        let limit = 5;
+        let queue = 5;
+        let limits = create_limits((limit, queue), (0, 0), (0, 0));
+        let (client, _handle) = setup_manager(limits);
+
+        // 1. Acquire all permits
+        let mut guards = Vec::new();
+        for _ in 0..limit {
+            guards.push(client.acquire_peer_connection().await.unwrap());
+        }
+
+        // 2. Spawn `queue` tasks to wait
+        let mut tasks = Vec::new();
+        for _ in 0..queue {
+            let client_clone = client.clone();
+            tasks.push(tokio::spawn(async move {
+                client_clone.acquire_peer_connection().await
+            }));
+        }
+
+        // 3. Give them time to queue up
+        sleep(Duration::from_millis(50)).await;
+        for (i, task) in tasks.iter().enumerate() {
+            assert!(!task.is_finished(), "Task {} finished early", i);
+        }
+
+        // 4. Drop all guards, this should trigger `handle_process_queue`
+        drop(guards);
+
+        // 5. All tasks should unblock. We await them sequentially.
+        // This replaces the need for `futures::future::join_all`.
+        for (i, task) in tasks.into_iter().enumerate() {
+            // Await each task with a timeout
+            let res = timeout(Duration::from_millis(100), task).await;
+            assert!(res.is_ok(), "Task {} timed out waiting to join", i);
+            let join_res = res.unwrap();
+            assert!(join_res.is_ok(), "Task {} join error", i);
+            assert!(join_res.unwrap().is_ok(), "Task {} acquire failed", i);
+        }
+    }
+}
