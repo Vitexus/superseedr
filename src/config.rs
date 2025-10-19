@@ -128,7 +128,7 @@ pub struct TorrentSettings {
 
 /// This is now the single source of truth for app directories.
 pub fn get_app_paths() -> Option<(PathBuf, PathBuf)> {
-    if let Some(proj_dirs) = ProjectDirs::from("com", "torrent", "superseedr") {
+    if let Some(proj_dirs) = ProjectDirs::from("com", "github", "jagalite.superseedr") {
         let config_dir = proj_dirs.config_dir().to_path_buf();
         let data_dir = proj_dirs.data_local_dir().to_path_buf();
 

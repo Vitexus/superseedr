@@ -11,7 +11,7 @@ Loading torrents via Paste (crtl + v) or by setting a torrent watch directory.
 cargo run
 ```
 Configuration files are located in the user's Application Support folder:
-`~/Library/Application Support/com.torrent.superseedr/`
+`~/Library/Application Support/com.github.jagalite.superseedr/`
 
 ## Current Status & Features
 The client is currently in a late-alpha stage. Most of the core BitTorrent protocol features are implemented and functional.

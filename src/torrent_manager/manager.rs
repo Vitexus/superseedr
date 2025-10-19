@@ -722,7 +722,29 @@ impl TorrentManager {
                         .mark_as_complete(piece_index.try_into().unwrap());
                 }
                 if piece_index % 20 == 0 {
-                    self.send_metrics();
+                    if let Some(ref torrent) = self.torrent {
+                        let metrics_tx_clone = self.metrics_tx.clone();
+                        let info_hash_clone = self.info_hash.clone();
+                        let torrent_name_clone = torrent.info.name.clone();
+                        let number_of_pieces_total = (torrent.info.pieces.len() / 20) as u32;
+                        let number_of_pieces_completed =
+                            number_of_pieces_total - self.piece_manager.pieces_remaining as u32;
+
+                        // Create a minimal TorrentState for validation progress
+                        let torrent_state = TorrentState {
+                            info_hash: info_hash_clone,
+                            torrent_name: torrent_name_clone,
+                            number_of_pieces_total,
+                            number_of_pieces_completed,
+                            activity_message: "Validating local files...".to_string(),
+                            // All other fields (speeds, peers, eta) are default (0 or empty)
+                            ..Default::default()
+                        };
+                        
+                        if let Err(e) = metrics_tx_clone.try_send(torrent_state) {
+                            tracing::event!(Level::ERROR, "Failed to send validation metrics to TUI: {}", e);
+                        }
+                    }
                 }
             }
         }
