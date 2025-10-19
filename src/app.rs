@@ -431,12 +431,10 @@ impl App {
         let (torrent_tx, torrent_rx) = mpsc::channel::<TorrentState>(100);
 
         // --- 3. Create S
-        let global_dl_bucket = Arc::new(Mutex::new(TokenBucket::new(
-            client_configs.global_download_limit_bps,
-        )));
-        let global_ul_bucket = Arc::new(Mutex::new(TokenBucket::new(
-            client_configs.global_upload_limit_bps,
-        )));
+        let dl_limit = client_configs.global_download_limit_bps as f64;
+        let ul_limit = client_configs.global_upload_limit_bps as f64;
+        let global_dl_bucket = Arc::new(Mutex::new(TokenBucket::new(dl_limit, dl_limit)));
+        let global_ul_bucket = Arc::new(Mutex::new(TokenBucket::new(ul_limit, ul_limit)));
 
         // --- 4. Initialize AppState from Configs ---
         let app_state = AppState {

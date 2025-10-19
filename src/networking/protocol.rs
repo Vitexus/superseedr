@@ -177,7 +177,7 @@ pub async fn writer_task(
     while let Some(message) = write_rx.recv().await {
         if let Message::Piece(_, _, data) = &message {
             if !data.is_empty() {
-                consume_tokens(&global_ul_bucket, data.len() as u64).await;
+                consume_tokens(&global_ul_bucket, data.len() as f64).await;
             }
         }
 

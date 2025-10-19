@@ -307,7 +307,7 @@ impl PeerSession {
                             });
                         },
                         Ok(Message::Piece(piece_index, block_offset , block_data)) => {
-                            consume_tokens(&self.global_dl_bucket, block_data.len() as u64).await;
+                            consume_tokens(&self.global_dl_bucket, block_data.len() as f64).await;
                             self.block_request_limit_semaphore.add_permits(1);
 
                             let received_block = BlockInfo {

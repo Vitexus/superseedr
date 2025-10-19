@@ -288,7 +288,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                             settings_edit.global_download_limit_bps = new_rate;
                                             let bucket = app.global_dl_bucket.clone();
                                             tokio::spawn(async move {
-                                                bucket.lock().await.set_rate(new_rate);
+                                                bucket.lock().await.set_rate(new_rate as f64);
                                             });
                                         }
                                     }
@@ -297,7 +297,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                             settings_edit.global_upload_limit_bps = new_rate;
                                             let bucket = app.global_ul_bucket.clone();
                                             tokio::spawn(async move {
-                                                bucket.lock().await.set_rate(new_rate);
+                                                bucket.lock().await.set_rate(new_rate as f64);
                                             });
                                         }
                                     }
@@ -362,7 +362,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                     settings_edit.global_download_limit_bps = new_rate;
                                     let bucket = app.global_dl_bucket.clone();
                                     tokio::spawn(async move {
-                                        bucket.lock().await.set_rate(new_rate);
+                                        bucket.lock().await.set_rate(new_rate as f64);
                                     });
                                 }
                                 ConfigItem::GlobalUploadLimit => {
@@ -372,7 +372,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                     settings_edit.global_upload_limit_bps = new_rate;
                                     let bucket = app.global_ul_bucket.clone();
                                     tokio::spawn(async move {
-                                        bucket.lock().await.set_rate(new_rate);
+                                        bucket.lock().await.set_rate(new_rate as f64);
                                     });
                                 }
                                 _ => {}
@@ -390,7 +390,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                     settings_edit.global_download_limit_bps = new_rate;
                                     let bucket = app.global_dl_bucket.clone();
                                     tokio::spawn(async move {
-                                        bucket.lock().await.set_rate(new_rate);
+                                        bucket.lock().await.set_rate(new_rate as f64);
                                     });
                                 }
                                 ConfigItem::GlobalUploadLimit => {
@@ -400,7 +400,7 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
                                     settings_edit.global_upload_limit_bps = new_rate;
                                     let bucket = app.global_ul_bucket.clone();
                                     tokio::spawn(async move {
-                                        bucket.lock().await.set_rate(new_rate);
+                                        bucket.lock().await.set_rate(new_rate as f64);
                                     });
                                 }
                                 _ => {}
