@@ -11,6 +11,8 @@ use crate::app::{
     TORRENT_HEADERS,
 };
 
+use crate::config::get_app_paths;
+
 use crate::config::{PeerSortColumn, Settings, SortDirection, TorrentSortColumn};
 
 use crate::theme;
@@ -1224,9 +1226,9 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         ]
     };
     let mut footer_spans = Line::from(vec![
-        Span::styled("↑↓/kj", Style::default().fg(theme::BLUE)),
+        Span::styled("↑↓", Style::default().fg(theme::BLUE)),
         Span::raw(" "),
-        Span::styled("←→/hl", Style::default().fg(theme::BLUE)),
+        Span::styled("←→", Style::default().fg(theme::BLUE)),
         Span::raw(" Navigate |"),
         Span::styled("[q]", Style::default().fg(theme::RED)),
         Span::raw("uit | "),
@@ -1279,7 +1281,7 @@ fn draw_config_screen(
     items: &[ConfigItem],
     editing: &Option<(ConfigItem, String)>,
 ) {
-    let area = centered_rect(60, 50, f.area());
+    let area = centered_rect(80, 60, f.area());
     f.render_widget(Clear, f.area());
 
     let block = Block::default()
@@ -1412,9 +1414,18 @@ fn draw_help_popup(f: &mut Frame, mode: &AppMode, app_state: &AppState) {
         let area = centered_rect(60, 90, f.area());
         f.render_widget(Clear, area);
 
+        let warning_width = area.width.saturating_sub(2).max(1) as usize;
+        let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
+        let warning_block_height = warning_lines
+            .saturating_add(2)
+            .max(3);
+
+        let max_warning_height = (area.height as f64 * 0.25).round() as u16;
+        let final_warning_height = warning_block_height.min(max_warning_height);
+
         let chunks = Layout::vertical([
-            Constraint::Length(3), // Height for the warning box
-            Constraint::Min(0),    // The rest for the help table
+            Constraint::Length(final_warning_height), // Use dynamic height
+            Constraint::Min(0),                      // The rest for the help table
         ])
         .split(area);
 
@@ -1438,6 +1449,21 @@ fn draw_help_popup(f: &mut Frame, mode: &AppMode, app_state: &AppState) {
 
 // Helper function containing the original help popup logic
 fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
+    let (settings_path_str, log_path_str) =
+        if let Some((config_dir, data_dir)) = get_app_paths() {
+            (
+                config_dir
+                    .join("settings.toml")
+                    .to_string_lossy()
+                    .to_string(),
+                data_dir.join("client.log").to_string_lossy().to_string(),
+            )
+        } else {
+            (
+                "Unknown location".to_string(),
+                "Unknown location".to_string(),
+            )
+    };
     let (title, rows, _height) = match mode {
         AppMode::Normal => (
             " Manual / Help ",
@@ -1455,7 +1481,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Cell::from("Open Config screen"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("z", Style::default().fg(theme::SUBTEXT0))), // Changed from Esc
+                    Cell::from(Span::styled("z", Style::default().fg(theme::SUBTEXT0))),
                     Cell::from("Toggle Zen/Power Saving mode"),
                 ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
@@ -1556,6 +1582,68 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Cell::from(Span::styled("  ■", Style::default().fg(theme::PEACH))),
                     Cell::from("You are choking peer (UL Restriction)"),
                 ]),
+                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
+                Row::new(vec![Cell::from(Span::styled(
+                    "Disk Stats Legend",
+                    Style::default().fg(theme::YELLOW),
+                ))]),
+                Row::new(vec![
+                    Cell::from(Span::styled("  ↑ (Read)", Style::default().fg(theme::GREEN))),
+                    Cell::from("Data read from disk"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("  ↓ (Write)", Style::default().fg(theme::SKY))),
+                    Cell::from("Data written to disk"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("  Seek", Style::default().fg(theme::TEXT))),
+                    Cell::from("Avg. distance between I/O ops (lower is better)"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("  Latency", Style::default().fg(theme::TEXT))),
+                    Cell::from("Time to complete one I/O op (lower is better)"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("  IOPS", Style::default().fg(theme::TEXT))),
+                    Cell::from("I/O Operations Per Second (total workload)"),
+                ]),
+                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
+                Row::new(vec![Cell::from(Span::styled(
+                    "Self-Tuning Legend",
+                    Style::default().fg(theme::YELLOW),
+                ))]),
+                Row::new(vec![
+                    Cell::from(Span::styled("  Best Score", Style::default().fg(theme::TEXT))),
+                    Cell::from("Score measuring if randomized changes resulted in optimial speeds."),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("  Next seconds", Style::default().fg(theme::TEXT))),
+                    Cell::from("Countdown to try a new random resource adjustment (file handles)"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("  (+/-)", Style::default().fg(theme::TEXT))),
+                    Cell::from("Random setting change between resources. (Green=Good, Red=Bad)"),
+                ]),
+                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
+                Row::new(vec![Cell::from(Span::styled(
+                        "File Locations",
+                        Style::default().fg(theme::YELLOW),
+                    ))]),
+                    Row::new(vec![
+                        Cell::from(Span::styled("Settings", Style::default().fg(theme::TEXT))),
+                        Cell::from(Span::styled(
+                            settings_path_str,
+                            Style::default().fg(theme::SUBTEXT0),
+                        )),
+                    ]),
+                    Row::new(vec![
+                        Cell::from(Span::styled("Log File", Style::default().fg(theme::TEXT))),
+                        Cell::from(Span::styled(
+                            log_path_str,
+                            Style::default().fg(theme::SUBTEXT0),
+                        )),
+                    ]),
+                    Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
             ],
             // New height percentage to fit all the content
             90,
