@@ -32,8 +32,8 @@ use crate::config::Settings;
 use tracing_appender::rolling;
 
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::io::stdout;
 use std::env;
+use std::io::stdout;
 
 use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*};
 
@@ -74,7 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let general_layer = fmt::layer()
                 .with_writer(non_blocking_general)
                 .with_filter(LevelFilter::INFO);
-            tracing_subscriber::registry().with(general_layer).try_init()
+            tracing_subscriber::registry()
+                .with(general_layer)
+                .try_init()
         } else {
             tracing_subscriber::registry().try_init()
         }
@@ -138,11 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut proceed_to_app = true;
     let mut _lock_file_handle: Option<File> = None;
-    
+
     if let Some(lock_path) = get_lock_path() {
         if let Ok(file) = File::create(&lock_path) {
             if file.try_lock_exclusive().is_ok() {
-                _lock_file_handle = Some(file); 
+                _lock_file_handle = Some(file);
             } else {
                 proceed_to_app = false;
             }
@@ -184,7 +186,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-
 
 fn get_lock_path() -> Option<PathBuf> {
     let base_data_dir = config::get_app_paths()

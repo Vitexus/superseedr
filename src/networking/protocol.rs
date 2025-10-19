@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use tokio::net::tcp::{OwnedWriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::oneshot;
 
@@ -305,7 +305,9 @@ pub fn generate_message(message: Message) -> Result<Vec<u8>, MessageGenerationEr
     }
 }
 
-pub async fn parse_message(socket: &mut (impl AsyncReadExt + Unpin)) -> Result<Message, std::io::Error> {
+pub async fn parse_message(
+    socket: &mut (impl AsyncReadExt + Unpin),
+) -> Result<Message, std::io::Error> {
     let mut buffer_message_len = [0u8; 4];
     let _ = socket.read_exact(&mut buffer_message_len).await?;
     let message_len = u32::from_be_bytes(buffer_message_len);
@@ -458,10 +460,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut client = TcpStream::connect(ip_port).await?;
-        
+
         let handshake_msg =
             generate_message(Message::Handshake(info_hash.clone(), my_peer_id.clone())).unwrap();
-        
+
         client.write_all(&handshake_msg).await?;
 
         let mut buffer = [0; 68];
@@ -498,7 +500,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let client = TcpStream::connect(ip_port).await?;
-        
+
         let (mut read_half, _) = client.into_split();
 
         assert_eq!(expected_message, parse_message(&mut read_half).await?);
@@ -508,12 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tcp_keep_alive() -> Result<(), Box<dyn Error>> {
-        run_message_test(
-            "127.0.0.1:8081",
-            Message::KeepAlive,
-            Message::KeepAlive,
-        )
-        .await
+        run_message_test("127.0.0.1:8081", Message::KeepAlive, Message::KeepAlive).await
     }
 
     #[tokio::test]
@@ -528,12 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_tcp_interested() -> Result<(), Box<dyn Error>> {
-        run_message_test(
-            "127.0.0.1:8084",
-            Message::Interested,
-            Message::Interested,
-        )
-        .await
+        run_message_test("127.0.0.1:8084", Message::Interested, Message::Interested).await
     }
 
     #[tokio::test]
@@ -649,5 +641,3 @@ mod tests {
         }
     }
 }
-
-

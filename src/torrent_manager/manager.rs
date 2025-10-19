@@ -739,9 +739,13 @@ impl TorrentManager {
                             activity_message: "Validating local files...".to_string(),
                             ..Default::default()
                         };
-                        
+
                         if let Err(e) = metrics_tx_clone.try_send(torrent_state) {
-                            tracing::event!(Level::ERROR, "Failed to send validation metrics to TUI: {}", e);
+                            tracing::event!(
+                                Level::ERROR,
+                                "Failed to send validation metrics to TUI: {}",
+                                e
+                            );
                         }
                     }
                 }

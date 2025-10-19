@@ -11,8 +11,8 @@ use crate::torrent_file::InfoFile;
 
 #[derive(Debug, Clone)]
 pub struct FileInfo {
-    pub path: PathBuf, // The full path to the file on the disk.
-    pub length: u64, // The length of the file in bytes.
+    pub path: PathBuf,            // The full path to the file on the disk.
+    pub length: u64,              // The length of the file in bytes.
     pub global_start_offset: u64, // The starting offset of this file within the torrent's complete data stream.
 }
 

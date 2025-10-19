@@ -27,7 +27,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     if app_state.show_help {
-        draw_help_popup(f, &app_state.mode, app_state);
         return;
     }
 
@@ -52,8 +51,29 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
                 .border_style(Style::default().fg(theme::SURFACE2));
 
             let inner_area = block.inner(area);
+
+            let chunks =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner_area);
+
+            let explorer_area = chunks[0];
+            let footer_area = chunks[1];
+
+            let footer_text = Line::from(vec![
+                Span::styled("[Tab]", Style::default().fg(theme::GREEN)),
+                Span::raw(" Confirm | "),
+                Span::styled("[Esc]", Style::default().fg(theme::RED)),
+                Span::raw(" Cancel | "),
+                Span::styled("←→↑↓", Style::default().fg(theme::BLUE)),
+                Span::raw(" Navigate"),
+            ])
+            .alignment(Alignment::Center);
+
+            let footer_paragraph =
+                Paragraph::new(footer_text).style(Style::default().fg(theme::SUBTEXT1));
+
             f.render_widget(block, area);
-            f.render_widget(&file_explorer.widget(), inner_area);
+            f.render_widget(&file_explorer.widget(), explorer_area);
+            f.render_widget(footer_paragraph, footer_area);
             return;
         }
         AppMode::Config {
@@ -68,7 +88,39 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
         AppMode::FilePicker(file_explorer) => {
             let area = centered_rect(80, 70, f.area());
             f.render_widget(Clear, area);
-            f.render_widget(&file_explorer.widget(), area);
+
+            let block = Block::default()
+                .title(Span::styled(
+                    "Select Download Folder",
+                    Style::default().fg(theme::MAUVE),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme::SURFACE2));
+
+            let inner_area = block.inner(area);
+
+            let chunks =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner_area);
+
+            let explorer_area = chunks[0];
+            let footer_area = chunks[1];
+
+            let footer_text = Line::from(vec![
+                Span::styled("[Tab]", Style::default().fg(theme::GREEN)),
+                Span::raw(" Confirm | "),
+                Span::styled("[Esc]", Style::default().fg(theme::RED)),
+                Span::raw(" Cancel | "),
+                Span::styled("←→↑↓", Style::default().fg(theme::BLUE)),
+                Span::raw(" Navigate"),
+            ])
+            .alignment(Alignment::Center);
+
+            let footer_paragraph =
+                Paragraph::new(footer_text).style(Style::default().fg(theme::SUBTEXT1));
+
+            f.render_widget(block, area);
+            f.render_widget(&file_explorer.widget(), explorer_area);
+            f.render_widget(footer_paragraph, footer_area);
             return;
         }
         AppMode::DeleteConfirm { .. } => {
@@ -1416,16 +1468,14 @@ fn draw_help_popup(f: &mut Frame, mode: &AppMode, app_state: &AppState) {
 
         let warning_width = area.width.saturating_sub(2).max(1) as usize;
         let warning_lines = (warning_text.len() as f64 / warning_width as f64).ceil() as u16;
-        let warning_block_height = warning_lines
-            .saturating_add(2)
-            .max(3);
+        let warning_block_height = warning_lines.saturating_add(2).max(3);
 
         let max_warning_height = (area.height as f64 * 0.25).round() as u16;
         let final_warning_height = warning_block_height.min(max_warning_height);
 
         let chunks = Layout::vertical([
             Constraint::Length(final_warning_height), // Use dynamic height
-            Constraint::Min(0),                      // The rest for the help table
+            Constraint::Min(0),                       // The rest for the help table
         ])
         .split(area);
 
@@ -1449,20 +1499,19 @@ fn draw_help_popup(f: &mut Frame, mode: &AppMode, app_state: &AppState) {
 
 // Helper function containing the original help popup logic
 fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
-    let (settings_path_str, log_path_str) =
-        if let Some((config_dir, data_dir)) = get_app_paths() {
-            (
-                config_dir
-                    .join("settings.toml")
-                    .to_string_lossy()
-                    .to_string(),
-                data_dir.join("client.log").to_string_lossy().to_string(),
-            )
-        } else {
-            (
-                "Unknown location".to_string(),
-                "Unknown location".to_string(),
-            )
+    let (settings_path_str, log_path_str) = if let Some((config_dir, data_dir)) = get_app_paths() {
+        (
+            config_dir
+                .join("settings.toml")
+                .to_string_lossy()
+                .to_string(),
+            data_dir.join("client.log").to_string_lossy().to_string(),
+        )
+    } else {
+        (
+            "Unknown location".to_string(),
+            "Unknown location".to_string(),
+        )
     };
     let (title, rows, _height) = match mode {
         AppMode::Normal => (
@@ -1588,7 +1637,10 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Style::default().fg(theme::YELLOW),
                 ))]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  ↑ (Read)", Style::default().fg(theme::GREEN))),
+                    Cell::from(Span::styled(
+                        "  ↑ (Read)",
+                        Style::default().fg(theme::GREEN),
+                    )),
                     Cell::from("Data read from disk"),
                 ]),
                 Row::new(vec![
@@ -1613,11 +1665,19 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     Style::default().fg(theme::YELLOW),
                 ))]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  Best Score", Style::default().fg(theme::TEXT))),
-                    Cell::from("Score measuring if randomized changes resulted in optimial speeds."),
+                    Cell::from(Span::styled(
+                        "  Best Score",
+                        Style::default().fg(theme::TEXT),
+                    )),
+                    Cell::from(
+                        "Score measuring if randomized changes resulted in optimial speeds.",
+                    ),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  Next seconds", Style::default().fg(theme::TEXT))),
+                    Cell::from(Span::styled(
+                        "  Next seconds",
+                        Style::default().fg(theme::TEXT),
+                    )),
                     Cell::from("Countdown to try a new random resource adjustment (file handles)"),
                 ]),
                 Row::new(vec![
@@ -1626,24 +1686,24 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                 ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
                 Row::new(vec![Cell::from(Span::styled(
-                        "File Locations",
-                        Style::default().fg(theme::YELLOW),
-                    ))]),
-                    Row::new(vec![
-                        Cell::from(Span::styled("Settings", Style::default().fg(theme::TEXT))),
-                        Cell::from(Span::styled(
-                            settings_path_str,
-                            Style::default().fg(theme::SUBTEXT0),
-                        )),
-                    ]),
-                    Row::new(vec![
-                        Cell::from(Span::styled("Log File", Style::default().fg(theme::TEXT))),
-                        Cell::from(Span::styled(
-                            log_path_str,
-                            Style::default().fg(theme::SUBTEXT0),
-                        )),
-                    ]),
-                    Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
+                    "File Locations",
+                    Style::default().fg(theme::YELLOW),
+                ))]),
+                Row::new(vec![
+                    Cell::from(Span::styled("Settings", Style::default().fg(theme::TEXT))),
+                    Cell::from(Span::styled(
+                        settings_path_str,
+                        Style::default().fg(theme::SUBTEXT0),
+                    )),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("Log File", Style::default().fg(theme::TEXT))),
+                    Cell::from(Span::styled(
+                        log_path_str,
+                        Style::default().fg(theme::SUBTEXT0),
+                    )),
+                ]),
+                Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
             ],
             // New height percentage to fit all the content
             90,

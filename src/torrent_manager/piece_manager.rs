@@ -284,12 +284,7 @@ mod tests {
         let block_data_1 = vec![2; block_size];
 
         // 1. Add first block
-        let result = pm.handle_block(
-            piece_index,
-            0,
-            &block_data_0,
-            piece_size,
-        );
+        let result = pm.handle_block(piece_index, 0, &block_data_0, piece_size);
         assert!(result.is_none());
         assert!(pm.piece_assemblers.contains_key(&piece_index));
         let assembler = pm.piece_assemblers.get(&piece_index).unwrap();
@@ -301,22 +296,12 @@ mod tests {
         assert!(!pm.piece_assemblers.contains_key(&piece_index));
 
         // 3. Add first block again (new assembler created)
-        let result = pm.handle_block(
-            piece_index,
-            0,
-            &block_data_0,
-            piece_size,
-        );
+        let result = pm.handle_block(piece_index, 0, &block_data_0, piece_size);
         assert!(result.is_none());
 
         // 4. Add second block
-        let result = pm.handle_block(
-            piece_index,
-            block_size as u32,
-            &block_data_1,
-            piece_size,
-        );
-        
+        let result = pm.handle_block(piece_index, block_size as u32, &block_data_1, piece_size);
+
         // 5. Check completion
         assert!(result.is_some());
         let full_piece = result.unwrap();
@@ -333,7 +318,7 @@ mod tests {
         let mut pm = setup_manager(4); // need = [0, 1, 2, 3]
         pm.mark_as_pending(2, "peer_A".to_string()); // need = [0, 1, 3], pending = [2]
         pm.mark_as_complete(0); // need = [1, 3], pending = [2], done = [0]
-                               // Pieces to check: 1, 3, 2
+                                // Pieces to check: 1, 3, 2
 
         let peer1_bitfield = vec![true, true, false, true]; // Has 0, 1, 3
         let peer2_bitfield = vec![true, false, true, true]; // Has 0, 2, 3
@@ -354,7 +339,7 @@ mod tests {
     #[test]
     fn test_choose_piece_standard_mode() {
         let mut pm = setup_manager(5); // need = [0, 1, 2, 3, 4]
-        
+
         // Rarity: 0 (rare), 1 (common), 2 (rare), 3 (medium), 4 (peer doesn't have)
         pm.piece_rarity.insert(0, 1);
         pm.piece_rarity.insert(1, 10);
@@ -405,7 +390,9 @@ mod tests {
 
         // 1. Peer has pieces from both Need (0, 3) and Pending (1)
         // Candidates are [0, 3, 1]
-        let choice = pm.choose_piece_for_peer(&peer_bitfield, &peer_pending, &status).unwrap();
+        let choice = pm
+            .choose_piece_for_peer(&peer_bitfield, &peer_pending, &status)
+            .unwrap();
         assert!([0, 1, 3].contains(&choice));
 
         // 2. Peer only has a piece from Need
