@@ -27,6 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
     if app_state.show_help {
+        draw_help_popup(f, &app_state.mode, app_state);
         return;
     }
 

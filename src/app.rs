@@ -449,6 +449,7 @@ pub struct AppState {
     pub tuning_countdown: u64,
     pub last_tuning_limits: CalculatedLimits,
     pub is_seeding: bool,
+    pub baseline_speed_ema: f64,
 }
 
 pub struct App {
@@ -1095,15 +1096,14 @@ impl App {
                 _ = tuning_interval.tick() => {
                     self.app_state.tuning_countdown = 90;
 
-                    // --- 2. GET NEW SCORE ---
-                    // Use the average of the last 60 seconds from the per-second history
+                    // --- 1. GET NEW SCORE ---
+                    // (This part is the same as before)
                     let history = if !self.app_state.is_seeding { // if leeching
                         &self.app_state.avg_download_history
                     } else {
                         &self.app_state.avg_upload_history
                     };
 
-                    // Get the last 60s, or as many as we have
                     let relevant_history = &history[history.len().saturating_sub(60)..];
                     let new_score = if relevant_history.is_empty() {
                         0
@@ -1112,35 +1112,64 @@ impl App {
                     };
                     self.app_state.current_tuning_score = new_score;
 
+                    // --- 2. UPDATE LONG-TERM BASELINE (EMA) ---
+                    // This tracks the "normal" performance over the last ~10-20 trials (15-30 mins)
+                    const BASELINE_ALPHA: f64 = 0.1; // Slower-moving average
+                    let new_score_f64 = new_score as f64;
+                    if self.app_state.baseline_speed_ema == 0.0 {
+                        // Seed the EMA with the first score
+                        self.app_state.baseline_speed_ema = new_score_f64;
+                    } else {
+                        self.app_state.baseline_speed_ema = (new_score_f64 * BASELINE_ALPHA)
+                            + (self.app_state.baseline_speed_ema * (1.0 - BASELINE_ALPHA));
+                    }
+
                     // --- 3. COMPARE AND DECIDE ---
-                    if new_score > self.app_state.last_tuning_score {
+                    let best_score = self.app_state.last_tuning_score;
+                    if new_score > best_score {
                         // --- SUCCESS: KEEP THE CHANGE ---
                         // The last random change was good. Store this as the new best.
                         self.app_state.last_tuning_score = new_score;
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
                         tracing_event!(Level::DEBUG, "Self-Tune: SUCCESS. New best score: {}", new_score);
-
                     } else {
                         // --- FAILURE: REVERT THE CHANGE ---
-                        // The last change was bad or no better. Revert to the last known good settings.
                         self.app_state.limits = self.app_state.last_tuning_limits.clone();
-                        tracing_event!(Level::DEBUG, "Self-Tune: REVERTING. Score {} was not better than {}.", new_score, self.app_state.last_tuning_score);
+
+                        let baseline_u64 = self.app_state.baseline_speed_ema as u64;
+
+                        // --- REALITY CHECK ---
+                        // Is the "best score" now unachievable?
+                        // e.g., if the best is > 10kbps AND more than 2x the recent baseline
+                        const REALITY_CHECK_FACTOR: f64 = 2.0;
+                        if best_score > 10_000
+                            && best_score
+                                > (self.app_state.baseline_speed_ema * REALITY_CHECK_FACTOR) as u64
+                        {
+                            // The old peak is stale and unachievable. Reset it to the current baseline
+                            // so we can start finding a *new*, realistic peak.
+                            self.app_state.last_tuning_score = baseline_u64;
+                            tracing_event!(Level::DEBUG, "Self-Tune: REALITY CHECK. Score {} failed. Old best {} is stale vs. baseline {}. Resetting best to baseline.", new_score, best_score, baseline_u64);
+                        } else {
+                            // The peak is still realistic, just this trial failed.
+                            tracing_event!(Level::DEBUG, "Self-Tune: REVERTING. Score {} was not better than {}. (Baseline is {})", new_score, best_score, baseline_u64);
+                        }
 
                         // Tell the resource manager to revert
-                        let _ = self.resource_manager.update_limits(
-                            self.app_state.limits.clone().into_map()
-                        ).await;
+                        let _ = self.resource_manager
+                            .update_limits(self.app_state.limits.clone().into_map())
+                            .await;
                     }
 
                     // --- 4. MAKE THE *NEXT* RANDOM CHANGE ---
-                    // Apply a new random adjustment for the *next* 90-second cycle.
+                    // (This part is the same as before)
                     let (next_limits, desc) = make_random_adjustment(self.app_state.limits.clone());
                     self.app_state.limits = next_limits; // Optimistically set the new limits
 
                     tracing_event!(Level::DEBUG, "Self-Tune: Trying next change... {}", desc);
-                    let _ = self.resource_manager.update_limits(
-                        self.app_state.limits.clone().into_map()
-                    ).await;
+                    let _ = self.resource_manager
+                        .update_limits(self.app_state.limits.clone().into_map())
+                        .await;
                 }
 
                 _ = draw_interval.tick() => {
