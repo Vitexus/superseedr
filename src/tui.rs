@@ -1215,7 +1215,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
     let help_key = if app_state.system_warning.is_some() {
         vec![
             Span::styled("[m]", Style::default().fg(theme::TEAL)),
-            Span::styled("anual (warning!)", Style::default().fg(theme::YELLOW)),
+            Span::styled("anual/help (warning!)", Style::default().fg(theme::YELLOW)),
         ]
     } else {
         vec![
@@ -1239,7 +1239,7 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::styled("[t]", Style::default().fg(theme::SAPPHIRE)),
         Span::raw("ime | "),
         Span::styled("[z]", Style::default().fg(theme::SUBTEXT0)), // Changed from [Esc]
-        Span::raw("en mode| "),
+        Span::raw("en mode | "),
     ]);
     footer_spans.extend(help_key);
 

@@ -7,7 +7,7 @@
 # SCRIPT CONFIGURATION
 # ==============================================================================
 # 1. Replace 'your_app_name' with your executable name.
-APP_NAME="sync" 
+APP_NAME="superseedr" 
 # 2. Replace '37345' with your application's listening port.
 CLIENT_PORT="37345" 
 # ==============================================================================
