@@ -4,10 +4,7 @@ Terminal-based BitTorrent client written in Rust using **[Ratatui](https://ratat
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
-**Status: Distribution TBD**
-The final build and installation methods are under review. To run the application now, you must build from source.
-
-### Preview / Running Locally / Tested on M1 Macbook
+## Preview / Running Locally / Tested on M1 Macbook
 Run the application directly using Cargo:
 Loading torrents via Paste (crtl + v) or by setting a torrent watch directory.
 ```bash
@@ -44,11 +41,10 @@ The client is currently in a late-alpha stage. Most of the core BitTorrent proto
 ---
 
 ## Roadmap to V1.0
-This is the punch list of features and fixes required for a stable and feature-complete "Version 1.0" release.
-- Building and distribution WIP.
 - Testing in various platforms and terminals.
 - Handling magnet links via registry, app, ...etc
 - CI/CD
+- Building and distribution WIP.
 - Unit testing
 
 ## Future (V2.0 and Beyond)
