@@ -737,7 +737,6 @@ impl TorrentManager {
                             number_of_pieces_total,
                             number_of_pieces_completed,
                             activity_message: "Validating local files...".to_string(),
-                            // All other fields (speeds, peers, eta) are default (0 or empty)
                             ..Default::default()
                         };
                         

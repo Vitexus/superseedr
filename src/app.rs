@@ -566,7 +566,9 @@ impl App {
         };
 
         // --- 6. Restore Torrents from Previous Session ---
-        for torrent_config in app.client_configs.torrents.clone() {
+        let mut torrents_to_load = app.client_configs.torrents.clone();
+        torrents_to_load.sort_by_key(|t| !t.validation_status);
+        for torrent_config in torrents_to_load {
             if torrent_config.torrent_or_magnet.starts_with("magnet:") {
                 tracing_event!(Level::INFO, "STARTING {}", torrent_config.name);
                 // Call the method on the `app` variable we are building
