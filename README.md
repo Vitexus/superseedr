@@ -1,6 +1,6 @@
 # superseedr - A BitTorrent Client in Rust
 
-`superseedr` is a modern, terminal-based BitTorrent client and TUI written in Rust.
+Terminal-based BitTorrent client written in Rust using **[Ratatui](https://ratatui.rs/)**.
 
 ![Feature Demo](https://github.com/Jagalite/superseedr-assets/blob/main/superseedr_landing.webp)
 
