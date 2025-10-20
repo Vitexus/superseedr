@@ -81,6 +81,7 @@ const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 
 #[derive(Default, Clone)]
 pub struct CalculatedLimits {
+    pub reserve_permits: usize,
     pub max_connected_peers: usize,
     pub disk_read_permits: usize,
     pub disk_write_permits: usize,
@@ -88,6 +89,7 @@ pub struct CalculatedLimits {
 impl CalculatedLimits {
     pub fn into_map(self) -> HashMap<ResourceType, usize> {
         let mut map = HashMap::new();
+        map.insert(ResourceType::Reserve, self.reserve_permits);
         map.insert(ResourceType::PeerConnection, self.max_connected_peers);
         map.insert(ResourceType::DiskRead, self.disk_read_permits);
         map.insert(ResourceType::DiskWrite, self.disk_write_permits);
@@ -304,6 +306,7 @@ pub struct AppState {
     pub mode: AppMode,
     pub show_help: bool,
     pub externally_accessable_port: bool,
+    pub anonymize_torrent_names: bool,
 
     pub pending_torrent_link: String,
     pub torrents: HashMap<Vec<u8>, TorrentDisplayState>,
@@ -365,6 +368,9 @@ pub struct AppState {
     pub last_tuning_limits: CalculatedLimits,
     pub is_seeding: bool,
     pub baseline_speed_ema: f64,
+    pub global_disk_thrash_score: f64,
+    pub adaptive_max_scpb: f64,
+    pub global_seek_cost_per_byte_history: Vec<f64>,
 }
 
 pub struct App {
@@ -401,6 +407,7 @@ impl App {
             limits.disk_write_permits
         );
         let mut rm_limits = HashMap::new();
+        rm_limits.insert(ResourceType::Reserve, (limits.reserve_permits, 0));
         // For peers and connection attempts, we set a max_queue_size of 0 to fail fast ("try_acquire" behavior).
         rm_limits.insert(
             ResourceType::PeerConnection,
@@ -455,7 +462,7 @@ impl App {
             current_tuning_score: 0,
             tuning_countdown: 90,
             last_tuning_limits: limits.clone(),
-            is_seeding: false, // Start assuming not seeding (i.e., leeching) is the default state
+            adaptive_max_scpb: 10.0,
             ..Default::default()
         };
 
@@ -681,6 +688,7 @@ impl App {
                         }
                         ManagerEvent::DiskWriteStarted { info_hash, op } => {
                             self.app_state.write_op_start_times.push_front(Instant::now());
+                            self.app_state.global_disk_write_history_log.push_front(op);
                             self.app_state.global_disk_write_history_log.truncate(100);
                             if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
                                 torrent.bytes_written_this_tick += op.length as u64; // Keep this one
@@ -891,12 +899,30 @@ impl App {
                         self.app_state.run_time = process.run_time();
                     }
 
-                    // Semaphore Permit calculations ==================================
 
-
-                    // --- START OF CHANGES: Calculate all thrash scores ---
+                    // --- Calculate all thrash scores ---
                     self.app_state.global_disk_read_thrash_score = calculate_thrash_score(&self.app_state.global_disk_read_history_log);
                     self.app_state.global_disk_write_thrash_score = calculate_thrash_score(&self.app_state.global_disk_write_history_log);
+
+                    let global_read_thrash_f64 = calculate_thrash_score_seek_cost_f64(&self.app_state.global_disk_read_history_log);
+                    let global_write_thrash_f64 = calculate_thrash_score_seek_cost_f64(&self.app_state.global_disk_write_history_log);
+                    self.app_state.global_disk_thrash_score = global_read_thrash_f64 + global_write_thrash_f64;
+
+                    if self.app_state.global_disk_thrash_score > 0.01 {
+                         self.app_state.global_seek_cost_per_byte_history.push(self.app_state.global_disk_thrash_score);
+                    }
+                    if self.app_state.global_seek_cost_per_byte_history.len() > 1000 {
+                        self.app_state.global_seek_cost_per_byte_history.remove(0);
+                    }
+                    const MIN_SAMPLES_TO_LEARN: usize = 50;
+                    if self.app_state.global_seek_cost_per_byte_history.len() > MIN_SAMPLES_TO_LEARN {
+                        let mut sorted_history = self.app_state.global_seek_cost_per_byte_history.clone();
+                        sorted_history.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let percentile_index = (sorted_history.len() as f64 * 0.95) as usize;
+                        let new_scpb_max = sorted_history[percentile_index];
+                        self.app_state.adaptive_max_scpb = new_scpb_max.max(1.0);
+                    }
+
 
                     let mut global_disk_read_bps = 0;
                     let mut global_disk_write_bps = 0;
@@ -996,8 +1022,6 @@ impl App {
                         tracing_event!(Level::DEBUG, "Self-Tune: Objective changed to {}. Resetting score.", if is_seeding { "Seeding" } else { "Leeching" });
                         self.app_state.last_tuning_score = 0;
                         self.app_state.current_tuning_score = 0;
-                        // Reset limits to the last known good configuration for the *previous* objective.
-                        // The tuning will then find a new good configuration for the *new* objective.
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
                     }
                     self.app_state.is_seeding = is_seeding;
@@ -1008,9 +1032,6 @@ impl App {
 
                 _ = tuning_interval.tick() => {
                     self.app_state.tuning_countdown = 90;
-
-                    // --- 1. GET NEW SCORE ---
-                    // (This part is the same as before)
                     let history = if !self.app_state.is_seeding { // if leeching
                         &self.app_state.avg_download_history
                     } else {
@@ -1018,64 +1039,52 @@ impl App {
                     };
 
                     let relevant_history = &history[history.len().saturating_sub(60)..];
-                    let new_score = if relevant_history.is_empty() {
+                    let new_raw_score = if relevant_history.is_empty() {
                         0
                     } else {
                         relevant_history.iter().sum::<u64>() / relevant_history.len() as u64
                     };
+                    let current_scpb = self.app_state.global_disk_thrash_score;
+                    let scpb_max = self.app_state.adaptive_max_scpb;
+                    let penalty_factor = (current_scpb / scpb_max - 1.0).max(0.0);
+                    let new_score = (new_raw_score as f64 / (1.0 + penalty_factor)) as u64;
                     self.app_state.current_tuning_score = new_score;
 
-                    // --- 2. UPDATE LONG-TERM BASELINE (EMA) ---
-                    // This tracks the "normal" performance over the last ~10-20 trials (15-30 mins)
                     const BASELINE_ALPHA: f64 = 0.1; // Slower-moving average
                     let new_score_f64 = new_score as f64;
                     if self.app_state.baseline_speed_ema == 0.0 {
-                        // Seed the EMA with the first score
                         self.app_state.baseline_speed_ema = new_score_f64;
                     } else {
                         self.app_state.baseline_speed_ema = (new_score_f64 * BASELINE_ALPHA)
                             + (self.app_state.baseline_speed_ema * (1.0 - BASELINE_ALPHA));
                     }
 
-                    // --- 3. COMPARE AND DECIDE ---
                     let best_score = self.app_state.last_tuning_score;
                     if new_score > best_score {
-                        // --- SUCCESS: KEEP THE CHANGE ---
-                        // The last random change was good. Store this as the new best.
                         self.app_state.last_tuning_score = new_score;
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
-                        tracing_event!(Level::DEBUG, "Self-Tune: SUCCESS. New best score: {}", new_score);
+                        tracing_event!(Level::DEBUG, "Self-Tune: SUCCESS. New best score: {} (raw: {}, penalty: {:.2}x)", new_score, new_raw_score, penalty_factor);
                     } else {
-                        // --- FAILURE: REVERT THE CHANGE ---
                         self.app_state.limits = self.app_state.last_tuning_limits.clone();
 
                         let baseline_u64 = self.app_state.baseline_speed_ema as u64;
 
-                        // --- REALITY CHECK ---
-                        // Is the "best score" now unachievable?
-                        // e.g., if the best is > 10kbps AND more than 2x the recent baseline
                         const REALITY_CHECK_FACTOR: f64 = 2.0;
                         if best_score > 10_000
                             && best_score
                                 > (self.app_state.baseline_speed_ema * REALITY_CHECK_FACTOR) as u64
                         {
-                            // The old peak is stale and unachievable. Reset it to the current baseline
-                            // so we can start finding a *new*, realistic peak.
                             self.app_state.last_tuning_score = baseline_u64;
-                            tracing_event!(Level::DEBUG, "Self-Tune: REALITY CHECK. Score {} failed. Old best {} is stale vs. baseline {}. Resetting best to baseline.", new_score, best_score, baseline_u64);
+                            tracing_event!(Level::DEBUG, "Self-Tune: REALITY CHECK. Score {} (raw: {}) failed. Old best {} is stale vs. baseline {}. Resetting best to baseline.", new_score, new_raw_score, best_score, baseline_u64);
                         } else {
-                            // The peak is still realistic, just this trial failed.
-                            tracing_event!(Level::DEBUG, "Self-Tune: REVERTING. Score {} was not better than {}. (Baseline is {})", new_score, best_score, baseline_u64);
+                            tracing_event!(Level::DEBUG, "Self-Tune: REVERTING. Score {} (raw: {}, penalty: {:.2}x) was not better than {}. (Baseline is {})", new_score, new_raw_score, penalty_factor, best_score, baseline_u64);
                         }
 
-                        // Tell the resource manager to revert
                         let _ = self.resource_manager
                             .update_limits(self.app_state.limits.clone().into_map())
                             .await;
                     }
 
-                    // --- 4. MAKE THE *NEXT* RANDOM CHANGE ---
-                    // (This part is the same as before)
                     let (next_limits, desc) = make_random_adjustment(self.app_state.limits.clone());
                     self.app_state.limits = next_limits; // Optimistically set the new limits
 
@@ -1120,39 +1129,30 @@ impl App {
 
         for manager_tx in self.torrent_manager_command_txs.values() {
             let manager_tx_clone = manager_tx.clone();
-            // Spawn a task for each shutdown message, but DON'T store the handle
             tokio::spawn(async move {
-                // Send the command with a very short timeout for the send itself
                 let _ = tokio::time::timeout(
                     Duration::from_millis(100), // Short timeout just for the send
                     manager_tx_clone.send(ManagerCommand::Shutdown),
                 )
                 .await;
-                // We don't wait for the manager to actually process the command
             });
         }
 
-        // --- Run Shutdown UI for a Fixed Duration (e.g., 1 second) ---
-        let hard_limit_timeout = Duration::from_secs(1); // e.g., 5 seconds total max shutdown time
-        let shutdown_ui_future = self.run_shutdown_ui(terminal, hard_limit_timeout); // Pass duration
-                                                                                     // --- Apply the HARD LIMIT TIMEOUT ---
+        let hard_limit_timeout = Duration::from_secs(1);
+        let shutdown_ui_future = self.run_shutdown_ui(terminal, hard_limit_timeout);
         match tokio::time::timeout(hard_limit_timeout, shutdown_ui_future).await {
             Ok(Ok(_)) => {
-                // UI finished within the hard limit.
                 tracing_event!(Level::INFO, "Shutdown UI finished gracefully.");
             }
             Ok(Err(e)) => {
-                // UI function itself returned an error.
                 tracing_event!(Level::ERROR, "Shutdown UI loop failed: {}", e);
             }
             Err(_) => {
-                // HARD LIMIT REACHED.
                 tracing_event!(
                     Level::WARN,
                     "Shutdown hard limit ({:?}) reached. Exiting now.",
                     hard_limit_timeout
                 );
-                // Force progress to 100% for the final draw
                 self.app_state.shutdown_progress = 1.0;
                 terminal.draw(|f| {
                     tui::draw(f, &self.app_state, &self.client_configs);
@@ -1577,6 +1577,33 @@ fn calculate_thrash_score(history_log: &VecDeque<DiskIoOperation>) -> u64 {
     total_seek_distance / seek_count as u64
 }
 
+
+fn calculate_thrash_score_seek_cost_f64(history_log: &VecDeque<DiskIoOperation>) -> f64 {
+    if history_log.len() < 2 {
+        return 0.0; // Not enough data to calculate a seek distance
+    }
+
+    let mut total_seek_distance = 0;
+    let mut total_bytes_transferred = 0;
+    let mut last_offset_end: Option<u64> = None;
+
+    // Iterate in reverse to process operations in chronological order (oldest to newest)
+    for op in history_log.iter().rev() {
+        if let Some(prev_offset_end) = last_offset_end {
+            total_seek_distance += op.offset.abs_diff(prev_offset_end);
+        }
+        last_offset_end = Some(op.offset + op.length as u64);
+        total_bytes_transferred += op.length as u64;
+    }
+
+    if total_bytes_transferred == 0 {
+        return 0.0; // Avoid division by zero
+    }
+
+    // Return the "seek cost per byte"
+    total_seek_distance as f64 / total_bytes_transferred as f64
+}
+
 fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Option<String>) {
     let effective_limit;
     let mut system_warning = None;
@@ -1619,15 +1646,16 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
         tracing_event!(Level::WARN, "{}", warning);
     }
 
-    let safe_budget = (effective_limit as f64 * 0.90) as usize;
+    let safe_budget = effective_limit as f64 * 0.90;
     const PEER_PROPORTION: f64 = 0.75;
     const DISK_READ_PROPORTION: f64 = 0.08;
     const DISK_WRITE_PROPORTION: f64 = 0.08;
 
     let limits = CalculatedLimits {
-        max_connected_peers: (safe_budget as f64 * PEER_PROPORTION).max(10.0) as usize,
-        disk_read_permits: (safe_budget as f64 * DISK_READ_PROPORTION).max(4.0) as usize,
-        disk_write_permits: (safe_budget as f64 * DISK_WRITE_PROPORTION).max(4.0) as usize,
+        reserve_permits: 0,
+        max_connected_peers: (safe_budget * PEER_PROPORTION).max(10.0) as usize,
+        disk_read_permits: (safe_budget * DISK_READ_PROPORTION).max(4.0) as usize,
+        disk_write_permits: (safe_budget * DISK_WRITE_PROPORTION).max(4.0) as usize,
     };
 
     (limits, system_warning)
@@ -1635,30 +1663,42 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
 
 const MIN_STEP_RATE: f64 = 0.01;
 const MAX_STEP_RATE: f64 = 0.10;
+
+// --- Define Min/Max bounds for all resource types ---
 const MIN_PEERS: usize = 20;
-const MAX_PEERS: usize = 1000;
 const MIN_DISK: usize = 2;
-const MAX_DISK: usize = 32;
+const MIN_RESERVE: usize = 0;
 
 // --- Maximum attempts to find a valid trade per cycle ---
-const MAX_TRADE_ATTEMPTS: usize = 5; // Try up to 5 different random trades
+const MAX_TRADE_ATTEMPTS: usize = 5;
 
-// Helper function get_bounds (Unchanged)
-fn get_bounds(resource: ResourceType) -> (usize, usize) {
+fn get_limit(limits: &CalculatedLimits, resource: ResourceType) -> usize {
     match resource {
-        ResourceType::PeerConnection => (MIN_PEERS, MAX_PEERS),
-        ResourceType::DiskRead => (MIN_DISK, MAX_DISK),
-        ResourceType::DiskWrite => (MIN_DISK, MAX_DISK),
+        ResourceType::PeerConnection => limits.max_connected_peers,
+        ResourceType::DiskRead => limits.disk_read_permits,
+        ResourceType::DiskWrite => limits.disk_write_permits,
+        ResourceType::Reserve => limits.reserve_permits,
+    }
+}
+
+fn set_limit(limits: &mut CalculatedLimits, resource: ResourceType, value: usize) {
+    match resource {
+        ResourceType::PeerConnection => limits.max_connected_peers = value,
+        ResourceType::DiskRead => limits.disk_read_permits = value,
+        ResourceType::DiskWrite => limits.disk_write_permits = value,
+        ResourceType::Reserve => limits.reserve_permits = value,
     }
 }
 
 /// Makes a random, proportional trade, retrying a few times if the first is blocked.
+/// This version is refactored to support any number of resources, including Reserve.
 fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, String) {
     let mut rng = rand::thread_rng();
     let mut parameters = [
         ResourceType::PeerConnection,
         ResourceType::DiskRead,
         ResourceType::DiskWrite,
+        ResourceType::Reserve, // Add Reserve to the trading pool
     ];
 
     for attempt in 0..MAX_TRADE_ATTEMPTS {
@@ -1667,52 +1707,37 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
         let source_param = parameters[0];
         let dest_param = parameters[1];
 
-        // 2. Get mutable references (same as before)
-        let (source_val_ptr, dest_val_ptr) = match (source_param, dest_param) {
-            (ResourceType::PeerConnection, ResourceType::DiskRead) => (
-                &mut limits.max_connected_peers,
-                &mut limits.disk_read_permits,
-            ),
-            (ResourceType::PeerConnection, ResourceType::DiskWrite) => (
-                &mut limits.max_connected_peers,
-                &mut limits.disk_write_permits,
-            ),
-            (ResourceType::DiskRead, ResourceType::PeerConnection) => (
-                &mut limits.disk_read_permits,
-                &mut limits.max_connected_peers,
-            ),
-            (ResourceType::DiskRead, ResourceType::DiskWrite) => (
-                &mut limits.disk_read_permits,
-                &mut limits.disk_write_permits,
-            ),
-            (ResourceType::DiskWrite, ResourceType::PeerConnection) => (
-                &mut limits.disk_write_permits,
-                &mut limits.max_connected_peers,
-            ),
-            (ResourceType::DiskWrite, ResourceType::DiskRead) => (
-                &mut limits.disk_write_permits,
-                &mut limits.disk_read_permits,
-            ),
-            _ => unreachable!(),
+        // 2. Get current values and bounds
+        let source_val = get_limit(&limits, source_param);
+        let dest_val = get_limit(&limits, dest_param);
+
+        let source_min = match source_param {
+            ResourceType::PeerConnection => MIN_PEERS,
+            ResourceType::DiskRead => MIN_DISK,
+            ResourceType::DiskWrite => MIN_DISK,
+            ResourceType::Reserve => MIN_RESERVE,
         };
 
-        // 3. Get bounds for BOTH parameters
-        let (source_min, _) = get_bounds(source_param);
-        let (_, dest_max) = get_bounds(dest_param);
-
-        // 4. Calculate random step rate and amount to trade
+        // 3. Calculate random step rate and amount to trade
         let step_rate = rng.gen_range(MIN_STEP_RATE..=MAX_STEP_RATE);
-        let amount_to_trade = ((*source_val_ptr as f64 * step_rate).ceil() as usize).max(1);
+        let amount_to_trade = ((source_val as f64 * step_rate).ceil() as usize).max(1);
 
-        // 5. Check if *this specific trade* is possible
-        let can_give = *source_val_ptr >= source_min.saturating_add(amount_to_trade);
-        let can_receive = *dest_val_ptr <= dest_max.saturating_sub(amount_to_trade);
+        // 4. Check if this specific trade is possible
+        let can_give = source_val >= source_min.saturating_add(amount_to_trade);
 
-        if can_give && can_receive {
+        if can_give  {
             // --- VALID TRADE FOUND ---
-            // 6. Perform the 1-for-1 trade
-            *source_val_ptr = source_val_ptr.saturating_sub(amount_to_trade);
-            *dest_val_ptr = dest_val_ptr.saturating_add(amount_to_trade);
+            // 5. Perform the 1-for-1 trade
+            set_limit(
+                &mut limits,
+                source_param,
+                source_val.saturating_sub(amount_to_trade),
+            );
+            set_limit(
+                &mut limits,
+                dest_param,
+                dest_val.saturating_add(amount_to_trade),
+            );
 
             let description = format!(
                 "Traded {} from {:?} to {:?} (Attempt {})",

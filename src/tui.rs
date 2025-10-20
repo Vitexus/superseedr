@@ -135,7 +135,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(10),
-            Constraint::Length(25),
+            Constraint::Length(27),
             Constraint::Length(1),
         ])
         .split(f.area());
@@ -329,8 +329,14 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                         row_style
                     };
 
+                    let name_to_display = if app_state.anonymize_torrent_names {
+                        format!("Torrent {}", i + 1)
+                    } else {
+                        state.torrent_name.clone()
+                    };
+
                     let mut name_cell = Cell::from(truncate_with_ellipsis(
-                        &state.torrent_name,
+                        &name_to_display,
                         name_column_width,
                     ));
                     if is_selected {
@@ -710,11 +716,30 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
         Line::from(""), // Separator
         Line::from(vec![
             Span::styled("Tune: ", Style::default().fg(theme::TEAL)),
-            Span::styled("Best ", Style::default().fg(theme::YELLOW)),
             Span::raw(app_state.last_tuning_score.to_string()),
             Span::styled(" | ", Style::default().fg(theme::SURFACE2)),
             Span::styled("Next in ", Style::default().fg(theme::TEXT)),
             Span::raw(format!("{}s", app_state.tuning_countdown)),
+        ]),
+        Line::from(vec![
+            Span::styled("Thrash: ", Style::default().fg(theme::TEAL)),
+            Span::styled(
+                format!("{:.1}", app_state.global_disk_thrash_score), // Current
+                Style::default().fg(theme::TEXT),
+            ),
+            Span::styled(" / ", Style::default().fg(theme::SURFACE2)),
+            Span::styled(
+                format!("{:.1}", app_state.adaptive_max_scpb), // Max
+                Style::default().fg(theme::SUBTEXT0),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Reserve Pool:  ", Style::default().fg(theme::TEAL)), // Using TEAL for a different color
+            Span::raw(app_state.limits.reserve_permits.to_string()),
+            format_limit_delta(
+                app_state.limits.reserve_permits,
+                app_state.last_tuning_limits.reserve_permits,
+            ),
         ]),
         {
             let mut spans = format_permits_spans(
@@ -1098,7 +1123,11 @@ fn draw_right_pane(f: &mut Frame, app_state: &AppState, details_chunk: Rect, pee
             };
 
             let title_width = peers_chunk.width.saturating_sub(4) as usize; // Account for borders and padding
-            let truncated_name = truncate_with_ellipsis(&state.torrent_name, title_width);
+            let truncated_name = if app_state.anonymize_torrent_names {
+                format!("Peers for Torrent {}", app_state.selected_torrent_index + 1)
+            } else {
+                truncate_with_ellipsis(&state.torrent_name, title_width)
+            };
             let peers_table = Table::new(peer_rows, peer_widths)
                 .header(peer_header)
                 .block(
@@ -1293,8 +1322,10 @@ fn draw_footer(f: &mut Frame, app_state: &AppState, settings: &Settings, footer_
         Span::raw("onfig | "),
         Span::styled("[t]", Style::default().fg(theme::SAPPHIRE)),
         Span::raw("ime | "),
-        Span::styled("[z]", Style::default().fg(theme::SUBTEXT0)), // Changed from [Esc]
+        Span::styled("[z]", Style::default().fg(theme::SUBTEXT0)),
         Span::raw("en mode | "),
+        Span::styled("[x]", Style::default().fg(theme::TEAL)),
+        Span::raw("ensor | "),
     ]);
     footer_spans.extend(help_key);
 
@@ -1586,6 +1617,10 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                 Row::new(vec![
                     Cell::from(Span::styled("t / T", Style::default().fg(theme::TEAL))),
                     Cell::from("Switch network graph time scale forward/backward"),
+                ]),
+                Row::new(vec![
+                    Cell::from(Span::styled("x", Style::default().fg(theme::TEAL))),
+                    Cell::from("Anonymize torrent names"),
                 ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
                 // --- Peer Flags Legend ---
