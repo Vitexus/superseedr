@@ -733,6 +733,14 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
                 Style::default().fg(theme::SUBTEXT0),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("Reserve Pool:  ", Style::default().fg(theme::TEAL)), // Using TEAL for a different color
+            Span::raw(app_state.limits.reserve_permits.to_string()),
+            format_limit_delta(
+                app_state.limits.reserve_permits,
+                app_state.last_tuning_limits.reserve_permits,
+            ),
+        ]),
         {
             let mut spans = format_permits_spans(
                 "Peer Slots: ",

@@ -24,6 +24,7 @@ impl Drop for PermitGuard {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum ResourceType {
+    Reserve,
     PeerConnection,
     DiskRead,
     DiskWrite,
@@ -119,27 +120,26 @@ impl ResourceManager {
         let mut acquire_txs = HashMap::new();
         let mut acquire_rxs = HashMap::new();
         let mut resources = HashMap::new();
-
-        let all_types = [
-            ResourceType::PeerConnection,
-            ResourceType::DiskRead,
-            ResourceType::DiskWrite,
-        ];
-
-        for res_type in all_types.into_iter() {
-            let (limit, max_queue_size) = limits.get(&res_type).copied().unwrap_or((0, 0));
-            let (tx, rx) = mpsc::channel(256);
-            acquire_txs.insert(res_type, tx);
-            acquire_rxs.insert(res_type, rx);
+        // Iterate over all provided limits.
+        for (res_type, (limit, max_queue_size)) in limits.iter() {
+            // Create a ResourceState for *all* resource types provided.
             resources.insert(
-                res_type,
+                *res_type,
                 ResourceState {
-                    limit,
+                    limit: *limit,
                     in_use: 0,
-                    max_queue_size,
+                    max_queue_size: *max_queue_size,
                     wait_queue: VecDeque::new(),
                 },
             );
+
+            // But *only* create acquire channels for acquirable types.
+            // The Reserve pool is just a number to be traded, not acquired.
+            if *res_type != ResourceType::Reserve {
+                let (tx, rx) = mpsc::channel(256);
+                acquire_txs.insert(*res_type, tx);
+                acquire_rxs.insert(*res_type, rx);
+            }
         }
 
         let client = ResourceManagerClient {

@@ -81,6 +81,7 @@ const MINUTES_HISTORY_MAX: usize = 48 * 60; // 48 hours of per-minute data
 
 #[derive(Default, Clone)]
 pub struct CalculatedLimits {
+    pub reserve_permits: usize,
     pub max_connected_peers: usize,
     pub disk_read_permits: usize,
     pub disk_write_permits: usize,
@@ -88,6 +89,7 @@ pub struct CalculatedLimits {
 impl CalculatedLimits {
     pub fn into_map(self) -> HashMap<ResourceType, usize> {
         let mut map = HashMap::new();
+        map.insert(ResourceType::Reserve, self.reserve_permits);
         map.insert(ResourceType::PeerConnection, self.max_connected_peers);
         map.insert(ResourceType::DiskRead, self.disk_read_permits);
         map.insert(ResourceType::DiskWrite, self.disk_write_permits);
@@ -405,6 +407,7 @@ impl App {
             limits.disk_write_permits
         );
         let mut rm_limits = HashMap::new();
+        rm_limits.insert(ResourceType::Reserve, (limits.reserve_permits, 0));
         // For peers and connection attempts, we set a max_queue_size of 0 to fail fast ("try_acquire" behavior).
         rm_limits.insert(
             ResourceType::PeerConnection,
@@ -1621,6 +1624,33 @@ fn calculate_thrash_score(history_log: &VecDeque<DiskIoOperation>) -> u64 {
     total_seek_distance / seek_count as u64
 }
 
+
+fn calculate_thrash_score_seek_cost_f64(history_log: &VecDeque<DiskIoOperation>) -> f64 {
+    if history_log.len() < 2 {
+        return 0.0; // Not enough data to calculate a seek distance
+    }
+
+    let mut total_seek_distance = 0;
+    let mut total_bytes_transferred = 0;
+    let mut last_offset_end: Option<u64> = None;
+
+    // Iterate in reverse to process operations in chronological order (oldest to newest)
+    for op in history_log.iter().rev() {
+        if let Some(prev_offset_end) = last_offset_end {
+            total_seek_distance += op.offset.abs_diff(prev_offset_end);
+        }
+        last_offset_end = Some(op.offset + op.length as u64);
+        total_bytes_transferred += op.length as u64;
+    }
+
+    if total_bytes_transferred == 0 {
+        return 0.0; // Avoid division by zero
+    }
+
+    // Return the "seek cost per byte"
+    total_seek_distance as f64 / total_bytes_transferred as f64
+}
+
 fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Option<String>) {
     let effective_limit;
     let mut system_warning = None;
@@ -1667,8 +1697,11 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
     const PEER_PROPORTION: f64 = 0.75;
     const DISK_READ_PROPORTION: f64 = 0.08;
     const DISK_WRITE_PROPORTION: f64 = 0.08;
+    let reserve_proportion =
+        (1.0 - PEER_PROPORTION - DISK_READ_PROPORTION - DISK_WRITE_PROPORTION).max(0.0);
 
     let limits = CalculatedLimits {
+        reserve_permits: (safe_budget as f64 * reserve_proportion).max(1.0) as usize,
         max_connected_peers: (safe_budget as f64 * PEER_PROPORTION).max(10.0) as usize,
         disk_read_permits: (safe_budget as f64 * DISK_READ_PROPORTION).max(4.0) as usize,
         disk_write_permits: (safe_budget as f64 * DISK_WRITE_PROPORTION).max(4.0) as usize,
@@ -1677,32 +1710,61 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
     (limits, system_warning)
 }
 
+// --- START: Replace existing tuning logic with this block ---
+
 const MIN_STEP_RATE: f64 = 0.01;
 const MAX_STEP_RATE: f64 = 0.10;
+
+// --- Define Min/Max bounds for all resource types ---
 const MIN_PEERS: usize = 20;
 const MAX_PEERS: usize = 1000;
 const MIN_DISK: usize = 2;
 const MAX_DISK: usize = 32;
+const MIN_RESERVE: usize = 0;
+const MAX_RESERVE: usize = 2000; // The reserve can be large
 
 // --- Maximum attempts to find a valid trade per cycle ---
-const MAX_TRADE_ATTEMPTS: usize = 5; // Try up to 5 different random trades
+const MAX_TRADE_ATTEMPTS: usize = 5;
 
-// Helper function get_bounds (Unchanged)
+/// Helper to get min/max bounds for a resource
 fn get_bounds(resource: ResourceType) -> (usize, usize) {
     match resource {
         ResourceType::PeerConnection => (MIN_PEERS, MAX_PEERS),
         ResourceType::DiskRead => (MIN_DISK, MAX_DISK),
         ResourceType::DiskWrite => (MIN_DISK, MAX_DISK),
+        ResourceType::Reserve => (MIN_RESERVE, MAX_RESERVE),
+    }
+}
+
+/// Helper to get the current limit value for a resource
+fn get_limit(limits: &CalculatedLimits, resource: ResourceType) -> usize {
+    match resource {
+        ResourceType::PeerConnection => limits.max_connected_peers,
+        ResourceType::DiskRead => limits.disk_read_permits,
+        ResourceType::DiskWrite => limits.disk_write_permits,
+        ResourceType::Reserve => limits.reserve_permits,
+    }
+}
+
+/// Helper to set the new limit value for a resource
+fn set_limit(limits: &mut CalculatedLimits, resource: ResourceType, value: usize) {
+    match resource {
+        ResourceType::PeerConnection => limits.max_connected_peers = value,
+        ResourceType::DiskRead => limits.disk_read_permits = value,
+        ResourceType::DiskWrite => limits.disk_write_permits = value,
+        ResourceType::Reserve => limits.reserve_permits = value,
     }
 }
 
 /// Makes a random, proportional trade, retrying a few times if the first is blocked.
+/// This version is refactored to support any number of resources, including Reserve.
 fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, String) {
     let mut rng = rand::thread_rng();
     let mut parameters = [
         ResourceType::PeerConnection,
         ResourceType::DiskRead,
         ResourceType::DiskWrite,
+        ResourceType::Reserve, // Add Reserve to the trading pool
     ];
 
     for attempt in 0..MAX_TRADE_ATTEMPTS {
@@ -1711,52 +1773,34 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
         let source_param = parameters[0];
         let dest_param = parameters[1];
 
-        // 2. Get mutable references (same as before)
-        let (source_val_ptr, dest_val_ptr) = match (source_param, dest_param) {
-            (ResourceType::PeerConnection, ResourceType::DiskRead) => (
-                &mut limits.max_connected_peers,
-                &mut limits.disk_read_permits,
-            ),
-            (ResourceType::PeerConnection, ResourceType::DiskWrite) => (
-                &mut limits.max_connected_peers,
-                &mut limits.disk_write_permits,
-            ),
-            (ResourceType::DiskRead, ResourceType::PeerConnection) => (
-                &mut limits.disk_read_permits,
-                &mut limits.max_connected_peers,
-            ),
-            (ResourceType::DiskRead, ResourceType::DiskWrite) => (
-                &mut limits.disk_read_permits,
-                &mut limits.disk_write_permits,
-            ),
-            (ResourceType::DiskWrite, ResourceType::PeerConnection) => (
-                &mut limits.disk_write_permits,
-                &mut limits.max_connected_peers,
-            ),
-            (ResourceType::DiskWrite, ResourceType::DiskRead) => (
-                &mut limits.disk_write_permits,
-                &mut limits.disk_read_permits,
-            ),
-            _ => unreachable!(),
-        };
+        // 2. Get current values and bounds
+        let source_val = get_limit(&limits, source_param);
+        let dest_val = get_limit(&limits, dest_param);
 
-        // 3. Get bounds for BOTH parameters
         let (source_min, _) = get_bounds(source_param);
         let (_, dest_max) = get_bounds(dest_param);
 
-        // 4. Calculate random step rate and amount to trade
+        // 3. Calculate random step rate and amount to trade
         let step_rate = rng.gen_range(MIN_STEP_RATE..=MAX_STEP_RATE);
-        let amount_to_trade = ((*source_val_ptr as f64 * step_rate).ceil() as usize).max(1);
+        let amount_to_trade = ((source_val as f64 * step_rate).ceil() as usize).max(1);
 
-        // 5. Check if *this specific trade* is possible
-        let can_give = *source_val_ptr >= source_min.saturating_add(amount_to_trade);
-        let can_receive = *dest_val_ptr <= dest_max.saturating_sub(amount_to_trade);
+        // 4. Check if this specific trade is possible
+        let can_give = source_val >= source_min.saturating_add(amount_to_trade);
+        let can_receive = dest_val <= dest_max.saturating_sub(amount_to_trade);
 
         if can_give && can_receive {
             // --- VALID TRADE FOUND ---
-            // 6. Perform the 1-for-1 trade
-            *source_val_ptr = source_val_ptr.saturating_sub(amount_to_trade);
-            *dest_val_ptr = dest_val_ptr.saturating_add(amount_to_trade);
+            // 5. Perform the 1-for-1 trade
+            set_limit(
+                &mut limits,
+                source_param,
+                source_val.saturating_sub(amount_to_trade),
+            );
+            set_limit(
+                &mut limits,
+                dest_param,
+                dest_val.saturating_add(amount_to_trade),
+            );
 
             let description = format!(
                 "Traded {} from {:?} to {:?} (Attempt {})",
@@ -1778,30 +1822,4 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
         MAX_TRADE_ATTEMPTS
     );
     (limits, description)
-}
-
-fn calculate_thrash_score_seek_cost_f64(history_log: &VecDeque<DiskIoOperation>) -> f64 {
-    if history_log.len() < 2 {
-        return 0.0; // Not enough data to calculate a seek distance
-    }
-
-    let mut total_seek_distance = 0;
-    let mut total_bytes_transferred = 0;
-    let mut last_offset_end: Option<u64> = None;
-
-    // Iterate in reverse to process operations in chronological order (oldest to newest)
-    for op in history_log.iter().rev() {
-        if let Some(prev_offset_end) = last_offset_end {
-            total_seek_distance += op.offset.abs_diff(prev_offset_end);
-        }
-        last_offset_end = Some(op.offset + op.length as u64);
-        total_bytes_transferred += op.length as u64;
-    }
-
-    if total_bytes_transferred == 0 {
-        return 0.0; // Avoid division by zero
-    }
-
-    // Return the "seek cost per byte"
-    total_seek_distance as f64 / total_bytes_transferred as f64
 }
