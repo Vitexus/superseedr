@@ -366,6 +366,9 @@ pub struct AppState {
     pub last_tuning_limits: CalculatedLimits,
     pub is_seeding: bool,
     pub baseline_speed_ema: f64,
+    pub global_disk_thrash_score: f64,
+    pub adaptive_max_scpb: f64,
+    pub global_seek_cost_per_byte_history: Vec<f64>,
 }
 
 pub struct App {
@@ -456,7 +459,7 @@ impl App {
             current_tuning_score: 0,
             tuning_countdown: 90,
             last_tuning_limits: limits.clone(),
-            is_seeding: false, // Start assuming not seeding (i.e., leeching) is the default state
+            adaptive_max_scpb: 10.0,
             ..Default::default()
         };
 
@@ -682,6 +685,7 @@ impl App {
                         }
                         ManagerEvent::DiskWriteStarted { info_hash, op } => {
                             self.app_state.write_op_start_times.push_front(Instant::now());
+                            self.app_state.global_disk_write_history_log.push_front(op);
                             self.app_state.global_disk_write_history_log.truncate(100);
                             if let Some(torrent) = self.app_state.torrents.get_mut(&info_hash) {
                                 torrent.bytes_written_this_tick += op.length as u64; // Keep this one
@@ -899,6 +903,36 @@ impl App {
                     self.app_state.global_disk_read_thrash_score = calculate_thrash_score(&self.app_state.global_disk_read_history_log);
                     self.app_state.global_disk_write_thrash_score = calculate_thrash_score(&self.app_state.global_disk_write_history_log);
 
+                    // MODIFIED: Calculate NEW scores for the Tuner
+                    let global_read_thrash_f64 = calculate_thrash_score_seek_cost_f64(&self.app_state.global_disk_read_history_log);
+                    let global_write_thrash_f64 = calculate_thrash_score_seek_cost_f64(&self.app_state.global_disk_write_history_log);
+                    self.app_state.global_disk_thrash_score = global_read_thrash_f64 + global_write_thrash_f64;
+
+                    if self.app_state.global_disk_thrash_score > 0.01 {
+                         self.app_state.global_seek_cost_per_byte_history.push(self.app_state.global_disk_thrash_score);
+                    }
+                    // 2. Keep history from growing forever (e.g., store last ~1000 tuning cycles)
+                    if self.app_state.global_seek_cost_per_byte_history.len() > 1000 {
+                        self.app_state.global_seek_cost_per_byte_history.remove(0);
+                    }
+
+                    // 3. Recalculate the 95th percentile (our SCPB_MAX)
+                    // We wait for a decent number of samples to get a stable value
+                    const MIN_SAMPLES_TO_LEARN: usize = 50;
+                    if self.app_state.global_seek_cost_per_byte_history.len() > MIN_SAMPLES_TO_LEARN {
+                        let mut sorted_history = self.app_state.global_seek_cost_per_byte_history.clone();
+                        // Sort floats (requires partial_cmp)
+                        sorted_history.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        
+                        let percentile_index = (sorted_history.len() as f64 * 0.95) as usize;
+                        let new_scpb_max = sorted_history[percentile_index];
+                        
+                        // Set the new adaptive max, but with a safety floor of 1.0.
+                        // We never want to penalize scores less than 1.0 (which are efficient).
+                        self.app_state.adaptive_max_scpb = new_scpb_max.max(1.0);
+                    }
+
+
                     let mut global_disk_read_bps = 0;
                     let mut global_disk_write_bps = 0;
 
@@ -1019,11 +1053,20 @@ impl App {
                     };
 
                     let relevant_history = &history[history.len().saturating_sub(60)..];
-                    let new_score = if relevant_history.is_empty() {
+                    let new_raw_score = if relevant_history.is_empty() {
                         0
                     } else {
                         relevant_history.iter().sum::<u64>() / relevant_history.len() as u64
                     };
+                    // --- 1b. CALCULATE PENALTY (MODIFIED with your new logic) ---
+                    let current_scpb = self.app_state.global_disk_thrash_score;
+                    let scpb_max = self.app_state.adaptive_max_scpb;
+
+                    // Calculate Penalty Factor (P) = (Current / Max) - 1, with a floor of 0
+                    let penalty_factor = (current_scpb / scpb_max - 1.0).max(0.0);
+
+                    // Apply penalty: Final Score = Throughput / (1 + P)
+                    let new_score = (new_raw_score as f64 / (1.0 + penalty_factor)) as u64;
                     self.app_state.current_tuning_score = new_score;
 
                     // --- 2. UPDATE LONG-TERM BASELINE (EMA) ---
@@ -1045,7 +1088,7 @@ impl App {
                         // The last random change was good. Store this as the new best.
                         self.app_state.last_tuning_score = new_score;
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
-                        tracing_event!(Level::DEBUG, "Self-Tune: SUCCESS. New best score: {}", new_score);
+                        tracing_event!(Level::DEBUG, "Self-Tune: SUCCESS. New best score: {} (raw: {}, penalty: {:.2}x)", new_score, new_raw_score, penalty_factor);
                     } else {
                         // --- FAILURE: REVERT THE CHANGE ---
                         self.app_state.limits = self.app_state.last_tuning_limits.clone();
@@ -1063,10 +1106,10 @@ impl App {
                             // The old peak is stale and unachievable. Reset it to the current baseline
                             // so we can start finding a *new*, realistic peak.
                             self.app_state.last_tuning_score = baseline_u64;
-                            tracing_event!(Level::DEBUG, "Self-Tune: REALITY CHECK. Score {} failed. Old best {} is stale vs. baseline {}. Resetting best to baseline.", new_score, best_score, baseline_u64);
+                            tracing_event!(Level::DEBUG, "Self-Tune: REALITY CHECK. Score {} (raw: {}) failed. Old best {} is stale vs. baseline {}. Resetting best to baseline.", new_score, new_raw_score, best_score, baseline_u64);
                         } else {
                             // The peak is still realistic, just this trial failed.
-                            tracing_event!(Level::DEBUG, "Self-Tune: REVERTING. Score {} was not better than {}. (Baseline is {})", new_score, best_score, baseline_u64);
+                            tracing_event!(Level::DEBUG, "Self-Tune: REVERTING. Score {} (raw: {}, penalty: {:.2}x) was not better than {}. (Baseline is {})", new_score, new_raw_score, penalty_factor, best_score, baseline_u64);
                         }
 
                         // Tell the resource manager to revert
@@ -1735,4 +1778,30 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
         MAX_TRADE_ATTEMPTS
     );
     (limits, description)
+}
+
+fn calculate_thrash_score_seek_cost_f64(history_log: &VecDeque<DiskIoOperation>) -> f64 {
+    if history_log.len() < 2 {
+        return 0.0; // Not enough data to calculate a seek distance
+    }
+
+    let mut total_seek_distance = 0;
+    let mut total_bytes_transferred = 0;
+    let mut last_offset_end: Option<u64> = None;
+
+    // Iterate in reverse to process operations in chronological order (oldest to newest)
+    for op in history_log.iter().rev() {
+        if let Some(prev_offset_end) = last_offset_end {
+            total_seek_distance += op.offset.abs_diff(prev_offset_end);
+        }
+        last_offset_end = Some(op.offset + op.length as u64);
+        total_bytes_transferred += op.length as u64;
+    }
+
+    if total_bytes_transferred == 0 {
+        return 0.0; // Avoid division by zero
+    }
+
+    // Return the "seek cost per byte"
+    total_seek_distance as f64 / total_bytes_transferred as f64
 }

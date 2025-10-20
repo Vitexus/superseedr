@@ -135,7 +135,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(10),
-            Constraint::Length(25),
+            Constraint::Length(26),
             Constraint::Length(1),
         ])
         .split(f.area());
@@ -716,11 +716,22 @@ fn draw_stats_panel(f: &mut Frame, app_state: &AppState, settings: &Settings, st
         Line::from(""), // Separator
         Line::from(vec![
             Span::styled("Tune: ", Style::default().fg(theme::TEAL)),
-            Span::styled("Best ", Style::default().fg(theme::YELLOW)),
             Span::raw(app_state.last_tuning_score.to_string()),
             Span::styled(" | ", Style::default().fg(theme::SURFACE2)),
             Span::styled("Next in ", Style::default().fg(theme::TEXT)),
             Span::raw(format!("{}s", app_state.tuning_countdown)),
+        ]),
+        Line::from(vec![
+            Span::styled("Thrash: ", Style::default().fg(theme::TEAL)),
+            Span::styled(
+                format!("{:.1}", app_state.global_disk_thrash_score), // Current
+                Style::default().fg(theme::TEXT),
+            ),
+            Span::styled(" / ", Style::default().fg(theme::SURFACE2)),
+            Span::styled(
+                format!("{:.1}", app_state.adaptive_max_scpb), // Max
+                Style::default().fg(theme::SUBTEXT0),
+            ),
         ]),
         {
             let mut spans = format_permits_spans(
