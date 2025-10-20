@@ -1693,47 +1693,35 @@ fn calculate_adaptive_limits(client_configs: &Settings) -> (CalculatedLimits, Op
         tracing_event!(Level::WARN, "{}", warning);
     }
 
-    let safe_budget = (effective_limit as f64 * 0.90) as usize;
+    let safe_budget = effective_limit as f64 * 0.90;
     const PEER_PROPORTION: f64 = 0.75;
     const DISK_READ_PROPORTION: f64 = 0.08;
     const DISK_WRITE_PROPORTION: f64 = 0.08;
-    let reserve_proportion =
-        (1.0 - PEER_PROPORTION - DISK_READ_PROPORTION - DISK_WRITE_PROPORTION).max(0.0);
 
     let limits = CalculatedLimits {
-        reserve_permits: (safe_budget as f64 * reserve_proportion).max(1.0) as usize,
-        max_connected_peers: (safe_budget as f64 * PEER_PROPORTION).max(10.0) as usize,
-        disk_read_permits: (safe_budget as f64 * DISK_READ_PROPORTION).max(4.0) as usize,
-        disk_write_permits: (safe_budget as f64 * DISK_WRITE_PROPORTION).max(4.0) as usize,
+        reserve_permits: 0,
+        max_connected_peers: (safe_budget * PEER_PROPORTION).max(10.0) as usize,
+        disk_read_permits: (safe_budget * DISK_READ_PROPORTION).max(4.0) as usize,
+        disk_write_permits: (safe_budget * DISK_WRITE_PROPORTION).max(4.0) as usize,
     };
 
     (limits, system_warning)
 }
-
-// --- START: Replace existing tuning logic with this block ---
 
 const MIN_STEP_RATE: f64 = 0.01;
 const MAX_STEP_RATE: f64 = 0.10;
 
 // --- Define Min/Max bounds for all resource types ---
 const MIN_PEERS: usize = 20;
-const MAX_PEERS: usize = 1000;
 const MIN_DISK: usize = 2;
-const MAX_DISK: usize = 32;
 const MIN_RESERVE: usize = 0;
-const MAX_RESERVE: usize = 2000; // The reserve can be large
 
 // --- Maximum attempts to find a valid trade per cycle ---
 const MAX_TRADE_ATTEMPTS: usize = 5;
 
 /// Helper to get min/max bounds for a resource
-fn get_bounds(resource: ResourceType) -> (usize, usize) {
-    match resource {
-        ResourceType::PeerConnection => (MIN_PEERS, MAX_PEERS),
-        ResourceType::DiskRead => (MIN_DISK, MAX_DISK),
-        ResourceType::DiskWrite => (MIN_DISK, MAX_DISK),
-        ResourceType::Reserve => (MIN_RESERVE, MAX_RESERVE),
-    }
+fn get_bounds(_resource: ResourceType) -> usize {
+    1
 }
 
 /// Helper to get the current limit value for a resource
@@ -1777,8 +1765,13 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
         let source_val = get_limit(&limits, source_param);
         let dest_val = get_limit(&limits, dest_param);
 
-        let (source_min, _) = get_bounds(source_param);
-        let (_, dest_max) = get_bounds(dest_param);
+        let source_min = match source_param {
+            ResourceType::PeerConnection => MIN_PEERS,
+            ResourceType::DiskRead => MIN_DISK,
+            ResourceType::DiskWrite => MIN_DISK,
+            ResourceType::Reserve => MIN_RESERVE,
+        };
+        let dest_max = get_bounds(dest_param);
 
         // 3. Calculate random step rate and amount to trade
         let step_rate = rng.gen_range(MIN_STEP_RATE..=MAX_STEP_RATE);

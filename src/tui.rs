@@ -135,7 +135,7 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(10),
-            Constraint::Length(26),
+            Constraint::Length(27),
             Constraint::Length(1),
         ])
         .split(f.area());
