@@ -899,14 +899,11 @@ impl App {
                         self.app_state.run_time = process.run_time();
                     }
 
-                    // Semaphore Permit calculations ==================================
 
-
-                    // --- START OF CHANGES: Calculate all thrash scores ---
+                    // --- Calculate all thrash scores ---
                     self.app_state.global_disk_read_thrash_score = calculate_thrash_score(&self.app_state.global_disk_read_history_log);
                     self.app_state.global_disk_write_thrash_score = calculate_thrash_score(&self.app_state.global_disk_write_history_log);
 
-                    // MODIFIED: Calculate NEW scores for the Tuner
                     let global_read_thrash_f64 = calculate_thrash_score_seek_cost_f64(&self.app_state.global_disk_read_history_log);
                     let global_write_thrash_f64 = calculate_thrash_score_seek_cost_f64(&self.app_state.global_disk_write_history_log);
                     self.app_state.global_disk_thrash_score = global_read_thrash_f64 + global_write_thrash_f64;
@@ -914,24 +911,15 @@ impl App {
                     if self.app_state.global_disk_thrash_score > 0.01 {
                          self.app_state.global_seek_cost_per_byte_history.push(self.app_state.global_disk_thrash_score);
                     }
-                    // 2. Keep history from growing forever (e.g., store last ~1000 tuning cycles)
                     if self.app_state.global_seek_cost_per_byte_history.len() > 1000 {
                         self.app_state.global_seek_cost_per_byte_history.remove(0);
                     }
-
-                    // 3. Recalculate the 95th percentile (our SCPB_MAX)
-                    // We wait for a decent number of samples to get a stable value
                     const MIN_SAMPLES_TO_LEARN: usize = 50;
                     if self.app_state.global_seek_cost_per_byte_history.len() > MIN_SAMPLES_TO_LEARN {
                         let mut sorted_history = self.app_state.global_seek_cost_per_byte_history.clone();
-                        // Sort floats (requires partial_cmp)
                         sorted_history.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                        
                         let percentile_index = (sorted_history.len() as f64 * 0.95) as usize;
                         let new_scpb_max = sorted_history[percentile_index];
-                        
-                        // Set the new adaptive max, but with a safety floor of 1.0.
-                        // We never want to penalize scores less than 1.0 (which are efficient).
                         self.app_state.adaptive_max_scpb = new_scpb_max.max(1.0);
                     }
 
@@ -1034,8 +1022,6 @@ impl App {
                         tracing_event!(Level::DEBUG, "Self-Tune: Objective changed to {}. Resetting score.", if is_seeding { "Seeding" } else { "Leeching" });
                         self.app_state.last_tuning_score = 0;
                         self.app_state.current_tuning_score = 0;
-                        // Reset limits to the last known good configuration for the *previous* objective.
-                        // The tuning will then find a new good configuration for the *new* objective.
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
                     }
                     self.app_state.is_seeding = is_seeding;
@@ -1046,9 +1032,6 @@ impl App {
 
                 _ = tuning_interval.tick() => {
                     self.app_state.tuning_countdown = 90;
-
-                    // --- 1. GET NEW SCORE ---
-                    // (This part is the same as before)
                     let history = if !self.app_state.is_seeding { // if leeching
                         &self.app_state.avg_download_history
                     } else {
@@ -1061,68 +1044,47 @@ impl App {
                     } else {
                         relevant_history.iter().sum::<u64>() / relevant_history.len() as u64
                     };
-                    // --- 1b. CALCULATE PENALTY (MODIFIED with your new logic) ---
                     let current_scpb = self.app_state.global_disk_thrash_score;
                     let scpb_max = self.app_state.adaptive_max_scpb;
-
-                    // Calculate Penalty Factor (P) = (Current / Max) - 1, with a floor of 0
                     let penalty_factor = (current_scpb / scpb_max - 1.0).max(0.0);
-
-                    // Apply penalty: Final Score = Throughput / (1 + P)
                     let new_score = (new_raw_score as f64 / (1.0 + penalty_factor)) as u64;
                     self.app_state.current_tuning_score = new_score;
 
-                    // --- 2. UPDATE LONG-TERM BASELINE (EMA) ---
-                    // This tracks the "normal" performance over the last ~10-20 trials (15-30 mins)
                     const BASELINE_ALPHA: f64 = 0.1; // Slower-moving average
                     let new_score_f64 = new_score as f64;
                     if self.app_state.baseline_speed_ema == 0.0 {
-                        // Seed the EMA with the first score
                         self.app_state.baseline_speed_ema = new_score_f64;
                     } else {
                         self.app_state.baseline_speed_ema = (new_score_f64 * BASELINE_ALPHA)
                             + (self.app_state.baseline_speed_ema * (1.0 - BASELINE_ALPHA));
                     }
 
-                    // --- 3. COMPARE AND DECIDE ---
                     let best_score = self.app_state.last_tuning_score;
                     if new_score > best_score {
-                        // --- SUCCESS: KEEP THE CHANGE ---
-                        // The last random change was good. Store this as the new best.
                         self.app_state.last_tuning_score = new_score;
                         self.app_state.last_tuning_limits = self.app_state.limits.clone();
                         tracing_event!(Level::DEBUG, "Self-Tune: SUCCESS. New best score: {} (raw: {}, penalty: {:.2}x)", new_score, new_raw_score, penalty_factor);
                     } else {
-                        // --- FAILURE: REVERT THE CHANGE ---
                         self.app_state.limits = self.app_state.last_tuning_limits.clone();
 
                         let baseline_u64 = self.app_state.baseline_speed_ema as u64;
 
-                        // --- REALITY CHECK ---
-                        // Is the "best score" now unachievable?
-                        // e.g., if the best is > 10kbps AND more than 2x the recent baseline
                         const REALITY_CHECK_FACTOR: f64 = 2.0;
                         if best_score > 10_000
                             && best_score
                                 > (self.app_state.baseline_speed_ema * REALITY_CHECK_FACTOR) as u64
                         {
-                            // The old peak is stale and unachievable. Reset it to the current baseline
-                            // so we can start finding a *new*, realistic peak.
                             self.app_state.last_tuning_score = baseline_u64;
                             tracing_event!(Level::DEBUG, "Self-Tune: REALITY CHECK. Score {} (raw: {}) failed. Old best {} is stale vs. baseline {}. Resetting best to baseline.", new_score, new_raw_score, best_score, baseline_u64);
                         } else {
-                            // The peak is still realistic, just this trial failed.
                             tracing_event!(Level::DEBUG, "Self-Tune: REVERTING. Score {} (raw: {}, penalty: {:.2}x) was not better than {}. (Baseline is {})", new_score, new_raw_score, penalty_factor, best_score, baseline_u64);
                         }
 
-                        // Tell the resource manager to revert
                         let _ = self.resource_manager
                             .update_limits(self.app_state.limits.clone().into_map())
                             .await;
                     }
 
-                    // --- 4. MAKE THE *NEXT* RANDOM CHANGE ---
-                    // (This part is the same as before)
                     let (next_limits, desc) = make_random_adjustment(self.app_state.limits.clone());
                     self.app_state.limits = next_limits; // Optimistically set the new limits
 
@@ -1167,39 +1129,30 @@ impl App {
 
         for manager_tx in self.torrent_manager_command_txs.values() {
             let manager_tx_clone = manager_tx.clone();
-            // Spawn a task for each shutdown message, but DON'T store the handle
             tokio::spawn(async move {
-                // Send the command with a very short timeout for the send itself
                 let _ = tokio::time::timeout(
                     Duration::from_millis(100), // Short timeout just for the send
                     manager_tx_clone.send(ManagerCommand::Shutdown),
                 )
                 .await;
-                // We don't wait for the manager to actually process the command
             });
         }
 
-        // --- Run Shutdown UI for a Fixed Duration (e.g., 1 second) ---
-        let hard_limit_timeout = Duration::from_secs(1); // e.g., 5 seconds total max shutdown time
-        let shutdown_ui_future = self.run_shutdown_ui(terminal, hard_limit_timeout); // Pass duration
-                                                                                     // --- Apply the HARD LIMIT TIMEOUT ---
+        let hard_limit_timeout = Duration::from_secs(1);
+        let shutdown_ui_future = self.run_shutdown_ui(terminal, hard_limit_timeout);
         match tokio::time::timeout(hard_limit_timeout, shutdown_ui_future).await {
             Ok(Ok(_)) => {
-                // UI finished within the hard limit.
                 tracing_event!(Level::INFO, "Shutdown UI finished gracefully.");
             }
             Ok(Err(e)) => {
-                // UI function itself returned an error.
                 tracing_event!(Level::ERROR, "Shutdown UI loop failed: {}", e);
             }
             Err(_) => {
-                // HARD LIMIT REACHED.
                 tracing_event!(
                     Level::WARN,
                     "Shutdown hard limit ({:?}) reached. Exiting now.",
                     hard_limit_timeout
                 );
-                // Force progress to 100% for the final draw
                 self.app_state.shutdown_progress = 1.0;
                 terminal.draw(|f| {
                     tui::draw(f, &self.app_state, &self.client_configs);
@@ -1719,12 +1672,6 @@ const MIN_RESERVE: usize = 0;
 // --- Maximum attempts to find a valid trade per cycle ---
 const MAX_TRADE_ATTEMPTS: usize = 5;
 
-/// Helper to get min/max bounds for a resource
-fn get_bounds(_resource: ResourceType) -> usize {
-    1
-}
-
-/// Helper to get the current limit value for a resource
 fn get_limit(limits: &CalculatedLimits, resource: ResourceType) -> usize {
     match resource {
         ResourceType::PeerConnection => limits.max_connected_peers,
@@ -1734,7 +1681,6 @@ fn get_limit(limits: &CalculatedLimits, resource: ResourceType) -> usize {
     }
 }
 
-/// Helper to set the new limit value for a resource
 fn set_limit(limits: &mut CalculatedLimits, resource: ResourceType, value: usize) {
     match resource {
         ResourceType::PeerConnection => limits.max_connected_peers = value,
@@ -1771,7 +1717,6 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
             ResourceType::DiskWrite => MIN_DISK,
             ResourceType::Reserve => MIN_RESERVE,
         };
-        let dest_max = get_bounds(dest_param);
 
         // 3. Calculate random step rate and amount to trade
         let step_rate = rng.gen_range(MIN_STEP_RATE..=MAX_STEP_RATE);
@@ -1779,9 +1724,8 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
 
         // 4. Check if this specific trade is possible
         let can_give = source_val >= source_min.saturating_add(amount_to_trade);
-        let can_receive = dest_val <= dest_max.saturating_sub(amount_to_trade);
 
-        if can_give && can_receive {
+        if can_give  {
             // --- VALID TRADE FOUND ---
             // 5. Perform the 1-for-1 trade
             set_limit(
