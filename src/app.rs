@@ -304,6 +304,7 @@ pub struct AppState {
     pub mode: AppMode,
     pub show_help: bool,
     pub externally_accessable_port: bool,
+    pub anonymize_torrent_names: bool,
 
     pub pending_torrent_link: String,
     pub torrents: HashMap<Vec<u8>, TorrentDisplayState>,
