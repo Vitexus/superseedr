@@ -16,7 +16,7 @@ reqwest = "0.12.8"
 sha1 = "0.10.6"
 tokio = { version = "1", features = ["full"] }
 console-subscriber = "0.1"
-thiserror = "1.0"
+thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 serde = { version = "1.0", features = ["derive"] }
