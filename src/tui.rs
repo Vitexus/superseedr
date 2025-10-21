@@ -1645,19 +1645,19 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                     ])),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  ■", Style::default().fg(theme::SAPPHIRE))),
+                    Cell::from(Span::styled("■", Style::default().fg(theme::SAPPHIRE))),
                     Cell::from("You are interested (DL Potential)"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  ■", Style::default().fg(theme::MAROON))),
+                    Cell::from(Span::styled("■", Style::default().fg(theme::MAROON))),
                     Cell::from("Peer is choking you (DL Block)"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  ■", Style::default().fg(theme::TEAL))),
+                    Cell::from(Span::styled("■", Style::default().fg(theme::TEAL))),
                     Cell::from("Peer is interested (UL Opportunity)"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  ■", Style::default().fg(theme::PEACH))),
+                    Cell::from(Span::styled("■", Style::default().fg(theme::PEACH))),
                     Cell::from("You are choking peer (UL Restriction)"),
                 ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
@@ -1667,25 +1667,25 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                 ))]),
                 Row::new(vec![
                     Cell::from(Span::styled(
-                        "  ↑ (Read)",
+                        "↑ (Read)",
                         Style::default().fg(theme::GREEN),
                     )),
                     Cell::from("Data read from disk"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  ↓ (Write)", Style::default().fg(theme::SKY))),
+                    Cell::from(Span::styled("↓ (Write)", Style::default().fg(theme::SKY))),
                     Cell::from("Data written to disk"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  Seek", Style::default().fg(theme::TEXT))),
+                    Cell::from(Span::styled("Seek", Style::default().fg(theme::TEXT))),
                     Cell::from("Avg. distance between I/O ops (lower is better)"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  Latency", Style::default().fg(theme::TEXT))),
+                    Cell::from(Span::styled("Latency", Style::default().fg(theme::TEXT))),
                     Cell::from("Time to complete one I/O op (lower is better)"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  IOPS", Style::default().fg(theme::TEXT))),
+                    Cell::from(Span::styled("IOPS", Style::default().fg(theme::TEXT))),
                     Cell::from("I/O Operations Per Second (total workload)"),
                 ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
@@ -1695,7 +1695,7 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                 ))]),
                 Row::new(vec![
                     Cell::from(Span::styled(
-                        "  Best Score",
+                        "Best Score",
                         Style::default().fg(theme::TEXT),
                     )),
                     Cell::from(
@@ -1704,13 +1704,13 @@ fn draw_help_table(f: &mut Frame, mode: &AppMode, area: Rect) {
                 ]),
                 Row::new(vec![
                     Cell::from(Span::styled(
-                        "  Next seconds",
+                        "Next seconds",
                         Style::default().fg(theme::TEXT),
                     )),
                     Cell::from("Countdown to try a new random resource adjustment (file handles)"),
                 ]),
                 Row::new(vec![
-                    Cell::from(Span::styled("  (+/-)", Style::default().fg(theme::TEXT))),
+                    Cell::from(Span::styled("(+/-)", Style::default().fg(theme::TEXT))),
                     Cell::from("Random setting change between resources. (Green=Good, Red=Bad)"),
                 ]),
                 Row::new(vec![Cell::from(""), Cell::from("")]).height(1),
