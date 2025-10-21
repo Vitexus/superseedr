@@ -5,7 +5,7 @@
 name = "superseedr"
 version = "0.9.0"
 description = "Terminal-based BitTorrent client written in Rust using Ratatui."
-edition = "2025"
+edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
 
 [dev-dependencies]
