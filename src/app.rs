@@ -66,7 +66,7 @@ use tokio::sync::mpsc;
 
 use tokio::time;
 
-use crossterm::event::{self, Event as CrosstermEvent};
+use ratatui::crossterm::event::{self, Event as CrosstermEvent};
 
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -1703,7 +1703,7 @@ fn set_limit(limits: &mut CalculatedLimits, resource: ResourceType, value: usize
 /// Makes a random, proportional trade, retrying a few times if the first is blocked.
 /// This version is refactored to support any number of resources, including Reserve.
 fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, String) {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut parameters = [
         ResourceType::PeerConnection,
         ResourceType::DiskRead,
@@ -1729,7 +1729,7 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
         };
 
         // 3. Calculate random step rate and amount to trade
-        let step_rate = rng.gen_range(MIN_STEP_RATE..=MAX_STEP_RATE);
+        let step_rate = rng.random_range(MIN_STEP_RATE..=MAX_STEP_RATE);
         let amount_to_trade = ((source_val as f64 * step_rate).ceil() as usize).max(1);
 
         // 4. Check if this specific trade is possible

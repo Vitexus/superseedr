@@ -1940,7 +1940,7 @@ fn draw_power_saving_screen(f: &mut Frame, app_state: &AppState, settings: &Sett
         .as_secs();
     let seed = seconds_since_epoch / MESSAGE_INTERVAL_SECONDS;
     let mut rng = StdRng::seed_from_u64(seed);
-    let message_index = rng.gen_range(0..TRANQUIL_MESSAGES.len());
+    let message_index = rng.random_range(0..TRANQUIL_MESSAGES.len());
     let current_message = TRANQUIL_MESSAGES[message_index];
 
     // --- Prepare Main Content Paragraph ---

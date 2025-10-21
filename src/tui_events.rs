@@ -5,7 +5,7 @@ use crate::app::{
     App, AppMode, ConfigItem, SelectedHeader, TorrentControlState, PEER_HEADERS, TORRENT_HEADERS,
 };
 use crate::config::SortDirection;
-use crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::style::{Color, Style};
 use ratatui_explorer::{FileExplorer, Theme};
 use std::path::Path;

@@ -45,8 +45,7 @@ use crate::tracker::client::{
 };
 
 use rand::Rng;
-
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 
 use crate::torrent_file::Torrent;
 
@@ -391,7 +390,7 @@ impl TorrentManager {
                 .filter(|p| !unchoke_candidates.contains(&p.ip_port))
                 .collect();
 
-            if let Some(optimistic_peer) = optimistic_candidates.choose(&mut rand::thread_rng()) {
+            if let Some(optimistic_peer) = optimistic_candidates.choose(&mut rand::rng()) {
                 unchoke_candidates.insert(optimistic_peer.ip_port.clone());
             }
             self.optimistic_unchoke_timer = Instant::now();
@@ -1587,7 +1586,7 @@ impl TorrentManager {
                                                                                             }
 
                                                                                             let backoff_duration_ms = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
-                                                                                            let jitter = rand::thread_rng().gen_range(0..=JITTER_MS);
+                                                                                            let jitter = rand::rng().random_range(0..=JITTER_MS);
                                                                                             let total_delay = Duration::from_millis(backoff_duration_ms + jitter);
 
                                                                                             event!(
@@ -1732,7 +1731,7 @@ impl TorrentManager {
                                                         }
 
                                                         let backoff_duration_ms = BASE_BACKOFF_MS.saturating_mul(2u64.pow(attempt));
-                                                        let jitter = rand::thread_rng().gen_range(0..=JITTER_MS);
+                                                        let jitter = rand::rng().random_range(0..=JITTER_MS);
                                                         let total_delay = Duration::from_millis(backoff_duration_ms + jitter);
 
                                                         event!(

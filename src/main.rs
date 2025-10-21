@@ -210,12 +210,12 @@ fn generate_client_id_string() -> String {
     const CLIENT_PREFIX: &str = "-SS1000-";
     const RANDOM_LEN: usize = 12;
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let random_chars: String = (0..RANDOM_LEN)
         .map(|_| {
             const CHARSET: &[u8] =
                 b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect();

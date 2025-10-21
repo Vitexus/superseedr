@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::torrent_manager::state::TorrentStatus;
-use rand::seq::SliceRandom;
+
+use rand::prelude::IndexedRandom;
 
 use tracing::{event, Level};
 
@@ -85,7 +86,7 @@ impl PieceManager {
                 .collect();
 
             // Choose a random piece from the candidates.
-            candidate_pieces.choose(&mut rand::thread_rng()).copied()
+            candidate_pieces.choose(&mut rand::rng()).copied()
         }
     }
 
