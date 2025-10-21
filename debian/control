@@ -1,0 +1,33 @@
+Source: superseedr
+Section: net
+Priority: optional
+Maintainer: Vítězslav Dvořák <info@vitexsoftware.cz>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ libssl-dev,
+ pkg-config,
+Standards-Version: 4.7.0
+Homepage: https://github.com/Jagalite/superseedr
+Rules-Requires-Root: no
+Vcs-Git: https://github.com/Jagalite/superseedr.git
+Vcs-Browser: https://github.com/Jagalite/superseedr
+
+Package: superseedr
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Description: Terminal-based BitTorrent client written in Rust
+ superseedr is a feature-rich BitTorrent client with a terminal user interface
+ built using Ratatui. It implements the full BitTorrent protocol including:
+ .
+  * Multi-torrent download and seeding support
+  * Tracker, DHT, and PEX peer discovery
+  * Magnet link support with metadata download
+  * Rarest-first piece selection with endgame mode
+  * Tit-for-tat choking algorithm with optimistic unchoking
+  * Interactive TUI with real-time network graphs
+  * Configurable bandwidth limits and resource management
+  * Cross-platform configuration and state persistence

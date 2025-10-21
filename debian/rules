@@ -1,0 +1,22 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --verbose
+
+override_dh_auto_install:
+	install -D -m 755 target/release/superseedr debian/superseedr/usr/bin/superseedr
+
+override_dh_auto_test:
+	# Skip tests during package build
+	# Tests can be run manually with: cargo test --verbose
+
+override_dh_auto_clean:
+	cargo clean
+
+override_dh_auto_configure:
+	# Skip auto-configure for Rust/Cargo projects

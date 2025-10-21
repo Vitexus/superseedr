@@ -1,0 +1,42 @@
+superseedr for Debian
+
+Configuration and Data Directories:
+
+  Config: ~/.config/jagalite.superseedr/
+  Data:   ~/.local/share/jagalite.superseedr/
+  Watch:  ~/.local/share/jagalite.superseedr/watch_files/
+  Logs:   ~/.local/share/jagalite.superseedr/logs/
+
+Usage:
+
+  Run superseedr directly from the terminal:
+    $ superseedr
+
+  Add a torrent file:
+    $ superseedr add /path/to/file.torrent
+
+  Add a magnet link:
+    $ superseedr add "magnet:?xt=urn:btih:..."
+
+  Stop the running client:
+    $ superseedr stop-client
+
+Keyboard Shortcuts:
+
+  Press 'm' in the TUI to see log and config paths
+  Press '?' for help screen with all available commands
+
+Configuration:
+
+  Settings are stored in TOML format at:
+  ~/.config/jagalite.superseedr/settings.toml
+
+  You can configure:
+  - Client port and peer limits
+  - Upload/download bandwidth limits
+  - Watch folder for auto-loading torrents
+  - Default download directory
+  - DHT bootstrap nodes
+  - Resource limits and performance tuning
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Mon, 21 Oct 2025 20:11:03 +0200

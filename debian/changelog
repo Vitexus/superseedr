@@ -1,0 +1,7 @@
+superseedr (1.0.0-1) unstable; urgency=medium
+
+  * Initial release
+  * Terminal-based BitTorrent client with full protocol support
+  * Features: DHT, PEX, magnet links, interactive TUI
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Mon, 21 Oct 2025 20:11:03 +0200
