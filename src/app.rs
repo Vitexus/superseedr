@@ -1,4 +1,3 @@
-// SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::tui;
@@ -49,8 +48,7 @@ use mainline::async_dht::AsyncDht;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-use notify::{RecursiveMode, Watcher};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+use notify::{Config, Error as NotifyError, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use ratatui::{backend::CrosstermBackend, Terminal};
 
@@ -301,6 +299,7 @@ pub struct AppState {
     pub should_quit: bool,
     pub shutdown_progress: f64,
     pub system_warning: Option<String>,
+    pub system_error: Option<String>,
     pub limits: CalculatedLimits,
 
     pub mode: AppMode,
@@ -387,13 +386,13 @@ pub struct App {
     pub global_ul_bucket: Arc<Mutex<TokenBucket>>,
 
     // Communication Channels
-    pub torrent_tx: Sender<TorrentState>,
+    pub torrent_tx: mpsc::Sender<TorrentState>,
     pub torrent_rx: mpsc::Receiver<TorrentState>,
-    pub manager_event_tx: Sender<ManagerEvent>,
+    pub manager_event_tx: mpsc::Sender<ManagerEvent>,
     pub manager_event_rx: mpsc::Receiver<ManagerEvent>,
-    pub app_command_tx: Sender<AppCommand>,
+    pub app_command_tx: mpsc::Sender<AppCommand>,
     pub app_command_rx: mpsc::Receiver<AppCommand>,
-    pub tui_event_tx: Sender<CrosstermEvent>,
+    pub tui_event_tx: mpsc::Sender<CrosstermEvent>,
     pub tui_event_rx: mpsc::Receiver<CrosstermEvent>,
 }
 impl App {
@@ -446,6 +445,7 @@ impl App {
         // --- 4. Initialize AppState from Configs ---
         let app_state = AppState {
             system_warning,
+            system_error: None,
             limits: limits.clone(),
             ui_needs_redraw: true,
             torrent_sort: (
@@ -537,68 +537,38 @@ impl App {
         });
 
         // --- Spawn Watch Folder task ---
-        let user_torrent_watch_path = self.client_configs.watch_folder.clone();
-
-        let mut system_watch_path = None;
-        if let Some((watch_path, _)) = get_watch_path() {
-            system_watch_path = Some(watch_path);
+        let (notify_tx, mut notify_rx) = mpsc::channel::<Result<Event, NotifyError>>(100);
+        let mut watcher = RecommendedWatcher::new(
+            move |res: Result<Event, NotifyError>| {
+                if let Err(e) = notify_tx.blocking_send(res) {
+                    tracing_event!(
+                        Level::ERROR,
+                        "Failed to send file event to main loop: {}",
+                        e
+                    );
+                }
+            },
+            Config::default(),
+        )?;
+        if let Some(path) = &self.client_configs.watch_folder {
+            if let Err(e) = watcher.watch(path, RecursiveMode::NonRecursive) {
+                tracing_event!(Level::ERROR, "Failed to watch user path {:?}: {}", path, e);
+            } else {
+                tracing_event!(Level::INFO, "Watching user path: {:?}", path);
+            }
         }
-
-        let app_command_tx_clone = self.app_command_tx.clone();
-        tokio::spawn(async move {
-            let (tx, mut rx) = mpsc::channel(10);
-            let event_handler = move |res: DebounceEventResult| {
-                if let Err(e) = tx.blocking_send(res) {
-                    tracing_event!(Level::ERROR, "Failed to send debouncer event: {}", e);
-                }
-            };
-            let mut debouncer = new_debouncer(Duration::from_secs(2), None, event_handler).unwrap();
-
-            if let Some(path) = user_torrent_watch_path {
-                debouncer
-                    .watcher()
-                    .watch(&path, RecursiveMode::NonRecursive)
-                    .unwrap();
+        if let Some((watch_path, _)) = get_watch_path() {
+            if let Err(e) = watcher.watch(&watch_path, RecursiveMode::NonRecursive) {
+                tracing_event!(
+                    Level::ERROR,
+                    "Failed to watch system path {:?}: {}",
+                    watch_path,
+                    e
+                );
+            } else {
+                tracing_event!(Level::INFO, "Watching system path: {:?}", watch_path);
             }
-            if let Some(path) = system_watch_path {
-                debouncer
-                    .watcher()
-                    .watch(&path, RecursiveMode::NonRecursive)
-                    .unwrap();
-            }
-
-            while let Some(res) = rx.recv().await {
-                if let Ok(events) = res {
-                    for event in events {
-                        if event.kind.is_create() {
-                            for path in &event.paths {
-                                if path.extension().is_some_and(|ext| ext == "torrent") {
-                                    let _ = app_command_tx_clone
-                                        .send(AppCommand::AddTorrentFromFile(path.clone()))
-                                        .await;
-                                }
-                                if path.extension().is_some_and(|ext| ext == "path") {
-                                    let _ = app_command_tx_clone
-                                        .send(AppCommand::AddTorrentFromPathFile(path.clone()))
-                                        .await;
-                                }
-                                if path.extension().is_some_and(|ext| ext == "magnet") {
-                                    let _ = app_command_tx_clone
-                                        .send(AppCommand::AddMagnetFromFile(path.clone()))
-                                        .await;
-                                }
-
-                                if path.file_name().is_some_and(|name| name == "shutdown.cmd") {
-                                    let _ = app_command_tx_clone
-                                        .send(AppCommand::ClientShutdown(path.clone()))
-                                        .await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        }
 
         // --- System Stats Setup ---
         let mut stats_interval = time::interval(Duration::from_secs(1));
@@ -769,6 +739,7 @@ impl App {
                         AppCommand::AddTorrentFromFile(path) => {
                             // All state mutation happens here, in the main task.
                             if let Some(download_path) = &self.client_configs.default_download_folder {
+
                                 self.add_torrent_from_file(
                                     path.to_path_buf(),
                                     download_path.to_path_buf(),
@@ -805,6 +776,9 @@ impl App {
 
                             } else {
                                 tracing_event!(Level::ERROR, "Watch folder cannot add torrent: default download folder is not set.");
+                                self.app_state.system_error = Some(format!(
+                                    "Failed to add torrent: Default download folder is not set. Press [c] to configure."
+                                ));
                             }
                         }
                         AppCommand::AddTorrentFromPathFile(path) => {
@@ -841,6 +815,9 @@ impl App {
                                             self.add_magnet_torrent("Fetching name...".to_string(), magnet_link.trim().to_string(), download_path, false, TorrentControlState::Running).await;
                                         } else {
                                             tracing_event!(Level::ERROR, "Watch folder cannot add magnet: default download folder is not set.");
+                                            self.app_state.system_error = Some(format!(
+                                                "Failed to add torrent: Default download folder not set. Press [c] to configure."
+                                            ));
                                         }
                                     }
                                     Err(e) => {
@@ -872,6 +849,44 @@ impl App {
 
                 Some(event) = self.tui_event_rx.recv() => {
                     tui_events::handle_event(event, self).await;
+                }
+
+                Some(result) = notify_rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            if event.kind.is_create() || event.kind.is_modify() {
+                                for path in &event.paths {
+                                        tracing_event!(Level::INFO, "Processing file event: {:?} for path: {:?}", event.kind, path);
+
+                                        if path.extension().is_some_and(|ext| ext == "torrent") {
+                                            let _ = self.app_command_tx
+                                                .send(AppCommand::AddTorrentFromFile(path.clone()))
+                                                .await;
+                                        }
+                                        if path.extension().is_some_and(|ext| ext == "path") {
+                                            let _ = self.app_command_tx
+                                                .send(AppCommand::AddTorrentFromPathFile(path.clone()))
+                                                .await;
+                                        }
+                                        if path.extension().is_some_and(|ext| ext == "magnet") {
+                                            let _ = self.app_command_tx
+                                                .send(AppCommand::AddMagnetFromFile(path.clone()))
+                                                .await;
+                                        }
+
+                                        if path.file_name().is_some_and(|name| name == "shutdown.cmd") {
+                                            tracing_event!(Level::INFO, "Shutdown command detected: {:?}", path);
+                                            let _ = self.app_command_tx
+                                                .send(AppCommand::ClientShutdown(path.clone()))
+                                                .await;
+                                        }
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing_event!(Level::ERROR, "File watcher error: {:?}", error);
+                        }
+                    }
                 }
 
                 _ = stats_interval.tick() => {
@@ -1577,7 +1592,6 @@ fn calculate_thrash_score(history_log: &VecDeque<DiskIoOperation>) -> u64 {
     total_seek_distance / seek_count as u64
 }
 
-
 fn calculate_thrash_score_seek_cost_f64(history_log: &VecDeque<DiskIoOperation>) -> f64 {
     if history_log.len() < 2 {
         return 0.0; // Not enough data to calculate a seek distance
@@ -1725,7 +1739,7 @@ fn make_random_adjustment(mut limits: CalculatedLimits) -> (CalculatedLimits, St
         // 4. Check if this specific trade is possible
         let can_give = source_val >= source_min.saturating_add(amount_to_trade);
 
-        if can_give  {
+        if can_give {
             // --- VALID TRADE FOUND ---
             // 5. Perform the 1-for-1 trade
             set_limit(

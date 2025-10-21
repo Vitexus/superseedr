@@ -9,12 +9,12 @@ mod networking;
 mod resource_manager;
 mod storage;
 mod theme;
+mod token_bucket;
 mod torrent_file;
 mod torrent_manager;
 mod tracker;
 mod tui;
 mod tui_events;
-mod token_bucket;
 
 use app::App;
 use rand::Rng;

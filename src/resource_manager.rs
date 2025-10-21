@@ -310,9 +310,8 @@ mod tests {
 
         // 2. Spawn a task to acquire the next one.
         let client_clone = client.clone();
-        let acquire_task = tokio::spawn(async move {
-            client_clone.acquire_peer_connection().await
-        });
+        let acquire_task =
+            tokio::spawn(async move { client_clone.acquire_peer_connection().await });
 
         // 3. Assert that it is blocking (by checking it's not finished)
         sleep(Duration::from_millis(50)).await;
@@ -343,10 +342,9 @@ mod tests {
 
         // 2. Spawn a task to take the only queue slot
         let client_clone = client.clone();
-        let acquire_task2 = tokio::spawn(async move {
-            client_clone.acquire_peer_connection().await
-        });
-        
+        let acquire_task2 =
+            tokio::spawn(async move { client_clone.acquire_peer_connection().await });
+
         // Give it time to run and block
         sleep(Duration::from_millis(50)).await;
         assert!(!acquire_task2.is_finished());
@@ -374,10 +372,9 @@ mod tests {
 
         // 2. Spawn task, it should block
         let client_clone = client.clone();
-        let acquire_task = tokio::spawn(async move {
-            client_clone.acquire_peer_connection().await
-        });
-        
+        let acquire_task =
+            tokio::spawn(async move { client_clone.acquire_peer_connection().await });
+
         // Assert it's blocking
         sleep(Duration::from_millis(50)).await;
         assert!(!acquire_task.is_finished());
@@ -415,10 +412,9 @@ mod tests {
 
         // 3. Spawn task, it should block (in_use is 2, limit is 1)
         let client_clone = client.clone();
-        let acquire_task = tokio::spawn(async move {
-            client_clone.acquire_peer_connection().await
-        });
-        
+        let acquire_task =
+            tokio::spawn(async move { client_clone.acquire_peer_connection().await });
+
         sleep(Duration::from_millis(50)).await;
         assert!(!acquire_task.is_finished());
 
@@ -450,10 +446,8 @@ mod tests {
 
         // 2. Spawn task for another PeerConnection, it should block
         let client_clone = client.clone();
-        let peer_task = tokio::spawn(async move {
-            client_clone.acquire_peer_connection().await
-        });
-        
+        let peer_task = tokio::spawn(async move { client_clone.acquire_peer_connection().await });
+
         sleep(Duration::from_millis(50)).await;
         assert!(
             !peer_task.is_finished(),
@@ -466,11 +460,11 @@ mod tests {
             read_result.is_ok(),
             "DiskRead acquire failed, was blocked by PeerConnection"
         );
-        
+
         // 4. Acquire DiskWrite, should fail (limit is 0, queue is 0)
         let write_result = client.acquire_disk_write().await;
         match write_result {
-            Err(ResourceManagerError::QueueFull) => { /* Success, queue size is 0 */ },
+            Err(ResourceManagerError::QueueFull) => { /* Success, queue size is 0 */ }
             _ => panic!("Expected QueueFull for 0-limit resource"),
         }
 

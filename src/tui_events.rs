@@ -36,6 +36,9 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
             CrosstermEvent::Key(key) => {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
+                        KeyCode::Esc => {
+                            app.app_state.system_error = None;
+                        }
                         KeyCode::Char('x') => {
                             app.app_state.anonymize_torrent_names =
                                 !app.app_state.anonymize_torrent_names;

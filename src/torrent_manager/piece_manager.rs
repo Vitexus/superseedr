@@ -260,7 +260,6 @@ mod tests {
         assert!(pm.need_queue.contains(&4));
         assert_eq!(pm.need_queue.len(), 5);
 
-
         // 4. Mark piece 3 (from NEED) as COMPLETE
         let peers_to_cancel = pm.mark_as_complete(3);
         assert!(peers_to_cancel.is_empty());
@@ -374,8 +373,11 @@ mod tests {
         // OR Candidates [0, 1, 3] if 2 was chosen. Rarity [0:1, 1:10, 3:5]. Rarest is 0.
         // OR Candidates [1, 2, 3] if 0 was chosen. Rarity [1:10, 2:1, 3:5]. Rarest is 2.
         let choice2 = pm.choose_piece_for_peer(&peer_bitfield, &peer_pending, &status);
-        if chosen_piece == 0 { assert_eq!(choice2, Some(2)); }
-        else { assert_eq!(choice2, Some(0)); } // If chosen_piece == 2
+        if chosen_piece == 0 {
+            assert_eq!(choice2, Some(2));
+        } else {
+            assert_eq!(choice2, Some(0));
+        } // If chosen_piece == 2
 
         // 3. Make all available pieces pending for this peer
         peer_pending.insert(0);
@@ -406,11 +408,13 @@ mod tests {
         // Run multiple times to increase chance of seeing different random choices.
         let mut choices = HashSet::new();
         for _ in 0..20 {
-             let choice = pm.choose_piece_for_peer(&peer_bitfield, &peer_pending, &status).unwrap();
-             assert!([0, 1, 2, 3].contains(&choice));
-             choices.insert(choice);
+            let choice = pm
+                .choose_piece_for_peer(&peer_bitfield, &peer_pending, &status)
+                .unwrap();
+            assert!([0, 1, 2, 3].contains(&choice));
+            choices.insert(choice);
         }
-         // Check if we got at least one from Need and one from Pending over several tries.
+        // Check if we got at least one from Need and one from Pending over several tries.
         assert!(choices.contains(&0) || choices.contains(&3)); // Need
         assert!(choices.contains(&1) || choices.contains(&2)); // Pending
     }
@@ -428,9 +432,11 @@ mod tests {
 
         // Candidates should be [0, 2, 3] (excludes piece 1)
         for _ in 0..20 {
-             let choice = pm.choose_piece_for_peer(&peer_bitfield, &peer_pending, &status).unwrap();
-             assert!([0, 2, 3].contains(&choice));
-             assert_ne!(choice, 1);
+            let choice = pm
+                .choose_piece_for_peer(&peer_bitfield, &peer_pending, &status)
+                .unwrap();
+            assert!([0, 2, 3].contains(&choice));
+            assert_ne!(choice, 1);
         }
     }
 
@@ -505,35 +511,34 @@ mod tests {
 
     #[test]
     fn test_handle_block_for_completed_piece() {
-         let mut pm = setup_manager(1);
-         let piece_index = 0;
-         let piece_size = 16384;
-         let block_data = vec![1; piece_size];
+        let mut pm = setup_manager(1);
+        let piece_index = 0;
+        let piece_size = 16384;
+        let block_data = vec![1; piece_size];
 
-         // Mark piece as complete first
-         pm.mark_as_complete(piece_index);
-         assert_eq!(pm.bitfield[piece_index as usize], PieceStatus::Done);
+        // Mark piece as complete first
+        pm.mark_as_complete(piece_index);
+        assert_eq!(pm.bitfield[piece_index as usize], PieceStatus::Done);
 
-         // Handle a block for the completed piece
-         // We expect handle_block might create an assembler temporarily
-         // but it shouldn't return the piece data again.
-         // Let's refine the expectation: If the piece manager knows the piece is Done,
-         // `handle_block` might ideally check this first and do nothing.
-         // If it relies solely on the assembler map, it might reassemble.
-         // Current implementation relies on assembler map.
+        // Handle a block for the completed piece
+        // We expect handle_block might create an assembler temporarily
+        // but it shouldn't return the piece data again.
+        // Let's refine the expectation: If the piece manager knows the piece is Done,
+        // `handle_block` might ideally check this first and do nothing.
+        // If it relies solely on the assembler map, it might reassemble.
+        // Current implementation relies on assembler map.
 
-         // Reset assembler state for the test
-         pm.piece_assemblers.remove(&piece_index);
+        // Reset assembler state for the test
+        pm.piece_assemblers.remove(&piece_index);
 
-         let result = pm.handle_block(piece_index, 0, &block_data, piece_size);
-         // Even though it assembles, because the `mark_as_complete` call removed
-         // it from need/pending queues, the manager logic *outside* handle_block
-         // should prevent requesting it again. The assembler map is primarily for
-         // in-progress downloads.
-         assert!(result.is_some()); // It will reassemble based on current logic
-         assert!(!pm.piece_assemblers.contains_key(&piece_index)); // Assembler is removed on completion
+        let result = pm.handle_block(piece_index, 0, &block_data, piece_size);
+        // Even though it assembles, because the `mark_as_complete` call removed
+        // it from need/pending queues, the manager logic *outside* handle_block
+        // should prevent requesting it again. The assembler map is primarily for
+        // in-progress downloads.
+        assert!(result.is_some()); // It will reassemble based on current logic
+        assert!(!pm.piece_assemblers.contains_key(&piece_index)); // Assembler is removed on completion
     }
-
 
     #[test]
     fn test_handle_block_non_standard_piece_size() {
@@ -566,23 +571,23 @@ mod tests {
         assert!(!pm.piece_assemblers.contains_key(&piece_index));
     }
 
-     #[test]
-     fn test_handle_block_ignores_extra_data() {
-         let mut pm = PieceManager::new();
-         let piece_index = 0;
-         let piece_size = 16384; // Exactly one block
-         let block_size = 16384;
-         let correct_block_data = vec![1; block_size];
-         let oversized_block_data = vec![1; block_size + 10]; // Extra data
+    #[test]
+    fn test_handle_block_ignores_extra_data() {
+        let mut pm = PieceManager::new();
+        let piece_index = 0;
+        let piece_size = 16384; // Exactly one block
+        let block_size = 16384;
+        let correct_block_data = vec![1; block_size];
+        let oversized_block_data = vec![1; block_size + 10]; // Extra data
 
-         // Send oversized block
-         let result = pm.handle_block(piece_index, 0, &oversized_block_data, piece_size);
+        // Send oversized block
+        let result = pm.handle_block(piece_index, 0, &oversized_block_data, piece_size);
 
-         // It should still complete, but only using the expected size
-         assert!(result.is_some());
-         let full_piece = result.unwrap();
-         assert_eq!(full_piece.len(), piece_size);
-         assert_eq!(full_piece, correct_block_data); // Ensure only correct data was stored
-         assert!(!pm.piece_assemblers.contains_key(&piece_index));
-     }
+        // It should still complete, but only using the expected size
+        assert!(result.is_some());
+        let full_piece = result.unwrap();
+        assert_eq!(full_piece.len(), piece_size);
+        assert_eq!(full_piece, correct_block_data); // Ensure only correct data was stored
+        assert!(!pm.piece_assemblers.contains_key(&piece_index));
+    }
 }
