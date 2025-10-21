@@ -776,9 +776,7 @@ impl App {
 
                             } else {
                                 tracing_event!(Level::ERROR, "Watch folder cannot add torrent: default download folder is not set.");
-                                self.app_state.system_error = Some(format!(
-                                    "Failed to add torrent: Default download folder is not set. Press [c] to configure."
-                                ));
+                                self.app_state.system_error = Some("Failed to add torrent: Default download folder is not set. Press [c] to configure.".to_string());
                             }
                         }
                         AppCommand::AddTorrentFromPathFile(path) => {
@@ -815,9 +813,7 @@ impl App {
                                             self.add_magnet_torrent("Fetching name...".to_string(), magnet_link.trim().to_string(), download_path, false, TorrentControlState::Running).await;
                                         } else {
                                             tracing_event!(Level::ERROR, "Watch folder cannot add magnet: default download folder is not set.");
-                                            self.app_state.system_error = Some(format!(
-                                                "Failed to add torrent: Default download folder not set. Press [c] to configure."
-                                            ));
+                                            self.app_state.system_error = Some("Failed to add torrent: Default download folder not set. Press [c] to configure.".to_string());
                                         }
                                     }
                                     Err(e) => {

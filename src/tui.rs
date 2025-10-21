@@ -1975,7 +1975,7 @@ fn draw_power_saving_screen(f: &mut Frame, app_state: &AppState, settings: &Sett
 fn draw_status_error_popup(f: &mut Frame, error_text: &str) {
     let popup_width_percent: u16 = 50;
     // We have 6 lines of text, plus 2 for the top/bottom borders.
-    let popup_height: u16 = 8; 
+    let popup_height: u16 = 8;
 
     // Create a vertical layout to center the popup
     let vertical_chunks = Layout::vertical([
@@ -1993,12 +1993,14 @@ fn draw_status_error_popup(f: &mut Frame, error_text: &str) {
     ])
     .split(vertical_chunks[1])[1]; // Use the middle chunk from the vertical layout
 
-    
     f.render_widget(Clear, area); // Clear the area behind the popup
 
     // Create the text for the popup
     let text = vec![
-        Line::from(Span::styled("Error", Style::default().fg(theme::RED).bold())),
+        Line::from(Span::styled(
+            "Error",
+            Style::default().fg(theme::RED).bold(),
+        )),
         Line::from(""),
         Line::from(Span::styled(error_text, Style::default().fg(theme::YELLOW))),
         Line::from(""),
@@ -2020,7 +2022,7 @@ fn draw_status_error_popup(f: &mut Frame, error_text: &str) {
         .alignment(Alignment::Center)
         // This makes sure that if the error message is too long,
         // it just gets cut off instead of wrapping and breaking the box height.
-        .wrap(Wrap { trim: true }); 
+        .wrap(Wrap { trim: true });
 
     f.render_widget(paragraph, area);
 }
