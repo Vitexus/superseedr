@@ -9,8 +9,8 @@ use super::protocol::{
     ExtendedHandshakePayload, Message, MessageSummary, MetadataMessage, PexMessage,
 };
 
-use crate::token_bucket::TokenBucket;
 use crate::token_bucket::consume_tokens;
+use crate::token_bucket::TokenBucket;
 
 use crate::command::TorrentCommand;
 

@@ -181,6 +181,10 @@ pub fn draw(f: &mut Frame, app_state: &AppState, settings: &Settings) {
 
     draw_footer(f, app_state, settings, footer_chunk);
 
+    if let Some(error_text) = &app_state.system_error {
+        draw_status_error_popup(f, error_text);
+    }
+
     if app_state.should_quit {
         draw_shutdown_screen(f, app_state);
     }
@@ -335,10 +339,8 @@ fn draw_left_pane(f: &mut Frame, app_state: &AppState, left_pane: Rect) {
                         state.torrent_name.clone()
                     };
 
-                    let mut name_cell = Cell::from(truncate_with_ellipsis(
-                        &name_to_display,
-                        name_column_width,
-                    ));
+                    let mut name_cell =
+                        Cell::from(truncate_with_ellipsis(&name_to_display, name_column_width));
                     if is_selected {
                         name_cell = name_cell.style(Style::default().fg(theme::YELLOW));
                         row_style = row_style.add_modifier(Modifier::BOLD);
@@ -1970,6 +1972,61 @@ fn draw_power_saving_screen(f: &mut Frame, app_state: &AppState, settings: &Sett
     f.render_widget(footer_paragraph, footer_area);
 }
 
+fn draw_status_error_popup(f: &mut Frame, error_text: &str) {
+    let popup_width_percent: u16 = 50;
+    // We have 6 lines of text, plus 2 for the top/bottom borders.
+    let popup_height: u16 = 8;
+
+    // Create a vertical layout to center the popup
+    let vertical_chunks = Layout::vertical([
+        Constraint::Min(0), // Top spacer
+        Constraint::Length(popup_height),
+        Constraint::Min(0), // Bottom spacer
+    ])
+    .split(f.area());
+
+    // Create a horizontal layout to center the popup
+    let area = Layout::horizontal([
+        Constraint::Percentage((100 - popup_width_percent) / 2),
+        Constraint::Percentage(popup_width_percent),
+        Constraint::Percentage((100 - popup_width_percent) / 2),
+    ])
+    .split(vertical_chunks[1])[1]; // Use the middle chunk from the vertical layout
+
+    f.render_widget(Clear, area); // Clear the area behind the popup
+
+    // Create the text for the popup
+    let text = vec![
+        Line::from(Span::styled(
+            "Error",
+            Style::default().fg(theme::RED).bold(),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(error_text, Style::default().fg(theme::YELLOW))),
+        Line::from(""),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[Press Esc to dismiss]",
+            Style::default().fg(theme::SUBTEXT1),
+        )),
+    ];
+
+    // Create the block
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::RED)); // Red border for warning
+
+    // Create the paragraph and render it
+    let paragraph = Paragraph::new(text)
+        .block(block)
+        .alignment(Alignment::Center)
+        // This makes sure that if the error message is too long,
+        // it just gets cut off instead of wrapping and breaking the box height.
+        .wrap(Wrap { trim: true });
+
+    f.render_widget(paragraph, area);
+}
+
 fn format_speed(bits_per_second: u64) -> String {
     if bits_per_second < 1_000 {
         format!("{} bps", bits_per_second)
@@ -2183,7 +2240,7 @@ fn calculate_nice_upper_bound(speed_bps: u64) -> u64 {
         // --- COMMENT FIXED ---
         // Default to 10 Kbps if speed is 0.
         // You can change this to 1_000_000 if you prefer a 1 Mbps floor.
-        return 10_000; 
+        return 10_000;
     }
 
     let exponent = (speed_bps as f64).log10().floor();
