@@ -3,7 +3,7 @@
 
 [package]
 name = "superseedr"
-version = "0.9.0"
+version = "1.0.0"
 description = "Terminal-based BitTorrent client written in Rust using Ratatui."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
@@ -51,3 +51,16 @@ notify = { version = "8.2.0", features = ["serde"] }
 clap = { version = "4.5.50", features = ["derive"] }
 fs2 = "0.4.3"
 rlimit = "0.10"
+
+[package.metadata.bundle]
+name = "superseedr"
+identifier = "com.github.jagalite.superseedr"
+# icon = ["packaging/macos/icon.icns"] # Optional: Uncomment and provide path if you have an icon
+version = "1.0.0" 
+copyright = "Copyright © 2025 Jaga Tranvo. All rights reserved." 
+category = "public.app-category.utilities" 
+short_description = "Terminal-based BitTorrent client." 
+long_description = """
+Terminal-based BitTorrent client written in Rust using Ratatui.
+""" 
+plist_path = "packaging/macos/Info.plist.template" 
