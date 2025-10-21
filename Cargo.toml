@@ -7,6 +7,7 @@ version = "0.9.0"
 description = "Terminal-based BitTorrent client written in Rust using Ratatui."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
+license = "GPL-3.0-or-later"
 
 [dev-dependencies]
 tempfile = "3.23.0"
