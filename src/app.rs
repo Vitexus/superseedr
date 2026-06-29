@@ -1009,6 +1009,13 @@ pub enum ConfigItem {
     GlobalUploadLimit,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfigPane {
+    #[default]
+    Settings,
+    Details,
+}
+
 #[derive(Default)]
 #[allow(clippy::large_enum_variant)]
 pub enum AppMode {
@@ -1653,6 +1660,7 @@ pub struct ConfigUiState {
     pub settings_edit: Box<Settings>,
     pub selected_index: usize,
     pub items: Vec<ConfigItem>,
+    pub active_pane: ConfigPane,
     pub editing: Option<(ConfigItem, String)>,
 }
 

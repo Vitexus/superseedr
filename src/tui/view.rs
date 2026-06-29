@@ -74,6 +74,7 @@ pub fn draw(
                 &app_state.ui.config.settings_edit,
                 app_state.ui.config.selected_index,
                 &app_state.ui.config.items,
+                app_state.ui.config.active_pane,
                 &app_state.ui.config.editing,
             );
             apply_theme_effects_to_frame(f, &ctx);

@@ -2032,6 +2032,7 @@ pub fn confirm_config_path_selection(
             settings_edit: new_settings,
             selected_index: *selected_index,
             items: items.clone(),
+            active_pane: crate::app::ConfigPane::Settings,
             editing: None,
         });
     }
@@ -2050,6 +2051,7 @@ pub fn escape_to_config_mode(browser_mode: &FileBrowserMode) -> Option<ConfigUiS
             settings_edit: current_settings.clone(),
             selected_index: *selected_index,
             items: items.clone(),
+            active_pane: crate::app::ConfigPane::Settings,
             editing: None,
         });
     }

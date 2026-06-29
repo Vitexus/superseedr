@@ -207,6 +207,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                     settings_edit: &mut app.app_state.ui.config.settings_edit,
                     selected_index: &mut app.app_state.ui.config.selected_index,
                     items: app.app_state.ui.config.items.as_mut_slice(),
+                    active_pane: &mut app.app_state.ui.config.active_pane,
                     editing: &mut app.app_state.ui.config.editing,
                     app_command_tx: &app.app_command_tx,
                     shutdown_tx: &app.shutdown_tx,
