@@ -13,9 +13,9 @@ use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
 use directories::UserDirs;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-use ratatui::prelude::{Frame, Line, Span, Style};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout};
+use ratatui::prelude::{Frame, Line, Modifier, Span, Style};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::{broadcast, mpsc};
 
 const RATE_LIMIT_STEP_BPS: u64 = 10_000 * 8;
@@ -237,7 +237,7 @@ fn map_key_to_config_action(
 
     match key_code {
         KeyCode::Esc | KeyCode::Char('Q') => Some(ConfigAction::SaveAndExit),
-        KeyCode::Enter => Some(ConfigAction::StartEditOrBrowse),
+        KeyCode::Char('e') => Some(ConfigAction::StartEditOrBrowse),
         KeyCode::Char(' ') => Some(ConfigAction::ToggleSelectedBool),
         KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
         KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
@@ -578,6 +578,16 @@ struct ConfigRenderContext<'a, 'b> {
     layout_kind: ConfigLayoutKind,
 }
 
+struct PortDetailsModel<'a> {
+    draft_port: u16,
+    active_port: u16,
+    default_port: u16,
+    editing_buffer: Option<&'a str>,
+    ipv4_open: bool,
+    ipv6_open: bool,
+    compact: bool,
+}
+
 pub fn draw(
     f: &mut Frame,
     screen: &ScreenContext<'_>,
@@ -617,7 +627,11 @@ pub fn draw(
         active_pane == ConfigPane::Details,
     );
 
-    let help_text = if editing.is_some() {
+    let port_details_active =
+        active_pane == ConfigPane::Details && active_item == ConfigItem::ClientPort;
+    let help_text = if port_details_active {
+        Line::from("")
+    } else if editing.is_some() {
         Line::from(vec![
             Span::styled("[Enter]", footer_key_style(ctx, ActionTone::Confirm)),
             Span::raw(" to confirm, "),
@@ -628,7 +642,7 @@ pub fn draw(
         Line::from(vec![
             Span::styled("↑/↓/k/j", footer_key_style(ctx, ActionTone::Navigate)),
             Span::raw(" select, "),
-            Span::styled("[Enter]|[Tab]", footer_key_style(ctx, ActionTone::Navigate)),
+            Span::styled("[e]|[Tab]", footer_key_style(ctx, ActionTone::Navigate)),
             Span::raw(" controls, "),
             Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
             Span::raw(" Save & Exit."),
@@ -637,7 +651,7 @@ pub fn draw(
         Line::from(vec![
             Span::styled("[Tab]", footer_key_style(ctx, ActionTone::Navigate)),
             Span::raw(" settings, "),
-            Span::styled("[Enter]", footer_key_style(ctx, ActionTone::Edit)),
+            Span::styled("[e]", footer_key_style(ctx, ActionTone::Edit)),
             Span::raw(" edit/open, "),
             Span::styled("←/→", footer_key_style(ctx, ActionTone::Toggle)),
             Span::raw(" adjust, "),
@@ -762,6 +776,11 @@ fn render_details_pane(
         .border_style(border_style);
     f.render_widget(block, area);
 
+    if active_item == ConfigItem::ClientPort {
+        render_port_details_pane(f, render_ctx, inner, focused);
+        return;
+    }
+
     let mut lines = vec![Line::from(vec![
         Span::raw("Value: "),
         Span::styled(value, ctx.apply(Style::default().fg(ctx.state_warning()))),
@@ -811,18 +830,367 @@ fn render_details_pane(
     }
 }
 
+fn render_port_details_pane(
+    f: &mut Frame,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    area: ratatui::layout::Rect,
+    focused: bool,
+) {
+    let ctx = render_ctx.screen.theme;
+    let default_port = Settings::default().client_port;
+    let editing_buffer = render_ctx.editing.as_ref().and_then(|(item, buffer)| {
+        if *item == ConfigItem::ClientPort {
+            Some(buffer.as_str())
+        } else {
+            None
+        }
+    });
+    let model = PortDetailsModel {
+        draft_port: render_ctx.settings.client_port,
+        active_port: render_ctx.screen.settings.client_port,
+        default_port,
+        editing_buffer,
+        ipv4_open: render_ctx.screen.ui.externally_accessable_port_v4,
+        ipv6_open: render_ctx.screen.ui.externally_accessable_port_v6,
+        compact: render_ctx.layout_kind == ConfigLayoutKind::Compact || area.height < 12,
+    };
+    let command_line = focused
+        .then(|| port_details_command_line(model.editing_buffer.is_some(), model.compact, ctx));
+    let (body_area, command_area) =
+        port_details_body_and_command_areas(area, command_line.is_some());
+
+    let lines = build_port_details_lines(&model, ctx);
+    let content_area = centered_port_content_area(body_area, lines.len() as u16);
+    let input = Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text)))
+        .wrap(Wrap { trim: false });
+    f.render_widget(input, content_area);
+
+    if let (Some(command_line), Some(command_area)) = (command_line, command_area) {
+        let commands = Paragraph::new(command_line)
+            .alignment(Alignment::Center)
+            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
+        f.render_widget(commands, command_area);
+    }
+}
+
+fn centered_port_content_area(
+    area: ratatui::layout::Rect,
+    content_height: u16,
+) -> ratatui::layout::Rect {
+    let height = content_height.min(area.height);
+    Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .split(area)[0]
+}
+
+fn port_details_body_and_command_areas(
+    area: ratatui::layout::Rect,
+    show_command: bool,
+) -> (ratatui::layout::Rect, Option<ratatui::layout::Rect>) {
+    if !show_command || area.height <= 1 {
+        return (area, None);
+    }
+
+    if area.height <= 2 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(area);
+        return (chunks[0], Some(chunks[1]));
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    (chunks[1], Some(chunks[2]))
+}
+
+fn build_port_details_lines(
+    model: &PortDetailsModel<'_>,
+    ctx: &crate::theme::ThemeContext,
+) -> Vec<Line<'static>> {
+    if model.compact {
+        return build_compact_port_details_lines(model, ctx);
+    }
+
+    let title_style = ctx.apply(
+        Style::default()
+            .fg(ctx.state_selected())
+            .add_modifier(Modifier::BOLD),
+    );
+    let label_style = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0));
+    let value_style = ctx.apply(
+        Style::default()
+            .fg(ctx.state_warning())
+            .add_modifier(Modifier::BOLD),
+    );
+    let muted_style = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1));
+
+    if let Some(buffer) = model.editing_buffer {
+        return build_port_edit_details_lines(
+            model,
+            buffer,
+            title_style,
+            value_style,
+            muted_style,
+            ctx,
+        );
+    }
+
+    vec![
+        port_header_line(model, title_style, value_style, muted_style),
+        Line::from(""),
+        port_family_status_line("IPv4", model.ipv4_open, ctx),
+        port_family_status_line("IPv6", model.ipv6_open, ctx),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "Inbound peer handshakes and DHT",
+            muted_style,
+        )]),
+        Line::from(vec![Span::styled(
+            "announces use this listener port.",
+            muted_style,
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Active bind: ", label_style),
+            Span::styled(
+                model.active_port.to_string(),
+                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+            ),
+            Span::raw("        "),
+            Span::styled("Default: ", label_style),
+            Span::styled(
+                model.default_port.to_string(),
+                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+            ),
+        ]),
+    ]
+}
+
+fn build_port_edit_details_lines(
+    model: &PortDetailsModel<'_>,
+    buffer: &str,
+    title_style: Style,
+    value_style: Style,
+    muted_style: Style,
+    ctx: &crate::theme::ThemeContext,
+) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled("Editing Listen Port", title_style)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Current: ", muted_style),
+            Span::styled(
+                model.active_port.to_string(),
+                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("New port", muted_style)),
+        port_edit_field_line(buffer, value_style, ctx),
+        Line::from(Span::styled("Valid range: 1-65535", muted_style)),
+        Line::from(""),
+        Line::from(Span::styled(
+            port_edit_status_message(buffer),
+            port_edit_validation_style(buffer, ctx),
+        )),
+    ]
+}
+
+fn port_edit_field_line(
+    buffer: &str,
+    value_style: Style,
+    ctx: &crate::theme::ThemeContext,
+) -> Line<'static> {
+    let filler = " ".repeat(5_usize.saturating_sub(buffer.len()));
+    Line::from(vec![
+        Span::styled("[ ", value_style),
+        Span::styled(buffer.to_string(), value_style),
+        Span::styled("_", ctx.apply(Style::default().fg(ctx.state_warning()))),
+        Span::styled(filler, value_style),
+        Span::styled("]", value_style),
+    ])
+}
+
+fn build_compact_port_details_lines(
+    model: &PortDetailsModel<'_>,
+    ctx: &crate::theme::ThemeContext,
+) -> Vec<Line<'static>> {
+    let title_style = ctx.apply(
+        Style::default()
+            .fg(ctx.state_warning())
+            .add_modifier(Modifier::BOLD),
+    );
+    let label_style = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Listen Port ", label_style),
+            Span::styled(model.draft_port.to_string(), title_style),
+            Span::raw("  "),
+            Span::styled(port_state_label(model), label_style),
+        ]),
+        Line::from(vec![
+            Span::raw("TCP/uTP  "),
+            port_family_badge("IPv4", model.ipv4_open, ctx),
+            Span::raw(" "),
+            port_family_badge("IPv6", model.ipv6_open, ctx),
+        ]),
+    ];
+
+    if let Some(buffer) = model.editing_buffer {
+        lines.push(Line::from(vec![
+            Span::styled("New ", label_style),
+            Span::raw("["),
+            Span::styled(buffer.to_string(), title_style),
+            Span::styled("_", ctx.apply(Style::default().fg(ctx.state_warning()))),
+            Span::raw("]  1-65535"),
+        ]));
+    }
+
+    lines
+}
+
+fn port_family_badge(
+    family: &'static str,
+    open: bool,
+    ctx: &crate::theme::ThemeContext,
+) -> Span<'static> {
+    let status = if open { "OPEN" } else { "WAIT" };
+    let color = if open {
+        ctx.state_success()
+    } else {
+        ctx.theme.semantic.subtext0
+    };
+    Span::styled(
+        format!("[{family} {status}]"),
+        ctx.apply(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    )
+}
+
+fn port_header_line(
+    model: &PortDetailsModel<'_>,
+    title_style: Style,
+    value_style: Style,
+    muted_style: Style,
+) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled("Listening Port: ", title_style),
+        Span::styled(model.draft_port.to_string(), value_style),
+    ];
+    if model.draft_port != model.active_port {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("pending save", muted_style));
+    }
+    Line::from(spans)
+}
+
+fn port_details_command_line(
+    editing: bool,
+    compact: bool,
+    ctx: &crate::theme::ThemeContext,
+) -> Line<'static> {
+    if editing {
+        return Line::from(vec![
+            Span::styled("[Enter]", footer_key_style(ctx, ActionTone::Confirm)),
+            Span::raw(" confirm  "),
+            Span::styled("[Esc]", footer_key_style(ctx, ActionTone::Cancel)),
+            Span::raw(" cancel"),
+        ]);
+    }
+
+    if compact {
+        return Line::from(vec![
+            Span::styled("[e]", footer_key_style(ctx, ActionTone::Edit)),
+            Span::raw(" edit  "),
+            Span::styled("[r]", footer_key_style(ctx, ActionTone::Clear)),
+            Span::raw(" reset"),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled("[e]", footer_key_style(ctx, ActionTone::Edit)),
+        Span::raw(" change port  "),
+        Span::styled("[r]", footer_key_style(ctx, ActionTone::Clear)),
+        Span::raw(" reset  "),
+        Span::styled("[Tab]", footer_key_style(ctx, ActionTone::Navigate)),
+        Span::raw(" settings  "),
+        Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
+        Span::raw(" Save & Exit"),
+    ])
+}
+
+fn port_family_status_line(
+    family: &'static str,
+    open: bool,
+    ctx: &crate::theme::ThemeContext,
+) -> Line<'static> {
+    let status = if open { "open" } else { "waiting" };
+    let color = if open {
+        ctx.state_success()
+    } else {
+        ctx.theme.semantic.subtext0
+    };
+
+    Line::from(vec![
+        Span::styled(
+            family,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            status,
+            ctx.apply(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        ),
+    ])
+}
+
+fn port_state_label(model: &PortDetailsModel<'_>) -> &'static str {
+    if model.draft_port == model.active_port {
+        "active"
+    } else {
+        "pending save"
+    }
+}
+
+fn port_edit_status_message(buffer: &str) -> String {
+    if buffer.is_empty() {
+        return "Type the new listen port.".to_string();
+    }
+
+    match buffer.parse::<u16>() {
+        Ok(0) => "Port 0 is reserved for startup auto-bind.".to_string(),
+        Ok(port) => format!("Ready to stage port {port}."),
+        Err(_) => "Out of range. Use 1-65535.".to_string(),
+    }
+}
+
+fn port_edit_validation_style(buffer: &str, ctx: &crate::theme::ThemeContext) -> Style {
+    let color = match buffer.parse::<u16>() {
+        Ok(port) if port > 0 => ctx.state_success(),
+        Ok(_) | Err(_) if !buffer.is_empty() => ctx.state_error(),
+        _ => ctx.theme.semantic.subtext1,
+    };
+    ctx.apply(Style::default().fg(color))
+}
+
 fn control_hint(control: ConfigControlKind, item: ConfigItem) -> &'static str {
     match control {
-        ConfigControlKind::Bool => "Space/Enter toggles. t enables. f disables.",
-        ConfigControlKind::Enum => "←/→ cycles choices. Enter advances to the next choice.",
-        ConfigControlKind::Number => "Enter edits exact numeric value. r resets to default.",
-        ConfigControlKind::RateLimit => {
-            "←/→ changes in steps. Enter edits exact bytes/sec. r resets."
-        }
+        ConfigControlKind::Bool => "Space/e toggles. t enables. f disables.",
+        ConfigControlKind::Enum => "←/→ cycles choices. e advances to the next choice.",
+        ConfigControlKind::Number => "e edits exact numeric value. r resets to default.",
+        ConfigControlKind::RateLimit => "←/→ changes in steps. e edits exact bytes/sec. r resets.",
         ConfigControlKind::Path if shared_path_is_manual(item) => {
             "Managed by shared config. Host-local settings still save here."
         }
-        ConfigControlKind::Path => "Enter opens the directory picker. r resets to default.",
+        ConfigControlKind::Path => "e opens the directory picker. r resets to default.",
     }
 }
 
@@ -900,6 +1268,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::theme::{Theme, ThemeContext, ThemeName};
     use strum::IntoEnumIterator;
 
     fn config_items() -> Vec<ConfigItem> {
@@ -912,6 +1281,23 @@ mod tests {
             ConfigItem::GlobalDownloadLimit,
             ConfigItem::GlobalUploadLimit,
         ]
+    }
+
+    fn test_theme_context() -> ThemeContext {
+        ThemeContext::new(Theme::builtin(ThemeName::CatppuccinMocha), 0.0)
+    }
+
+    fn plain_lines(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect()
     }
 
     #[test]
@@ -1196,6 +1582,136 @@ mod tests {
 
         toggle_config_pane(&mut active_pane);
         assert_eq!(active_pane, ConfigPane::Settings);
+    }
+
+    #[test]
+    fn e_key_starts_config_edit_or_open_action() {
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('e'), &None),
+            Some(ConfigAction::StartEditOrBrowse)
+        );
+        assert_eq!(map_key_to_config_action(KeyCode::Enter, &None), None);
+        assert_eq!(
+            map_key_to_config_action(
+                KeyCode::Char('e'),
+                &Some((ConfigItem::ClientPort, String::new()))
+            ),
+            None
+        );
+        assert_eq!(
+            map_key_to_config_action(
+                KeyCode::Enter,
+                &Some((ConfigItem::ClientPort, String::new()))
+            ),
+            Some(ConfigAction::EditCommit)
+        );
+    }
+
+    #[test]
+    fn port_details_lines_show_pending_port_and_live_reachability() {
+        let ctx = test_theme_context();
+        let model = PortDetailsModel {
+            draft_port: 7001,
+            active_port: 6681,
+            default_port: 6681,
+            editing_buffer: None,
+            ipv4_open: true,
+            ipv6_open: false,
+            compact: false,
+        };
+
+        let lines = build_port_details_lines(&model, &ctx);
+        let rendered = plain_lines(&lines).join("\n");
+
+        assert!(rendered.contains("Listening Port: 7001"));
+        assert!(rendered.contains("pending save"));
+        assert!(rendered.contains("IPv4  open"));
+        assert!(rendered.contains("IPv6  waiting"));
+        assert!(rendered.contains("Inbound peer handshakes and DHT"));
+        assert!(rendered.contains("announces use this listener port."));
+        assert!(rendered.contains("Active bind: 6681"));
+        assert!(rendered.contains("Default: 6681"));
+    }
+
+    #[test]
+    fn port_details_edit_lines_render_visible_caret_after_buffer() {
+        let ctx = test_theme_context();
+        let model = PortDetailsModel {
+            draft_port: 6681,
+            active_port: 6681,
+            default_port: 6681,
+            editing_buffer: Some("7123"),
+            ipv4_open: false,
+            ipv6_open: false,
+            compact: false,
+        };
+
+        let lines = build_port_details_lines(&model, &ctx);
+        let rendered = plain_lines(&lines).join("\n");
+
+        assert!(rendered.contains("Editing Listen Port"));
+        assert!(rendered.contains("Current: 6681"));
+        assert!(rendered.contains("New port"));
+        assert!(rendered.contains("[ 7123_ ]"));
+        assert!(rendered.contains("Valid range: 1-65535"));
+        assert!(rendered.contains("Ready to stage port 7123."));
+    }
+
+    #[test]
+    fn port_details_command_line_uses_bespoke_edit_key() {
+        let ctx = test_theme_context();
+        let rendered = plain_lines(&[port_details_command_line(false, false, &ctx)]).join("\n");
+        let editing = plain_lines(&[port_details_command_line(true, false, &ctx)]).join("\n");
+
+        assert!(rendered.contains("[e] change port"));
+        assert!(rendered.contains("[r] reset"));
+        assert!(rendered.contains("[Tab] settings"));
+        assert!(editing.contains("[Enter] confirm"));
+        assert!(editing.contains("[Esc] cancel"));
+    }
+
+    #[test]
+    fn port_details_content_area_is_vertically_centered() {
+        let area = ratatui::layout::Rect::new(4, 6, 50, 12);
+        let centered = centered_port_content_area(area, 6);
+
+        assert_eq!(centered.x, area.x);
+        assert_eq!(centered.width, area.width);
+        assert_eq!(centered.height, 6);
+        assert_eq!(centered.y, 9);
+    }
+
+    #[test]
+    fn port_details_command_row_reserves_matching_top_offset() {
+        let area = ratatui::layout::Rect::new(4, 6, 50, 12);
+        let (body, command) = port_details_body_and_command_areas(area, true);
+
+        assert_eq!(body.y, area.y + 1);
+        assert_eq!(body.height, area.height - 2);
+        assert_eq!(command.expect("command area").y, area.y + area.height - 1);
+    }
+
+    #[test]
+    fn port_details_command_row_degrades_without_top_offset_when_tiny() {
+        let area = ratatui::layout::Rect::new(4, 6, 50, 2);
+        let (body, command) = port_details_body_and_command_areas(area, true);
+
+        assert_eq!(body.y, area.y);
+        assert_eq!(body.height, 1);
+        assert_eq!(command.expect("command area").y, area.y + 1);
+    }
+
+    #[test]
+    fn port_edit_validation_rejects_zero_and_out_of_range_values() {
+        assert_eq!(port_edit_status_message(""), "Type the new listen port.");
+        assert_eq!(
+            port_edit_status_message("0"),
+            "Port 0 is reserved for startup auto-bind."
+        );
+        assert_eq!(
+            port_edit_status_message("7123"),
+            "Ready to stage port 7123."
+        );
     }
 
     #[test]
