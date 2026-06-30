@@ -1,7 +1,7 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Jagalite/superseedr-assets/main/superseedr_logo_transparent.gif">
-  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/Jagalite/superseedr-assets/main/superseedr_logo.gif">
-  <img alt="Superseedr Logo" src="https://raw.githubusercontent.com/Jagalite/superseedr-assets/main/superseedr_logo.gif">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/Jagalite/superseedr-assets/main/superseedr_logo_light_transparent.gif">
+  <img alt="Superseedr Logo" src="https://raw.githubusercontent.com/Jagalite/superseedr-assets/main/superseedr_logo_light_transparent.gif">
 </picture>
 
 # A BitTorrent Client in your Terminal
