@@ -1,0 +1,102 @@
+name: Installers Expanded
+
+on:
+  push:
+    branches:
+      - installers-expanded
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: superseedr
+
+jobs:
+  linux_arm64:
+    timeout-minutes: 120
+    name: Linux ARM64 packages (${{ matrix.suffix }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suffix: normal
+            flags: ""
+          - suffix: private
+            flags: --no-default-features
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-arm64-cargo-${{ matrix.suffix }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-arm64-cargo-${{ matrix.suffix }}-
+            ${{ runner.os }}-arm64-cargo-
+
+      - name: Install packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+          if ! command -v cargo-bundle >/dev/null 2>&1; then
+            cargo install cargo-bundle
+          fi
+
+      - name: Set package version
+        run: |
+          VERSION=$(python3 - <<'PY'
+          import tomllib
+          with open('Cargo.toml', 'rb') as f:
+              print(tomllib.load(f)['package']['version'])
+          PY
+          )
+          SHORT_SHA=${GITHUB_SHA::7}
+          echo "PACKAGE_VERSION=${VERSION}+${SHORT_SHA}" >> "$GITHUB_ENV"
+          echo "PACKAGE_VERSION_SLUG=${VERSION}-${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release ${{ matrix.flags }}
+
+      - name: Build Debian package
+        run: cargo bundle --release --format deb ${{ matrix.flags }}
+
+      - name: Stage Linux ARM64 artifacts
+        run: |
+          mkdir -p staging
+
+          if [ "${{ matrix.suffix }}" = "private" ]; then
+            DEB_NAME="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_arm64.deb"
+            TAR_NAME="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_linux-arm64.tar.gz"
+          else
+            DEB_NAME="${APP_NAME}_${PACKAGE_VERSION_SLUG}_arm64.deb"
+            TAR_NAME="${APP_NAME}_${PACKAGE_VERSION_SLUG}_linux-arm64.tar.gz"
+          fi
+
+          DEB_FILE=$(find target/release/bundle/deb -name '*.deb' -print -quit)
+          if [ -z "$DEB_FILE" ]; then
+            echo "::error:: No .deb file found."
+            exit 1
+          fi
+
+          cp "$DEB_FILE" "staging/$DEB_NAME"
+          tar -C target/release -czf "staging/$TAR_NAME" "$APP_NAME"
+          sha256sum staging/* | tee staging/SHA256SUMS
+          dpkg-deb --info "staging/$DEB_NAME"
+          file "target/release/$APP_NAME"
+
+      - name: Upload Linux ARM64 artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: superseedr-linux-arm64-${{ matrix.suffix }}-${{ github.sha }}
+          path: staging/*
