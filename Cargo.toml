@@ -8,7 +8,7 @@ description = "A BitTorrent Client in your Terminal."
 edition = "2021"
 repository = "https://github.com/Jagalite/superseedr"
 license = "GPL-3.0-or-later"
-authors = ["Jaga Tranvo <jagatranvo@prudential.com>"]  # <-- ADD THIS
+authors = ["Jaga Tranvo <jagatranvo@gmail.com>"]
 
 [workspace]
 members = [".", "fuzz"]

@@ -13,18 +13,34 @@ env:
   APP_NAME: superseedr
 
 jobs:
-  linux_arm64:
+  linux_packages:
     timeout-minutes: 120
-    name: Linux ARM64 packages (${{ matrix.suffix }})
-    runs-on: ubuntu-24.04-arm
+    name: Linux ${{ matrix.package_arch }} packages (${{ matrix.suffix }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - suffix: normal
             flags: ""
+            runner: ubuntu-latest
+            package_arch: amd64
+            tar_arch: linux-amd64
           - suffix: private
             flags: --no-default-features
+            runner: ubuntu-latest
+            package_arch: amd64
+            tar_arch: linux-amd64
+          - suffix: normal
+            flags: ""
+            runner: ubuntu-24.04-arm
+            package_arch: arm64
+            tar_arch: linux-arm64
+          - suffix: private
+            flags: --no-default-features
+            runner: ubuntu-24.04-arm
+            package_arch: arm64
+            tar_arch: linux-arm64
     steps:
       - uses: actions/checkout@v6
 
@@ -76,11 +92,11 @@ jobs:
           mkdir -p staging
 
           if [ "${{ matrix.suffix }}" = "private" ]; then
-            DEB_NAME="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_arm64.deb"
-            TAR_NAME="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_linux-arm64.tar.gz"
+            DEB_NAME="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_${{ matrix.package_arch }}.deb"
+            TAR_NAME="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_${{ matrix.tar_arch }}.tar.gz"
           else
-            DEB_NAME="${APP_NAME}_${PACKAGE_VERSION_SLUG}_arm64.deb"
-            TAR_NAME="${APP_NAME}_${PACKAGE_VERSION_SLUG}_linux-arm64.tar.gz"
+            DEB_NAME="${APP_NAME}_${PACKAGE_VERSION_SLUG}_${{ matrix.package_arch }}.deb"
+            TAR_NAME="${APP_NAME}_${PACKAGE_VERSION_SLUG}_${{ matrix.tar_arch }}.tar.gz"
           fi
 
           DEB_FILE=$(find target/release/bundle/deb -name '*.deb' -print -quit)
@@ -91,12 +107,12 @@ jobs:
 
           cp "$DEB_FILE" "staging/$DEB_NAME"
           tar -C target/release -czf "staging/$TAR_NAME" "$APP_NAME"
-          sha256sum staging/* | tee staging/SHA256SUMS
+          (cd staging && sha256sum *.deb *.tar.gz | tee SHA256SUMS)
           dpkg-deb --info "staging/$DEB_NAME"
           file "target/release/$APP_NAME"
 
-      - name: Upload Linux ARM64 artifacts
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: superseedr-linux-arm64-${{ matrix.suffix }}-${{ github.sha }}
+          name: superseedr-${{ matrix.tar_arch }}-${{ matrix.suffix }}-${{ github.sha }}
           path: staging/*
