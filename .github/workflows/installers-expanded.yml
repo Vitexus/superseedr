@@ -94,9 +94,11 @@ jobs:
           if [ "${{ matrix.suffix }}" = "private" ]; then
             DEB_NAME="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_${{ matrix.package_arch }}.deb"
             TAR_NAME="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_${{ matrix.tar_arch }}.tar.gz"
+            TAR_DIR="${APP_NAME}-private_${PACKAGE_VERSION_SLUG}_${{ matrix.tar_arch }}"
           else
             DEB_NAME="${APP_NAME}_${PACKAGE_VERSION_SLUG}_${{ matrix.package_arch }}.deb"
             TAR_NAME="${APP_NAME}_${PACKAGE_VERSION_SLUG}_${{ matrix.tar_arch }}.tar.gz"
+            TAR_DIR="${APP_NAME}_${PACKAGE_VERSION_SLUG}_${{ matrix.tar_arch }}"
           fi
 
           DEB_FILE=$(find target/release/bundle/deb -name '*.deb' -print -quit)
@@ -106,7 +108,12 @@ jobs:
           fi
 
           cp "$DEB_FILE" "staging/$DEB_NAME"
-          tar -C target/release -czf "staging/$TAR_NAME" "$APP_NAME"
+          mkdir -p "staging/$TAR_DIR"
+          cp "target/release/$APP_NAME" "staging/$TAR_DIR/"
+          cp README.md LICENSE "staging/$TAR_DIR/"
+          cp docs/CHANGELOG.md "staging/$TAR_DIR/CHANGELOG.md"
+          tar -C staging -czf "staging/$TAR_NAME" "$TAR_DIR"
+          rm -rf "staging/$TAR_DIR"
           (cd staging && sha256sum *.deb *.tar.gz | tee SHA256SUMS)
           dpkg-deb --info "staging/$DEB_NAME"
           file "target/release/$APP_NAME"

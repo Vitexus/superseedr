@@ -142,11 +142,18 @@ jobs:
         run: |
           if [ "${{ matrix.suffix }}" = "private" ]; then
             FILE_NAME="${APP_NAME}-private_${{ github.ref_name }}_${{ matrix.tar_arch }}.tar.gz"
+            TAR_DIR="${APP_NAME}-private_${{ github.ref_name }}_${{ matrix.tar_arch }}"
           else
             FILE_NAME="${APP_NAME}_${{ github.ref_name }}_${{ matrix.tar_arch }}.tar.gz"
+            TAR_DIR="${APP_NAME}_${{ github.ref_name }}_${{ matrix.tar_arch }}"
           fi
 
-          tar -C target/release -czf "staging/$FILE_NAME" "${APP_NAME}"
+          mkdir -p "staging/$TAR_DIR"
+          cp "target/release/$APP_NAME" "staging/$TAR_DIR/"
+          cp README.md LICENSE "staging/$TAR_DIR/"
+          cp docs/CHANGELOG.md "staging/$TAR_DIR/CHANGELOG.md"
+          tar -C staging -czf "staging/$FILE_NAME" "$TAR_DIR"
+          rm -rf "staging/$TAR_DIR"
 
       - name: Generate Checksums
         run: |
