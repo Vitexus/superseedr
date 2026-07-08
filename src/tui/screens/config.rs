@@ -1132,7 +1132,8 @@ fn port_family_status_line(
     open: bool,
     ctx: &crate::theme::ThemeContext,
 ) -> Line<'static> {
-    let status = if open { "open" } else { "waiting" };
+    let status = if open { "open" } else { "waiting..." };
+
     let color = if open {
         ctx.state_success()
     } else {
@@ -1167,8 +1168,8 @@ fn port_edit_status_message(buffer: &str) -> String {
 
     match buffer.parse::<u16>() {
         Ok(0) => "Port 0 is reserved for startup auto-bind.".to_string(),
-        Ok(port) => format!("Ready to stage port {port}."),
-        Err(_) => "Out of range. Use 1-65535.".to_string(),
+        Ok(port) => format!("Ready to bind port {port}."),
+        Err(_) => "Invalid port range. Use 1-65535.".to_string(),
     }
 }
 
