@@ -56,10 +56,10 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-arm64-cargo-${{ matrix.suffix }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.tar_arch }}-cargo-${{ matrix.suffix }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-arm64-cargo-${{ matrix.suffix }}-
-            ${{ runner.os }}-arm64-cargo-
+            ${{ runner.os }}-${{ matrix.tar_arch }}-cargo-${{ matrix.suffix }}-
+            ${{ runner.os }}-${{ matrix.tar_arch }}-cargo-
 
       - name: Install packaging dependencies
         run: |
