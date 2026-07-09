@@ -56,8 +56,9 @@ use crate::config::{
     shared_root_path, HostIdSource, SharedConfigSource,
 };
 use crate::control_service::{
-    apply_offline_control_request, apply_offline_purge, control_event_details, list_torrent_files,
-    online_control_success_message, resolve_purge_target_info_hash, resolve_target_info_hash,
+    apply_offline_control_request, apply_offline_purge, build_move_torrent_request,
+    control_event_details, list_torrent_files, online_control_success_message,
+    resolve_purge_target_info_hash, resolve_target_info_hash,
 };
 use crate::integrations::cli::{
     command_to_control_requests_with_resolver, expand_add_inputs, require_cli_targets,
@@ -2369,6 +2370,21 @@ fn process_cli_request(
                 output_mode,
             )
         }
+        Commands::Move {
+            info_hash_hex,
+            path,
+        } => {
+            let request = build_move_torrent_request(settings, info_hash_hex, path)
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+            process_control_requests(
+                settings,
+                &[request],
+                "move",
+                shared_mode,
+                leader_is_running,
+                output_mode,
+            )
+        }
         _ => {
             let requests =
                 command_to_control_requests_with_resolver(command, |target, command_name| {
@@ -3346,6 +3362,7 @@ fn cli_command_name(command: Option<&Commands>) -> Option<&'static str> {
         Some(Commands::Purge { .. }) => Some("purge"),
         Some(Commands::Files { .. }) => Some("files"),
         Some(Commands::Priority { .. }) => Some("priority"),
+        Some(Commands::Move { .. }) => Some("move"),
         #[cfg(feature = "synthetic-load")]
         Some(Commands::Benchmark(_)) => Some("benchmark"),
         #[cfg(feature = "synthetic-load")]
@@ -3722,6 +3739,172 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(settings.torrents.is_empty());
+    }
+
+    #[test]
+    fn offline_move_updates_only_download_path() {
+        let destination = tempdir().expect("create destination");
+        let canonical_destination =
+            fs::canonicalize(destination.path()).expect("canonical destination");
+        let mut settings = sample_settings();
+        settings.torrents[0].container_name = Some("sample-container".to_string());
+        settings.torrents[0]
+            .file_priorities
+            .insert(1, app::FilePriority::High);
+        let request = ControlRequest::MoveTorrent {
+            info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+            download_path: destination.path().to_path_buf(),
+        };
+
+        let result = apply_offline_control_request(&mut settings, &request);
+
+        assert!(result.is_ok());
+        assert_eq!(
+            settings.torrents[0].download_path.as_deref(),
+            Some(canonical_destination.as_path())
+        );
+        assert_eq!(
+            settings.torrents[0].container_name.as_deref(),
+            Some("sample-container")
+        );
+        assert_eq!(
+            settings.torrents[0].file_priorities.get(&1),
+            Some(&app::FilePriority::High)
+        );
+    }
+
+    #[test]
+    fn move_request_builder_rejects_unknown_hash() {
+        let destination = tempdir().expect("create destination");
+        let settings = sample_settings();
+
+        let error = build_move_torrent_request(
+            &settings,
+            "2222222222222222222222222222222222222222",
+            destination.path(),
+        )
+        .expect_err("unknown torrent should fail");
+
+        assert!(error.contains("was not found"));
+    }
+
+    #[test]
+    fn move_request_builder_rejects_missing_destination() {
+        let destination = tempdir().expect("create destination");
+        let settings = sample_settings();
+        let missing_path = destination.path().join("missing");
+
+        let error = build_move_torrent_request(
+            &settings,
+            "1111111111111111111111111111111111111111",
+            &missing_path,
+        )
+        .expect_err("missing destination should fail");
+
+        assert!(error.contains("does not exist"));
+    }
+
+    #[test]
+    fn offline_move_renames_payload_files_and_checks_metadata() {
+        let (_torrent_dir, torrent_path) = write_sample_torrent_file();
+        let source_root = tempdir().expect("create source root");
+        let destination_root = tempdir().expect("create destination root");
+        let source_payload_dir = source_root.path().join("sample-container").join("folder");
+        fs::create_dir_all(&source_payload_dir).expect("create source payload dir");
+        let source_alpha = source_payload_dir.join("alpha.bin");
+        let source_beta = source_payload_dir.join("beta.bin");
+        fs::write(&source_alpha, b"alpha-data").expect("write alpha payload");
+        fs::write(&source_beta, b"beta-data").expect("write beta payload");
+        let info_hash_hex = hex::encode(
+            info_hash_from_torrent_source(&torrent_path).expect("sample torrent info hash"),
+        );
+        let mut settings = Settings {
+            torrents: vec![config::TorrentSettings {
+                torrent_or_magnet: torrent_path,
+                name: "Sample Alpha".to_string(),
+                download_path: Some(source_root.path().to_path_buf()),
+                container_name: Some("sample-container".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = ControlRequest::MoveTorrent {
+            info_hash_hex,
+            download_path: destination_root.path().to_path_buf(),
+        };
+
+        apply_offline_control_request(&mut settings, &request).expect("move torrent payload");
+
+        let destination_payload_dir = destination_root
+            .path()
+            .join("sample-container")
+            .join("folder");
+        assert_eq!(
+            fs::read(destination_payload_dir.join("alpha.bin")).expect("read moved alpha"),
+            b"alpha-data"
+        );
+        assert_eq!(
+            fs::read(destination_payload_dir.join("beta.bin")).expect("read moved beta"),
+            b"beta-data"
+        );
+        assert!(!source_alpha.exists());
+        assert!(!source_beta.exists());
+        assert_eq!(
+            settings.torrents[0].download_path.as_deref(),
+            Some(
+                fs::canonicalize(destination_root.path())
+                    .expect("canonical destination")
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn offline_move_rejects_conflicting_destination_without_deleting_source() {
+        let (_torrent_dir, torrent_path) = write_sample_torrent_file();
+        let source_root = tempdir().expect("create source root");
+        let destination_root = tempdir().expect("create destination root");
+        let source_payload_dir = source_root.path().join("sample-container").join("folder");
+        let destination_payload_dir = destination_root
+            .path()
+            .join("sample-container")
+            .join("folder");
+        fs::create_dir_all(&source_payload_dir).expect("create source payload dir");
+        fs::create_dir_all(&destination_payload_dir).expect("create destination payload dir");
+        let source_alpha = source_payload_dir.join("alpha.bin");
+        fs::write(&source_alpha, b"alpha-data").expect("write alpha payload");
+        fs::write(destination_payload_dir.join("alpha.bin"), b"different-data")
+            .expect("write conflicting destination");
+        let info_hash_hex = hex::encode(
+            info_hash_from_torrent_source(&torrent_path).expect("sample torrent info hash"),
+        );
+        let mut settings = Settings {
+            torrents: vec![config::TorrentSettings {
+                torrent_or_magnet: torrent_path,
+                name: "Sample Alpha".to_string(),
+                download_path: Some(source_root.path().to_path_buf()),
+                container_name: Some("sample-container".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let request = ControlRequest::MoveTorrent {
+            info_hash_hex,
+            download_path: destination_root.path().to_path_buf(),
+        };
+
+        let error = apply_offline_control_request(&mut settings, &request)
+            .expect_err("conflicting destination should fail");
+
+        assert!(error.contains("already exists"));
+        assert_eq!(
+            fs::read(&source_alpha).expect("source remains"),
+            b"alpha-data"
+        );
+        assert_eq!(
+            settings.torrents[0].download_path.as_deref(),
+            Some(source_root.path())
+        );
     }
 
     #[test]

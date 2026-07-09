@@ -190,6 +190,13 @@ pub enum Commands {
         #[arg(help = "Priority to apply")]
         priority: CliPriority,
     },
+    #[command(about = "Move a torrent to an existing download directory")]
+    Move {
+        #[arg(value_name = "INFO_HASH_HEX", help = "Torrent info hash")]
+        info_hash_hex: String,
+        #[arg(value_name = "PATH", help = "Existing destination directory")]
+        path: PathBuf,
+    },
     #[cfg(feature = "synthetic-load")]
     #[command(about = "Run adaptive local synthetic benchmarks with bounded disk usage")]
     Benchmark(SyntheticBenchmarkArgs),
@@ -654,6 +661,13 @@ where
                 priority: (*priority).into(),
             }]))
         }
+        Commands::Move {
+            info_hash_hex,
+            path,
+        } => Ok(Some(vec![ControlRequest::MoveTorrent {
+            info_hash_hex: info_hash_hex.clone(),
+            download_path: path.clone(),
+        }])),
         Commands::Add { .. }
         | Commands::StopClient
         | Commands::Journal { .. }
@@ -978,6 +992,26 @@ mod tests {
             priority: CliPriority::High,
         };
         assert!(command_to_control_request(&command).is_err());
+    }
+
+    #[test]
+    fn move_command_maps_to_move_torrent_request() {
+        let command = Commands::Move {
+            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            path: PathBuf::from("/tmp/fictional-downloads"),
+        };
+
+        let request = command_to_control_request(&command)
+            .expect("move command should map")
+            .expect("move request");
+
+        assert_eq!(
+            request,
+            ControlRequest::MoveTorrent {
+                info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                download_path: PathBuf::from("/tmp/fictional-downloads"),
+            }
+        );
     }
 
     #[test]
