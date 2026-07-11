@@ -6,7 +6,7 @@ use crate::config::Settings;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{
-    centered_rect, format_limit_bps, format_speed, path_to_string, truncate_with_ellipsis,
+    format_limit_bps, format_speed, path_to_string, truncate_with_ellipsis,
 };
 use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
@@ -1073,7 +1073,19 @@ fn build_port_detail_lines(
             ctx.apply(Style::default().fg(ctx.accent_sky()).bold()),
             ctx,
         ),
-        inbound_observation_line(render_ctx, ctx),
+        inbound_matrix_header(ctx),
+        inbound_transport_row(
+            "TCP",
+            render_ctx.screen.ui.inbound_peer_transports.tcp_ipv4_seen,
+            render_ctx.screen.ui.inbound_peer_transports.tcp_ipv6_seen,
+            ctx,
+        ),
+        inbound_transport_row(
+            "uTP (UDP)",
+            render_ctx.screen.ui.inbound_peer_transports.utp_ipv4_seen,
+            render_ctx.screen.ui.inbound_peer_transports.utp_ipv6_seen,
+            ctx,
+        ),
         detail_row(
             "Default",
             Settings::default().client_port.to_string(),
@@ -1090,26 +1102,47 @@ fn build_port_detail_lines(
     lines
 }
 
-fn inbound_observation_line(
-    render_ctx: &ConfigRenderContext<'_, '_>,
-    ctx: &crate::theme::ThemeContext,
-) -> Line<'static> {
-    let observation = |family: &'static str, observed: bool| {
-        let (label, color) = if observed {
-            ("seen", ctx.state_success())
-        } else {
-            ("not seen", ctx.theme.semantic.subtext0)
-        };
+const INBOUND_MATRIX_COLUMN_WIDTH: usize = 12;
+
+fn inbound_matrix_header(ctx: &crate::theme::ThemeContext) -> Line<'static> {
+    Line::from(vec![
+        detail_label_span("Transport", ctx),
         Span::styled(
-            format!("{family} {label}"),
-            ctx.apply(Style::default().fg(color).bold()),
+            format!("{:<INBOUND_MATRIX_COLUMN_WIDTH$}", "IPv4"),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0).bold()),
+        ),
+        Span::styled(
+            "IPv6",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0).bold()),
+        ),
+    ])
+}
+
+fn inbound_status_cell(observed: bool, ctx: &crate::theme::ThemeContext) -> Span<'static> {
+    let (status, style) = if observed {
+        (
+            "Seen",
+            ctx.apply(Style::default().fg(ctx.state_success()).bold()),
+        )
+    } else {
+        (
+            "Not yet",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
         )
     };
+    Span::styled(format!("{status:<INBOUND_MATRIX_COLUMN_WIDTH$}"), style)
+}
+
+fn inbound_transport_row(
+    transport: &'static str,
+    ipv4_seen: bool,
+    ipv6_seen: bool,
+    ctx: &crate::theme::ThemeContext,
+) -> Line<'static> {
     Line::from(vec![
-        detail_label_span("Inbound", ctx),
-        observation("IPv4", render_ctx.screen.ui.externally_accessable_port_v4),
-        Span::raw("   "),
-        observation("IPv6", render_ctx.screen.ui.externally_accessable_port_v6),
+        detail_label_span(transport, ctx),
+        inbound_status_cell(ipv4_seen, ctx),
+        inbound_status_cell(ipv6_seen, ctx),
     ])
 }
 
@@ -1779,11 +1812,7 @@ fn render_reset_confirmation_dialog(
 ) {
     let ctx = render_ctx.screen.theme;
     let terminal = render_ctx.terminal_area;
-    let area = centered_rect(
-        if terminal.width < 60 { 92 } else { 54 },
-        if terminal.height < 18 { 90 } else { 38 },
-        terminal,
-    );
+    let area = reset_confirmation_area(terminal);
     f.render_widget(Clear, area);
 
     let vertical_padding = u16::from(area.height >= 9);
@@ -1792,6 +1821,7 @@ fn render_reset_confirmation_dialog(
             " Confirm Reset ",
             ctx.apply(Style::default().fg(ctx.state_warning()).bold()),
         )))
+        .title_alignment(Alignment::Center)
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.state_warning())))
         .padding(Padding::new(2, 2, vertical_padding, vertical_padding));
@@ -1841,6 +1871,17 @@ fn render_reset_confirmation_dialog(
         Paragraph::new(actions).alignment(Alignment::Center),
         chunks[1],
     );
+}
+
+fn reset_confirmation_area(terminal: Rect) -> Rect {
+    let width = terminal.width.saturating_sub(2).clamp(1, 52);
+    let height = terminal.height.saturating_sub(2).clamp(1, 9);
+    Rect::new(
+        terminal.x + terminal.width.saturating_sub(width) / 2,
+        terminal.y + terminal.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
 }
 
 fn footer_actions_line(
@@ -2040,7 +2081,7 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::AppState;
+    use crate::app::{AppState, InboundPeerTransportStatus};
     use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
     use crate::theme::{Theme, ThemeContext, ThemeName};
     use ratatui::{backend::TestBackend, Terminal};
@@ -2135,7 +2176,17 @@ mod tests {
             ui_layout_mode: layout_mode,
             ..Settings::default()
         };
-        let app_state = AppState::default();
+        let app_state = AppState {
+            externally_accessable_port_v4: true,
+            externally_accessable_port_v6: true,
+            inbound_peer_transports: InboundPeerTransportStatus {
+                tcp_ipv4_seen: true,
+                tcp_ipv6_seen: false,
+                utp_ipv4_seen: false,
+                utp_ipv6_seen: true,
+            },
+            ..AppState::default()
+        };
         let dht_status = DhtStatus::default();
         let dht_wave_telemetry = DhtWaveTelemetry::default();
         let theme = test_theme_context();
@@ -2276,7 +2327,17 @@ mod tests {
     #[test]
     fn detail_panels_keep_controls_above_and_information_below_the_divider() {
         let settings = Settings::default();
-        let app_state = AppState::default();
+        let app_state = AppState {
+            externally_accessable_port_v4: true,
+            externally_accessable_port_v6: true,
+            inbound_peer_transports: InboundPeerTransportStatus {
+                tcp_ipv4_seen: true,
+                tcp_ipv6_seen: false,
+                utp_ipv4_seen: false,
+                utp_ipv6_seen: true,
+            },
+            ..AppState::default()
+        };
         let dht_status = DhtStatus::default();
         let dht_wave_telemetry = DhtWaveTelemetry::default();
         let theme = test_theme_context();
@@ -2301,9 +2362,28 @@ mod tests {
         assert_detail_hierarchy(
             &port_lines,
             &["Configured"],
-            &["Runtime", "Inbound", "Default"],
+            &["Runtime", "Transport", "TCP", "uTP (UDP)", "Default"],
         );
         assert_first_below_divider(&port_lines, "Accepts inbound");
+        let port_text = plain_lines(&port_lines);
+        let matrix_header = port_text
+            .iter()
+            .find(|line| line.contains("Transport"))
+            .expect("matrix should have a transport header");
+        let tcp_row = port_text
+            .iter()
+            .find(|line| line.contains("TCP"))
+            .expect("matrix should have a TCP row");
+        let utp_row = port_text
+            .iter()
+            .find(|line| line.contains("uTP (UDP)"))
+            .expect("matrix should have a uTP row");
+        assert!(matrix_header.contains("IPv4"));
+        assert!(matrix_header.contains("IPv6"));
+        assert!(tcp_row.contains("Seen"));
+        assert!(tcp_row.contains("Not yet"));
+        assert!(utp_row.contains("Not yet"));
+        assert!(utp_row.contains("Seen"));
 
         let path_lines = build_path_detail_lines(ConfigItem::WatchFolder, &render_ctx, 60);
         assert_detail_hierarchy(&path_lines, &["Configured"], &["Resolved", "State"]);
@@ -2376,6 +2456,25 @@ mod tests {
             .inner(roomy_area);
         assert_eq!(navigation_inner.y, roomy_area.y + 1);
         assert_eq!(navigation_inner.height, roomy_area.height - 3);
+    }
+
+    #[test]
+    fn reset_confirmation_uses_a_compact_centered_area() {
+        let terminal = Rect::new(3, 5, 120, 30);
+        let dialog = reset_confirmation_area(terminal);
+
+        assert_eq!(dialog.width, 52);
+        assert_eq!(dialog.height, 9);
+        let left = dialog.x - terminal.x;
+        let right = terminal.right() - dialog.right();
+        let top = dialog.y - terminal.y;
+        let bottom = terminal.bottom() - dialog.bottom();
+        assert!(left.abs_diff(right) <= 1);
+        assert!(top.abs_diff(bottom) <= 1);
+
+        let compact_terminal = Rect::new(0, 0, 30, 7);
+        let compact_dialog = reset_confirmation_area(compact_terminal);
+        assert_eq!(compact_dialog, Rect::new(1, 1, 28, 5));
     }
 
     #[test]
