@@ -1661,7 +1661,15 @@ pub struct ConfigUiState {
     pub selected_index: usize,
     pub items: Vec<ConfigItem>,
     pub active_pane: ConfigPane,
-    pub editing: Option<(ConfigItem, String)>,
+    pub editing: Option<ConfigEditState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigEditState {
+    pub item: ConfigItem,
+    pub buffer: String,
+    pub cursor: usize,
+    pub select_all: bool,
 }
 
 #[derive(Default)]
@@ -5567,6 +5575,7 @@ impl App {
 
         let port_changed = new_settings.client_port != old_settings.client_port;
         let bootstrap_changed = new_settings.bootstrap_nodes != old_settings.bootstrap_nodes;
+        let mut config_error = None;
 
         if port_changed {
             tracing::info!(
@@ -5574,6 +5583,10 @@ impl App {
                 new_settings.client_port
             );
             if !self.rebind_listener(new_settings.client_port).await {
+                config_error = Some(format!(
+                    "Could not activate listen port {}. Port {} remains active.",
+                    new_settings.client_port, old_settings.client_port
+                ));
                 self.client_configs.client_port = old_settings.client_port;
                 let _ = self.rss_settings_tx.send(self.client_configs.clone());
                 if bootstrap_changed {
@@ -5621,7 +5634,7 @@ impl App {
             self.save_state_to_disk();
         }
 
-        self.app_state.system_error = None;
+        self.app_state.system_error = config_error;
         self.app_state.ui.needs_redraw = true;
     }
 
@@ -5679,6 +5692,11 @@ impl App {
                 self.app_state.ui.needs_redraw = true;
             }
         }
+    }
+
+    pub(crate) async fn apply_config_update_from_ui(&mut self, settings: Settings) {
+        self.handle_app_command(AppCommand::UpdateConfig(settings))
+            .await;
     }
 
     async fn handle_app_command(&mut self, command: AppCommand) {
@@ -11812,6 +11830,11 @@ mod tests {
             .expect("listener should remain bound");
         assert_eq!(app.client_configs.client_port, original_port);
         assert_eq!(rebound_port, original_port);
+        assert!(app
+            .app_state
+            .system_error
+            .as_deref()
+            .is_some_and(|message| message.contains("remains active")));
 
         let _ = app.shutdown_tx.send(());
     }

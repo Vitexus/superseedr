@@ -1,21 +1,20 @@
 // SPDX-FileCopyrightText: 2025 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::sync::Arc;
-
-use crate::app::{AppCommand, AppMode, ConfigItem, ConfigPane, FileBrowserMode};
+use crate::app::{AppCommand, AppMode, ConfigEditState, ConfigItem, ConfigPane, FileBrowserMode};
 use crate::config::Settings;
-use crate::token_bucket::{rate_limit_bps_to_bucket_bytes_per_sec, TokenBucket};
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
-use crate::tui::formatters::{format_limit_bps, path_to_string};
+use crate::tui::formatters::{
+    format_limit_bps, format_speed, path_to_string, truncate_with_ellipsis,
+};
 use crate::tui::layout::config::{calculate_config_layout, ConfigLayoutKind};
 use crate::tui::screen_context::ScreenContext;
 use directories::UserDirs;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
-use ratatui::layout::{Alignment, Constraint, Direction, Flex, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::prelude::{Frame, Line, Modifier, Span, Style};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use tokio::sync::{broadcast, mpsc};
 
 const RATE_LIMIT_STEP_BPS: u64 = 10_000 * 8;
@@ -23,41 +22,44 @@ const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigAction {
-    SaveAndExit,
+    Exit,
     StartEditOrBrowse,
-    ToggleSelectedBool,
+    ShiftSelected,
     SetSelectedBool(bool),
     MoveUp,
     MoveDown,
-    ToggleFocus,
     ResetSelected,
     IncreaseSelected,
     DecreaseSelected,
     EditInsert(char),
     EditBackspace,
+    EditDelete,
+    EditMoveLeft,
+    EditMoveRight,
+    EditMoveHome,
+    EditMoveEnd,
     EditCancel,
     EditCommit,
 }
 
 pub enum ConfigEffect {
     AppCommand(Box<AppCommand>),
-    SetDownloadRate(u64),
-    SetUploadRate(u64),
-    ToNormal,
+    ApplySettings,
 }
 
 pub struct ConfigHandleContext<'a> {
     pub mode: &'a mut AppMode,
     pub settings_edit: &'a mut Box<Settings>,
+    pub applied_settings: &'a Settings,
     pub selected_index: &'a mut usize,
     pub items: &'a mut [ConfigItem],
     pub active_pane: &'a mut ConfigPane,
-    pub editing: &'a mut Option<(ConfigItem, String)>,
+    pub editing: &'a mut Option<ConfigEditState>,
+    pub shared_follower: bool,
+    pub compact: bool,
     pub app_command_tx: &'a mpsc::Sender<AppCommand>,
     pub shutdown_tx: &'a broadcast::Sender<()>,
     pub file_browser_generation: &'a mut u64,
-    pub global_dl_bucket: &'a Arc<TokenBucket>,
-    pub global_ul_bucket: &'a Arc<TokenBucket>,
 }
 
 #[derive(Default)]
@@ -98,12 +100,19 @@ enum ConfigControlKind {
     Path,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigScope {
+    Host,
+    Shared,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ConfigSettingDescriptor {
     item: ConfigItem,
     category: ConfigCategory,
     label: &'static str,
     control: ConfigControlKind,
+    scope: ConfigScope,
 }
 
 fn config_setting_descriptors() -> &'static [ConfigSettingDescriptor] {
@@ -113,42 +122,49 @@ fn config_setting_descriptors() -> &'static [ConfigSettingDescriptor] {
             category: ConfigCategory::Network,
             label: "Listen Port",
             control: ConfigControlKind::Number,
+            scope: ConfigScope::Host,
         },
         ConfigSettingDescriptor {
             item: ConfigItem::DefaultDownloadFolder,
             category: ConfigCategory::Paths,
             label: "Default Download Folder",
             control: ConfigControlKind::Path,
+            scope: ConfigScope::Shared,
         },
         ConfigSettingDescriptor {
             item: ConfigItem::WatchFolder,
             category: ConfigCategory::Paths,
             label: "Torrent Watch Folder",
             control: ConfigControlKind::Path,
+            scope: ConfigScope::Host,
         },
         ConfigSettingDescriptor {
             item: ConfigItem::UiLayoutMode,
             category: ConfigCategory::Ui,
             label: "Layout",
             control: ConfigControlKind::Enum,
+            scope: ConfigScope::Shared,
         },
         ConfigSettingDescriptor {
             item: ConfigItem::AlwaysShowAddLocationPrompt,
             category: ConfigCategory::Downloads,
             label: "Confirm Add Priority And Location",
             control: ConfigControlKind::Bool,
+            scope: ConfigScope::Host,
         },
         ConfigSettingDescriptor {
             item: ConfigItem::GlobalDownloadLimit,
             category: ConfigCategory::Downloads,
             label: "Global Download Limit",
             control: ConfigControlKind::RateLimit,
+            scope: ConfigScope::Shared,
         },
         ConfigSettingDescriptor {
             item: ConfigItem::GlobalUploadLimit,
             category: ConfigCategory::Downloads,
             label: "Global Upload Limit",
             control: ConfigControlKind::RateLimit,
+            scope: ConfigScope::Shared,
         },
     ]
 }
@@ -191,11 +207,70 @@ fn value_for_item(item: ConfigItem, settings: &Settings) -> String {
     }
 }
 
-fn toggle_config_pane(active_pane: &mut ConfigPane) {
-    *active_pane = match *active_pane {
-        ConfigPane::Settings => ConfigPane::Details,
-        ConfigPane::Details => ConfigPane::Settings,
-    };
+fn config_item_is_dirty(item: ConfigItem, draft: &Settings, applied: &Settings) -> bool {
+    match item {
+        ConfigItem::ClientPort => draft.client_port != applied.client_port,
+        ConfigItem::DefaultDownloadFolder => {
+            draft.default_download_folder != applied.default_download_folder
+        }
+        ConfigItem::WatchFolder => draft.watch_folder != applied.watch_folder,
+        ConfigItem::AlwaysShowAddLocationPrompt => {
+            draft.always_show_add_location_prompt != applied.always_show_add_location_prompt
+        }
+        ConfigItem::UiLayoutMode => draft.ui_layout_mode != applied.ui_layout_mode,
+        ConfigItem::GlobalDownloadLimit => {
+            draft.global_download_limit_bps != applied.global_download_limit_bps
+        }
+        ConfigItem::GlobalUploadLimit => {
+            draft.global_upload_limit_bps != applied.global_upload_limit_bps
+        }
+    }
+}
+
+fn config_item_is_locked(item: ConfigItem, shared_follower: bool) -> bool {
+    let descriptor = descriptor_for_item(item);
+    (shared_follower && descriptor.scope == ConfigScope::Shared) || shared_path_is_manual(item)
+}
+
+fn config_scope_label(scope: ConfigScope) -> &'static str {
+    if crate::config::is_shared_config_mode() {
+        match scope {
+            ConfigScope::Host => "HOST",
+            ConfigScope::Shared => "SHARED",
+        }
+    } else {
+        "LOCAL"
+    }
+}
+
+pub(crate) fn merge_config_item_into_current(
+    draft: &Settings,
+    current: &Settings,
+    item: ConfigItem,
+    shared_follower: bool,
+) -> Settings {
+    let mut update = current.clone();
+    if config_item_is_locked(item, shared_follower) {
+        return update;
+    }
+    match item {
+        ConfigItem::ClientPort => update.client_port = draft.client_port,
+        ConfigItem::DefaultDownloadFolder => {
+            update.default_download_folder = draft.default_download_folder.clone();
+        }
+        ConfigItem::WatchFolder => update.watch_folder = draft.watch_folder.clone(),
+        ConfigItem::UiLayoutMode => update.ui_layout_mode = draft.ui_layout_mode,
+        ConfigItem::AlwaysShowAddLocationPrompt => {
+            update.always_show_add_location_prompt = draft.always_show_add_location_prompt;
+        }
+        ConfigItem::GlobalDownloadLimit => {
+            update.global_download_limit_bps = draft.global_download_limit_bps;
+        }
+        ConfigItem::GlobalUploadLimit => {
+            update.global_upload_limit_bps = draft.global_upload_limit_bps;
+        }
+    }
+    update
 }
 
 fn shared_path_is_manual(item: ConfigItem) -> bool {
@@ -203,32 +278,99 @@ fn shared_path_is_manual(item: ConfigItem) -> bool {
 }
 
 fn increase_rate_limit_bps(current: u64) -> u64 {
-    match current {
-        0 => UNLIMITED_RATE_LIMIT_BPS,
-        UNLIMITED_RATE_LIMIT_BPS => RATE_LIMIT_STEP_BPS,
-        _ => current.saturating_add(RATE_LIMIT_STEP_BPS),
+    if crate::config::is_unlimited_rate_limit_bps(current) {
+        RATE_LIMIT_STEP_BPS
+    } else {
+        current.saturating_add(RATE_LIMIT_STEP_BPS)
     }
 }
 
 fn decrease_rate_limit_bps(current: u64) -> u64 {
-    match current {
-        0 => 0,
-        UNLIMITED_RATE_LIMIT_BPS => 0,
-        _ => current
-            .checked_sub(RATE_LIMIT_STEP_BPS)
-            .filter(|new_rate| *new_rate > 0)
-            .unwrap_or(UNLIMITED_RATE_LIMIT_BPS),
+    if crate::config::is_unlimited_rate_limit_bps(current) {
+        return current;
     }
+    current
+        .checked_sub(RATE_LIMIT_STEP_BPS)
+        .filter(|new_rate| *new_rate > 0)
+        .unwrap_or(UNLIMITED_RATE_LIMIT_BPS)
+}
+
+fn parse_rate_limit_input(input: &str) -> Option<u64> {
+    let normalized = input.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "unlimited" | "none" | "off") {
+        return Some(UNLIMITED_RATE_LIMIT_BPS);
+    }
+
+    let compact = normalized.replace(' ', "");
+    let number_end = compact
+        .char_indices()
+        .find_map(|(index, character)| {
+            (!character.is_ascii_digit() && character != '.').then_some(index)
+        })
+        .unwrap_or(compact.len());
+    let number = compact.get(..number_end)?.parse::<f64>().ok()?;
+    if !number.is_finite() || number < 0.0 {
+        return None;
+    }
+    if number == 0.0 {
+        return Some(UNLIMITED_RATE_LIMIT_BPS);
+    }
+
+    let multiplier = match compact.get(number_end..)? {
+        "" | "bps" | "bit/s" | "bits/s" => 1.0,
+        "k" | "kbps" | "kbit/s" | "kbits/s" => 1_000.0,
+        "m" | "mbps" | "mbit/s" | "mbits/s" => 1_000_000.0,
+        "g" | "gbps" | "gbit/s" | "gbits/s" => 1_000_000_000.0,
+        _ => return None,
+    };
+    let value = number * multiplier;
+    if value > u64::MAX as f64 {
+        return None;
+    }
+    let value = value.round() as u64;
+    Some(if crate::config::is_unlimited_rate_limit_bps(value) {
+        UNLIMITED_RATE_LIMIT_BPS
+    } else {
+        value
+    })
+}
+
+fn edit_character_allowed(item: ConfigItem, character: char) -> bool {
+    match item {
+        ConfigItem::ClientPort => character.is_ascii_digit(),
+        ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | ' ' | '/')
+        }
+        _ => false,
+    }
+}
+
+fn insert_editor_character(editor: &mut ConfigEditState, character: char) {
+    if editor.select_all {
+        editor.buffer.clear();
+        editor.cursor = 0;
+        editor.select_all = false;
+    }
+    editor.buffer.insert(editor.cursor, character);
+    editor.cursor += character.len_utf8();
 }
 
 fn map_key_to_config_action(
     key_code: KeyCode,
-    editing: &Option<(ConfigItem, String)>,
+    editing: &Option<ConfigEditState>,
 ) -> Option<ConfigAction> {
     if editing.is_some() {
+        let item = editing.as_ref().map(|editor| editor.item);
         return match key_code {
-            KeyCode::Char(c) if c.is_ascii_digit() => Some(ConfigAction::EditInsert(c)),
+            KeyCode::Char(c) if item.is_some_and(|item| edit_character_allowed(item, c)) => {
+                Some(ConfigAction::EditInsert(c))
+            }
             KeyCode::Backspace => Some(ConfigAction::EditBackspace),
+            KeyCode::Delete => Some(ConfigAction::EditDelete),
+            KeyCode::Left => Some(ConfigAction::EditMoveLeft),
+            KeyCode::Right => Some(ConfigAction::EditMoveRight),
+            KeyCode::Home => Some(ConfigAction::EditMoveHome),
+            KeyCode::End => Some(ConfigAction::EditMoveEnd),
             KeyCode::Esc => Some(ConfigAction::EditCancel),
             KeyCode::Enter => Some(ConfigAction::EditCommit),
             _ => None,
@@ -236,14 +378,13 @@ fn map_key_to_config_action(
     }
 
     match key_code {
-        KeyCode::Esc | KeyCode::Char('Q') => Some(ConfigAction::SaveAndExit),
-        KeyCode::Char('e') => Some(ConfigAction::StartEditOrBrowse),
-        KeyCode::Char(' ') => Some(ConfigAction::ToggleSelectedBool),
+        KeyCode::Esc | KeyCode::Char('q' | 'Q') => Some(ConfigAction::Exit),
+        KeyCode::Enter | KeyCode::Char('e') => Some(ConfigAction::StartEditOrBrowse),
+        KeyCode::Char(' ') => Some(ConfigAction::ShiftSelected),
         KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
         KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
         KeyCode::Up | KeyCode::Char('k') => Some(ConfigAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(ConfigAction::MoveDown),
-        KeyCode::Tab | KeyCode::BackTab => Some(ConfigAction::ToggleFocus),
         KeyCode::Char('r') => Some(ConfigAction::ResetSelected),
         KeyCode::Right | KeyCode::Char('l') => Some(ConfigAction::IncreaseSelected),
         KeyCode::Left | KeyCode::Char('h') => Some(ConfigAction::DecreaseSelected),
@@ -256,34 +397,21 @@ pub fn reduce_config_action(
     settings_edit: &mut Box<Settings>,
     selected_index: &mut usize,
     items: &mut [ConfigItem],
-    editing: &mut Option<(ConfigItem, String)>,
+    editing: &mut Option<ConfigEditState>,
 ) -> ConfigReduceResult {
     let mut result = ConfigReduceResult::default();
     match action {
-        ConfigAction::SaveAndExit => {
+        ConfigAction::Exit => {
             result.consumed = true;
-            result.effects.push(ConfigEffect::AppCommand(Box::new(
-                AppCommand::UpdateConfig(*settings_edit.clone()),
-            )));
-            result.effects.push(ConfigEffect::ToNormal);
         }
         ConfigAction::StartEditOrBrowse => {
             result.consumed = true;
-            let selected_item = items[*selected_index];
-            match selected_item {
-                ConfigItem::GlobalDownloadLimit
-                | ConfigItem::GlobalUploadLimit
-                | ConfigItem::ClientPort => {
-                    *editing = Some((selected_item, String::new()));
-                }
-                ConfigItem::AlwaysShowAddLocationPrompt => {
-                    settings_edit.always_show_add_location_prompt =
-                        !settings_edit.always_show_add_location_prompt;
-                }
-                ConfigItem::UiLayoutMode => {
-                    settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
-                }
+        }
+        ConfigAction::ShiftSelected => {
+            result.consumed = true;
+            match items[*selected_index] {
                 ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
+                    let selected_item = items[*selected_index];
                     if shared_path_is_manual(selected_item) {
                         return result;
                     }
@@ -313,19 +441,47 @@ pub fn reduce_config_action(
                         },
                     )));
                 }
-            }
-        }
-        ConfigAction::ToggleSelectedBool => {
-            result.consumed = true;
-            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt {
-                settings_edit.always_show_add_location_prompt =
-                    !settings_edit.always_show_add_location_prompt;
+                ConfigItem::ClientPort => {
+                    let buffer = settings_edit.client_port.to_string();
+                    *editing = Some(ConfigEditState {
+                        cursor: buffer.len(),
+                        buffer,
+                        item: ConfigItem::ClientPort,
+                        select_all: true,
+                    });
+                }
+                ConfigItem::AlwaysShowAddLocationPrompt => {
+                    settings_edit.always_show_add_location_prompt =
+                        !settings_edit.always_show_add_location_prompt;
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::UiLayoutMode => {
+                    settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
+                    result.effects.push(ConfigEffect::ApplySettings);
+                }
+                ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
+                    let item = items[*selected_index];
+                    let buffer = if item == ConfigItem::GlobalDownloadLimit {
+                        format_limit_bps(settings_edit.global_download_limit_bps)
+                    } else {
+                        format_limit_bps(settings_edit.global_upload_limit_bps)
+                    };
+                    *editing = Some(ConfigEditState {
+                        cursor: buffer.len(),
+                        buffer,
+                        item,
+                        select_all: true,
+                    });
+                }
             }
         }
         ConfigAction::SetSelectedBool(value) => {
             result.consumed = true;
-            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt {
+            if items[*selected_index] == ConfigItem::AlwaysShowAddLocationPrompt
+                && settings_edit.always_show_add_location_prompt != value
+            {
                 settings_edit.always_show_add_location_prompt = value;
+                result.effects.push(ConfigEffect::ApplySettings);
             }
         }
         ConfigAction::MoveUp => {
@@ -336,13 +492,12 @@ pub fn reduce_config_action(
             result.consumed = true;
             *selected_index = next_visible_setting_index(items, *selected_index);
         }
-        ConfigAction::ToggleFocus => {
-            result.consumed = true;
-        }
         ConfigAction::ResetSelected => {
             result.consumed = true;
             let default_settings = Settings::default();
             let selected_item = items[*selected_index];
+            let changed = config_item_is_dirty(selected_item, settings_edit, &default_settings);
+            let mut can_apply = true;
             match selected_item {
                 ConfigItem::ClientPort => {
                     settings_edit.client_port = default_settings.client_port;
@@ -351,6 +506,8 @@ pub fn reduce_config_action(
                     if !shared_path_is_manual(selected_item) {
                         settings_edit.default_download_folder =
                             default_settings.default_download_folder;
+                    } else {
+                        can_apply = false;
                     }
                 }
                 ConfigItem::WatchFolder => {
@@ -372,6 +529,9 @@ pub fn reduce_config_action(
                         default_settings.global_upload_limit_bps;
                 }
             }
+            if changed && can_apply {
+                result.effects.push(ConfigEffect::ApplySettings);
+            }
         }
         ConfigAction::IncreaseSelected => {
             result.consumed = true;
@@ -380,15 +540,16 @@ pub fn reduce_config_action(
                 ConfigItem::GlobalDownloadLimit => {
                     let new_rate = increase_rate_limit_bps(settings_edit.global_download_limit_bps);
                     settings_edit.global_download_limit_bps = new_rate;
-                    result.effects.push(ConfigEffect::SetDownloadRate(new_rate));
+                    result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::GlobalUploadLimit => {
                     let new_rate = increase_rate_limit_bps(settings_edit.global_upload_limit_bps);
                     settings_edit.global_upload_limit_bps = new_rate;
-                    result.effects.push(ConfigEffect::SetUploadRate(new_rate));
+                    result.effects.push(ConfigEffect::ApplySettings);
                 }
                 ConfigItem::UiLayoutMode => {
                     settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.next();
+                    result.effects.push(ConfigEffect::ApplySettings);
                 }
                 _ => {}
             }
@@ -399,30 +560,108 @@ pub fn reduce_config_action(
             match item {
                 ConfigItem::GlobalDownloadLimit => {
                     let new_rate = decrease_rate_limit_bps(settings_edit.global_download_limit_bps);
-                    settings_edit.global_download_limit_bps = new_rate;
-                    result.effects.push(ConfigEffect::SetDownloadRate(new_rate));
+                    if settings_edit.global_download_limit_bps != new_rate {
+                        settings_edit.global_download_limit_bps = new_rate;
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
                 }
                 ConfigItem::GlobalUploadLimit => {
                     let new_rate = decrease_rate_limit_bps(settings_edit.global_upload_limit_bps);
-                    settings_edit.global_upload_limit_bps = new_rate;
-                    result.effects.push(ConfigEffect::SetUploadRate(new_rate));
+                    if settings_edit.global_upload_limit_bps != new_rate {
+                        settings_edit.global_upload_limit_bps = new_rate;
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
                 }
                 ConfigItem::UiLayoutMode => {
                     settings_edit.ui_layout_mode = settings_edit.ui_layout_mode.previous();
+                    result.effects.push(ConfigEffect::ApplySettings);
                 }
                 _ => {}
             }
         }
         ConfigAction::EditInsert(c) => {
             result.consumed = true;
-            if let Some((_item, buffer)) = editing {
-                buffer.push(c);
+            if let Some(editor) = editing {
+                insert_editor_character(editor, c);
             }
         }
         ConfigAction::EditBackspace => {
             result.consumed = true;
-            if let Some((_item, buffer)) = editing {
-                buffer.pop();
+            if let Some(editor) = editing {
+                if editor.select_all {
+                    editor.buffer.clear();
+                    editor.cursor = 0;
+                    editor.select_all = false;
+                } else if editor.cursor > 0 {
+                    let previous = editor.buffer[..editor.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    editor.buffer.drain(previous..editor.cursor);
+                    editor.cursor = previous;
+                }
+            }
+        }
+        ConfigAction::EditDelete => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                if editor.select_all {
+                    editor.buffer.clear();
+                    editor.cursor = 0;
+                    editor.select_all = false;
+                } else if editor.cursor < editor.buffer.len() {
+                    let next = editor.buffer[editor.cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(offset, _)| editor.cursor + offset)
+                        .unwrap_or(editor.buffer.len());
+                    editor.buffer.drain(editor.cursor..next);
+                }
+            }
+        }
+        ConfigAction::EditMoveLeft => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                if editor.select_all {
+                    editor.cursor = 0;
+                    editor.select_all = false;
+                } else if editor.cursor > 0 {
+                    editor.cursor = editor.buffer[..editor.cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                }
+            }
+        }
+        ConfigAction::EditMoveRight => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                if editor.select_all {
+                    editor.cursor = editor.buffer.len();
+                    editor.select_all = false;
+                } else if editor.cursor < editor.buffer.len() {
+                    editor.cursor = editor.buffer[editor.cursor..]
+                        .char_indices()
+                        .nth(1)
+                        .map(|(offset, _)| editor.cursor + offset)
+                        .unwrap_or(editor.buffer.len());
+                }
+            }
+        }
+        ConfigAction::EditMoveHome => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                editor.cursor = 0;
+                editor.select_all = false;
+            }
+        }
+        ConfigAction::EditMoveEnd => {
+            result.consumed = true;
+            if let Some(editor) = editing {
+                editor.cursor = editor.buffer.len();
+                editor.select_all = false;
             }
         }
         ConfigAction::EditCancel => {
@@ -431,28 +670,30 @@ pub fn reduce_config_action(
         }
         ConfigAction::EditCommit => {
             result.consumed = true;
-            if let Some((item, buffer)) = editing {
+            if let Some(editor) = editing {
                 let mut committed = false;
-                match item {
+                let mut changed = false;
+                match editor.item {
                     ConfigItem::ClientPort => {
-                        if let Ok(new_port) = buffer.parse::<u16>() {
+                        if let Ok(new_port) = editor.buffer.parse::<u16>() {
                             if new_port > 0 {
+                                changed = settings_edit.client_port != new_port;
                                 settings_edit.client_port = new_port;
                                 committed = true;
                             }
                         }
                     }
                     ConfigItem::GlobalDownloadLimit => {
-                        if let Ok(new_rate) = buffer.parse::<u64>() {
+                        if let Some(new_rate) = parse_rate_limit_input(&editor.buffer) {
+                            changed = settings_edit.global_download_limit_bps != new_rate;
                             settings_edit.global_download_limit_bps = new_rate;
-                            result.effects.push(ConfigEffect::SetDownloadRate(new_rate));
                             committed = true;
                         }
                     }
                     ConfigItem::GlobalUploadLimit => {
-                        if let Ok(new_rate) = buffer.parse::<u64>() {
+                        if let Some(new_rate) = parse_rate_limit_input(&editor.buffer) {
+                            changed = settings_edit.global_upload_limit_bps != new_rate;
                             settings_edit.global_upload_limit_bps = new_rate;
-                            result.effects.push(ConfigEffect::SetUploadRate(new_rate));
                             committed = true;
                         }
                     }
@@ -461,6 +702,9 @@ pub fn reduce_config_action(
                     }
                 }
                 if committed {
+                    if changed {
+                        result.effects.push(ConfigEffect::ApplySettings);
+                    }
                     *editing = None;
                 }
             }
@@ -529,143 +773,96 @@ fn previous_visible_setting_index(items: &[ConfigItem], selected_index: usize) -
         .unwrap_or(selected_index)
 }
 
-fn settings_focus_moves_to_details(action: &ConfigAction) -> bool {
-    matches!(
-        action,
-        ConfigAction::StartEditOrBrowse
-            | ConfigAction::ToggleSelectedBool
-            | ConfigAction::SetSelectedBool(_)
-            | ConfigAction::ResetSelected
-    )
-}
-
-fn settings_pane_ignores_action(action: &ConfigAction) -> bool {
-    matches!(
-        action,
-        ConfigAction::IncreaseSelected | ConfigAction::DecreaseSelected
-    )
-}
-
-fn controls_pane_ignores_action(action: &ConfigAction) -> bool {
-    matches!(action, ConfigAction::MoveUp | ConfigAction::MoveDown)
-}
-
-fn pane_content_margin(area: ratatui::layout::Rect) -> ratatui::layout::Margin {
-    ratatui::layout::Margin {
-        horizontal: if area.width >= 70 {
-            3
-        } else if area.width >= 30 {
-            2
-        } else {
-            1
-        },
-        vertical: if area.height >= 18 { 2 } else { 1 },
-    }
-}
-
-fn settings_pane_content_area(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
-    let margin = pane_content_margin(area);
-    area.inner(ratatui::layout::Margin {
-        horizontal: margin.horizontal,
-        vertical: 1,
-    })
-}
-
 struct ConfigRenderContext<'a, 'b> {
     screen: &'a ScreenContext<'b>,
     settings: &'a Settings,
-    editing: &'a Option<(ConfigItem, String)>,
+    editing: &'a Option<ConfigEditState>,
     layout_kind: ConfigLayoutKind,
+    terminal_area: Rect,
+    shared_follower: bool,
 }
 
-struct PortDetailsModel<'a> {
-    draft_port: u16,
-    active_port: u16,
-    default_port: u16,
-    editing_buffer: Option<&'a str>,
-    ipv4_open: bool,
-    ipv6_open: bool,
-    compact: bool,
+fn config_pane_padding(horizontal: u16, area: Rect, pad_top: bool) -> Padding {
+    let vertical = u16::from(area.height >= 15);
+    Padding::new(
+        horizontal,
+        horizontal,
+        if pad_top { vertical } else { 0 },
+        vertical,
+    )
 }
 
-pub fn draw(
-    f: &mut Frame,
-    screen: &ScreenContext<'_>,
-    settings: &Settings,
-    selected_index: usize,
-    items: &[ConfigItem],
-    active_pane: ConfigPane,
-    editing: &Option<(ConfigItem, String)>,
-) {
-    let ctx = screen.theme;
+pub struct ConfigDrawState<'a> {
+    pub settings: &'a Settings,
+    pub selected_index: usize,
+    pub items: &'a [ConfigItem],
+    pub active_pane: ConfigPane,
+    pub editing: &'a Option<ConfigEditState>,
+}
+
+pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, state: ConfigDrawState<'_>) {
+    let ConfigDrawState {
+        settings,
+        selected_index,
+        items,
+        active_pane,
+        editing,
+    } = state;
     let plan = calculate_config_layout(f.area(), settings.ui_layout_mode);
     f.render_widget(Clear, f.area());
 
     let active_item = selected_item(items, selected_index);
     let active_descriptor = descriptor_for_item(active_item);
-
+    let shared_follower = crate::config::is_shared_config_mode()
+        && screen.ui.cluster_role_label.as_deref() == Some("Follower");
     let render_ctx = ConfigRenderContext {
         screen,
         settings,
         editing,
         layout_kind: plan.kind,
+        terminal_area: f.area(),
+        shared_follower,
     };
-    render_settings_pane(
-        f,
-        &render_ctx,
-        items,
-        selected_index,
-        plan.list_pane,
-        active_pane == ConfigPane::Settings,
-    );
-    render_details_pane(
-        f,
-        &render_ctx,
-        active_item,
-        active_descriptor,
-        plan.details_pane,
-        active_pane == ConfigPane::Details,
-    );
 
-    let port_details_active =
-        active_pane == ConfigPane::Details && active_item == ConfigItem::ClientPort;
-    let help_text = if port_details_active {
-        Line::from("")
-    } else if editing.is_some() {
-        Line::from(vec![
-            Span::styled("[Enter]", footer_key_style(ctx, ActionTone::Confirm)),
-            Span::raw(" to confirm, "),
-            Span::styled("[Esc]", footer_key_style(ctx, ActionTone::Cancel)),
-            Span::raw(" to cancel."),
-        ])
-    } else if active_pane == ConfigPane::Settings {
-        Line::from(vec![
-            Span::styled("↑/↓/k/j", footer_key_style(ctx, ActionTone::Navigate)),
-            Span::raw(" select, "),
-            Span::styled("[e]|[Tab]", footer_key_style(ctx, ActionTone::Navigate)),
-            Span::raw(" controls, "),
-            Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
-            Span::raw(" Save & Exit."),
-        ])
+    if plan.kind == ConfigLayoutKind::Compact {
+        match active_pane {
+            ConfigPane::Settings => render_settings_pane(
+                f,
+                &render_ctx,
+                items,
+                selected_index,
+                plan.content_area,
+                true,
+            ),
+            ConfigPane::Details => render_details_pane(
+                f,
+                &render_ctx,
+                active_item,
+                active_descriptor,
+                plan.content_area,
+                true,
+            ),
+        }
     } else {
-        Line::from(vec![
-            Span::styled("[Tab]", footer_key_style(ctx, ActionTone::Navigate)),
-            Span::raw(" settings, "),
-            Span::styled("[e]", footer_key_style(ctx, ActionTone::Edit)),
-            Span::raw(" edit/open, "),
-            Span::styled("←/→", footer_key_style(ctx, ActionTone::Toggle)),
-            Span::raw(" adjust, "),
-            Span::styled("[r]", footer_key_style(ctx, ActionTone::Clear)),
-            Span::raw("eset, "),
-            Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
-            Span::raw(" Save & Exit."),
-        ])
-    };
+        render_settings_pane(
+            f,
+            &render_ctx,
+            items,
+            selected_index,
+            plan.list_pane,
+            active_pane == ConfigPane::Settings,
+        );
+        render_details_pane(
+            f,
+            &render_ctx,
+            active_item,
+            active_descriptor,
+            plan.details_pane,
+            active_pane == ConfigPane::Details,
+        );
+    }
 
-    let footer_paragraph = Paragraph::new(help_text)
-        .alignment(Alignment::Center)
-        .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
-    f.render_widget(footer_paragraph, plan.footer_area);
+    render_config_footer(f, &render_ctx, active_item, active_pane, plan.footer_area);
 }
 
 fn render_settings_pane(
@@ -678,65 +875,100 @@ fn render_settings_pane(
 ) {
     let ctx = render_ctx.screen.theme;
     let editing = render_ctx.editing;
-    let layout_kind = render_ctx.layout_kind;
     let border_style = if focused {
         ctx.apply(Style::default().fg(ctx.state_selected()))
     } else {
         ctx.apply(Style::default().fg(ctx.theme.semantic.border))
     };
-    let inner = settings_pane_content_area(area);
     let block = Block::default()
         .borders(Borders::ALL)
+        .padding(config_pane_padding(1, area, false))
         .border_style(border_style);
+    let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows_model = config_list_rows(items);
-    let constraints = rows_model
-        .iter()
-        .map(|row| match row {
-            ConfigListRow::Category(_) => Constraint::Length(1),
-            ConfigListRow::Setting { .. } if layout_kind == ConfigLayoutKind::Compact => {
-                Constraint::Length(2)
-            }
-            ConfigListRow::Setting { .. } => Constraint::Length(1),
-        })
-        .collect::<Vec<_>>();
+    let (start, end) = config_list_viewport(&rows_model, selected_index, inner.height as usize);
+    let visible_rows = &rows_model[start..end];
+    let constraints = vec![Constraint::Length(1); visible_rows.len()];
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(inner);
 
-    for (row_model, row_area) in rows_model.iter().zip(rows.iter()) {
+    for (row_model, row_area) in visible_rows.iter().zip(rows.iter()) {
         match row_model {
             ConfigListRow::Category(category) => {
                 let line = Line::from(vec![Span::styled(
-                    category.label(),
-                    ctx.apply(Style::default().fg(ctx.state_selected())),
+                    category.label().to_ascii_uppercase(),
+                    ctx.apply(Style::default().fg(ctx.accent_sapphire()).bold()),
                 )]);
                 f.render_widget(Paragraph::new(line), *row_area);
             }
             ConfigListRow::Setting { global_index, item } => {
                 let descriptor = descriptor_for_item(*item);
-                let is_highlighted = if let Some((edited_item, _)) = editing {
-                    *edited_item == *item
+                let is_highlighted = if let Some(editor) = editing {
+                    editor.item == *item
                 } else {
                     *global_index == selected_index
                 };
-                let row_style = if is_highlighted {
-                    ctx.apply(Style::default().fg(ctx.state_warning()))
+                let locked = config_item_is_locked(*item, render_ctx.shared_follower);
+                let label_style = if locked {
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
                 } else {
                     ctx.apply(Style::default().fg(ctx.theme.semantic.text))
                 };
-                let marker = if is_highlighted { "▶" } else { " " };
-                let line = if layout_kind == ConfigLayoutKind::Compact {
-                    format!("{marker} {}\n", descriptor.label)
+                let marker_style = if is_highlighted {
+                    ctx.apply(Style::default().fg(ctx.state_selected()).bold())
                 } else {
-                    format!("{marker} {}", descriptor.label)
+                    label_style
                 };
-                f.render_widget(Paragraph::new(line).style(row_style), *row_area);
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(if is_highlighted { "▶" } else { " " }, marker_style),
+                        Span::raw(" "),
+                        Span::styled(descriptor.label, label_style),
+                    ])),
+                    *row_area,
+                );
             }
         }
     }
+}
+
+fn config_list_viewport(
+    rows: &[ConfigListRow],
+    selected_index: usize,
+    visible_height: usize,
+) -> (usize, usize) {
+    if visible_height == 0 || rows.is_empty() {
+        return (0, 0);
+    }
+    if rows.len() <= visible_height {
+        return (0, rows.len());
+    }
+
+    let selected_row = rows
+        .iter()
+        .position(|row| {
+            matches!(
+                row,
+                ConfigListRow::Setting { global_index, .. } if *global_index == selected_index
+            )
+        })
+        .unwrap_or(0);
+    let category_start = rows[..=selected_row]
+        .iter()
+        .rposition(|row| matches!(row, ConfigListRow::Category(_)))
+        .unwrap_or(selected_row);
+    let start = if selected_row.saturating_sub(category_start) < visible_height {
+        category_start.min(rows.len().saturating_sub(visible_height))
+    } else {
+        selected_row
+            .saturating_sub(visible_height / 2)
+            .min(rows.len().saturating_sub(visible_height))
+    };
+    (start, (start + visible_height).min(rows.len()))
 }
 
 fn render_details_pane(
@@ -748,417 +980,729 @@ fn render_details_pane(
     focused: bool,
 ) {
     let ctx = render_ctx.screen.theme;
-    let settings = render_ctx.settings;
-    let editing = render_ctx.editing;
     let border_style = if focused {
         ctx.apply(Style::default().fg(ctx.state_selected()))
     } else {
         ctx.apply(Style::default().fg(ctx.theme.semantic.border))
     };
-    let shared_path_notice =
-        crate::config::is_shared_config_mode() && active_item == ConfigItem::DefaultDownloadFolder;
-    let value = if let Some((edited_item, buffer)) = editing {
-        if *edited_item == active_item {
-            format!("[{buffer}]")
-        } else {
-            value_for_item(active_item, settings)
-        }
+    let locked = config_item_is_locked(active_item, render_ctx.shared_follower);
+    let editing_active = render_ctx
+        .editing
+        .as_ref()
+        .is_some_and(|editor| editor.item == active_item);
+    let title_label = if editing_active {
+        format!(" Edit {} ", active_descriptor.label)
     } else {
-        value_for_item(active_item, settings)
+        format!(
+            " {} · {} ",
+            active_descriptor.label,
+            active_descriptor.category.label()
+        )
     };
-    let inner = area.inner(ratatui::layout::Margin {
-        horizontal: 2,
-        vertical: 1,
-    });
-
+    let mut title_spans = vec![Span::styled(
+        title_label,
+        ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+    )];
+    title_spans.push(Span::styled(
+        format!("[{}]", config_scope_label(active_descriptor.scope)),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+    ));
+    if locked {
+        title_spans.push(Span::styled(
+            "  READ ONLY",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        ));
+    }
     let block = Block::default()
+        .title(Line::from(title_spans))
         .borders(Borders::ALL)
+        .padding(config_pane_padding(
+            if area.width >= 44 { 2 } else { 1 },
+            area,
+            true,
+        ))
         .border_style(border_style);
+    let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if active_item == ConfigItem::ClientPort {
-        render_port_details_pane(f, render_ctx, inner, focused);
-        return;
-    }
-
-    let mut lines = vec![Line::from(vec![
-        Span::raw("Value: "),
-        Span::styled(value, ctx.apply(Style::default().fg(ctx.state_warning()))),
-    ])];
-
-    if let Some((edited_item, buffer)) = editing {
-        if *edited_item == active_item {
-            lines.push(Line::from(format!("Editing: {buffer}")));
-        }
-    }
-
-    if shared_path_notice {
-        let settings_label = crate::config::shared_settings_path()
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_else(|| "settings.toml".to_string());
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::raw("Shared mode: edit this value in "),
-            Span::styled(
-                settings_label,
-                ctx.apply(Style::default().fg(ctx.state_warning())),
-            ),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(control_hint(
-        active_descriptor.control,
-        active_item,
-    )));
-
-    let input =
-        Paragraph::new(lines).style(ctx.apply(Style::default().fg(ctx.theme.semantic.text)));
-    f.render_widget(input, inner);
-
-    if let Some((edited_item, buffer)) = editing {
-        if *edited_item == active_item {
-            let cursor_x = inner
-                .x
-                .saturating_add(8)
-                .saturating_add(buffer.len() as u16);
-            f.set_cursor_position((
-                cursor_x.min(inner.x + inner.width.saturating_sub(1)),
-                inner.y.saturating_add(1),
-            ));
-        }
-    }
-}
-
-fn render_port_details_pane(
-    f: &mut Frame,
-    render_ctx: &ConfigRenderContext<'_, '_>,
-    area: ratatui::layout::Rect,
-    focused: bool,
-) {
-    let ctx = render_ctx.screen.theme;
-    let default_port = Settings::default().client_port;
-    let editing_buffer = render_ctx.editing.as_ref().and_then(|(item, buffer)| {
-        if *item == ConfigItem::ClientPort {
-            Some(buffer.as_str())
+    let mut lines = if let Some(editor) = render_ctx.editing {
+        if editor.item == active_item {
+            build_edit_detail_lines(editor, render_ctx, inner.width)
         } else {
-            None
+            build_setting_detail_lines(active_item, render_ctx, inner.width)
         }
-    });
-    let model = PortDetailsModel {
-        draft_port: render_ctx.settings.client_port,
-        active_port: render_ctx.screen.settings.client_port,
-        default_port,
-        editing_buffer,
-        ipv4_open: render_ctx.screen.ui.externally_accessable_port_v4,
-        ipv6_open: render_ctx.screen.ui.externally_accessable_port_v6,
-        compact: render_ctx.layout_kind == ConfigLayoutKind::Compact || area.height < 12,
+    } else {
+        build_setting_detail_lines(active_item, render_ctx, inner.width)
     };
-    let command_line = focused
-        .then(|| port_details_command_line(model.editing_buffer.is_some(), model.compact, ctx));
-    let (body_area, command_area) =
-        port_details_body_and_command_areas(area, command_line.is_some());
-
-    let lines = build_port_details_lines(&model, ctx);
-    let content_area = centered_port_content_area(body_area, lines.len() as u16);
-    let input = Paragraph::new(lines)
-        .alignment(Alignment::Center)
-        .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text)))
-        .wrap(Wrap { trim: false });
-    f.render_widget(input, content_area);
-
-    if let (Some(command_line), Some(command_area)) = (command_line, command_area) {
-        let commands = Paragraph::new(command_line)
-            .alignment(Alignment::Center)
-            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
-        f.render_widget(commands, command_area);
+    if let Some(error) = render_ctx.screen.ui.system_error.as_deref() {
+        let mut error_lines = vec![Line::from(vec![
+            Span::styled(
+                "STATUS  ",
+                ctx.apply(Style::default().fg(ctx.state_error()).bold()),
+            ),
+            Span::styled(
+                error.to_string(),
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            ),
+        ])];
+        error_lines.push(detail_divider(inner.width, ctx));
+        error_lines.push(Line::from(""));
+        error_lines.append(&mut lines);
+        lines = error_lines;
     }
-}
-
-fn centered_port_content_area(
-    area: ratatui::layout::Rect,
-    content_height: u16,
-) -> ratatui::layout::Rect {
-    let height = content_height.min(area.height);
-    Layout::vertical([Constraint::Length(height)])
-        .flex(Flex::Center)
-        .split(area)[0]
-}
-
-fn port_details_body_and_command_areas(
-    area: ratatui::layout::Rect,
-    show_command: bool,
-) -> (ratatui::layout::Rect, Option<ratatui::layout::Rect>) {
-    if !show_command || area.height <= 1 {
-        return (area, None);
-    }
-
-    if area.height <= 2 {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
-            .split(area);
-        return (chunks[0], Some(chunks[1]));
-    }
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .split(area);
-    (chunks[1], Some(chunks[2]))
-}
-
-fn build_port_details_lines(
-    model: &PortDetailsModel<'_>,
-    ctx: &crate::theme::ThemeContext,
-) -> Vec<Line<'static>> {
-    if model.compact {
-        return build_compact_port_details_lines(model, ctx);
-    }
-
-    let title_style = ctx.apply(
-        Style::default()
-            .fg(ctx.state_selected())
-            .add_modifier(Modifier::BOLD),
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text))),
+        inner,
     );
-    let label_style = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0));
+}
+
+fn build_setting_detail_lines(
+    item: ConfigItem,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    match item {
+        ConfigItem::ClientPort => build_port_detail_lines(render_ctx, width),
+        ConfigItem::DefaultDownloadFolder | ConfigItem::WatchFolder => {
+            build_path_detail_lines(item, render_ctx, width)
+        }
+        ConfigItem::UiLayoutMode => build_layout_detail_lines(render_ctx, width),
+        ConfigItem::AlwaysShowAddLocationPrompt => {
+            build_confirm_add_detail_lines(render_ctx, width)
+        }
+        ConfigItem::GlobalDownloadLimit => build_rate_detail_lines(true, render_ctx, width),
+        ConfigItem::GlobalUploadLimit => build_rate_detail_lines(false, render_ctx, width),
+    }
+}
+
+fn build_port_detail_lines(
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let draft = render_ctx.settings.client_port;
+    let active = render_ctx.screen.settings.client_port;
+    let dirty = draft != active;
     let value_style = ctx.apply(
         Style::default()
-            .fg(ctx.state_warning())
-            .add_modifier(Modifier::BOLD),
+            .fg(if dirty {
+                ctx.state_warning()
+            } else {
+                ctx.theme.semantic.text
+            })
+            .bold(),
     );
-    let muted_style = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1));
-
-    if let Some(buffer) = model.editing_buffer {
-        return build_port_edit_details_lines(
-            model,
-            buffer,
-            title_style,
-            value_style,
-            muted_style,
-            ctx,
-        );
+    let mut configured = detail_row("Configured", draft.to_string(), value_style, ctx);
+    if dirty {
+        configured.spans.push(Span::styled(
+            "  UPDATING",
+            ctx.apply(Style::default().fg(ctx.state_warning()).bold()),
+        ));
     }
-
-    vec![
-        port_header_line(model, title_style, value_style, muted_style),
+    let mut lines = vec![
+        configured,
+        detail_row(
+            "Runtime",
+            active.to_string(),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+            ctx,
+        ),
+        inbound_observation_line(render_ctx, ctx),
         Line::from(""),
-        port_family_status_line("IPv4", model.ipv4_open, ctx),
-        port_family_status_line("IPv6", model.ipv6_open, ctx),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Inbound peer handshakes and DHT",
-            muted_style,
-        )]),
-        Line::from(vec![Span::styled(
-            "announces use this listener port.",
-            muted_style,
-        )]),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Active bind: ", label_style),
-            Span::styled(
-                model.active_port.to_string(),
-                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-            ),
-            Span::raw("        "),
-            Span::styled("Default: ", label_style),
-            Span::styled(
-                model.default_port.to_string(),
-                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-            ),
-        ]),
-    ]
-}
-
-fn build_port_edit_details_lines(
-    model: &PortDetailsModel<'_>,
-    buffer: &str,
-    title_style: Style,
-    value_style: Style,
-    muted_style: Style,
-    ctx: &crate::theme::ThemeContext,
-) -> Vec<Line<'static>> {
-    vec![
-        Line::from(Span::styled("Editing Listen Port", title_style)),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Current: ", muted_style),
-            Span::styled(
-                model.active_port.to_string(),
-                ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-            ),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled("New port", muted_style)),
-        port_edit_field_line(buffer, value_style, ctx),
-        Line::from(Span::styled("Valid range: 1-65535", muted_style)),
+        detail_divider(width, ctx),
         Line::from(""),
         Line::from(Span::styled(
-            port_edit_status_message(buffer),
-            port_edit_validation_style(buffer, ctx),
+            "Accepts inbound peer handshakes and DHT traffic.",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+        )),
+        detail_row(
+            "Default",
+            Settings::default().client_port.to_string(),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ctx,
+        ),
+    ];
+    if dirty {
+        lines.push(Line::from(Span::styled(
+            "The listener is updating to this port.",
+            ctx.apply(Style::default().fg(ctx.state_warning())),
+        )));
+    }
+    lines
+}
+
+fn inbound_observation_line(
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    ctx: &crate::theme::ThemeContext,
+) -> Line<'static> {
+    let observation = |family: &'static str, observed: bool| {
+        let (label, color) = if observed {
+            ("seen", ctx.state_success())
+        } else {
+            ("not seen", ctx.theme.semantic.subtext0)
+        };
+        Span::styled(
+            format!("{family} {label}"),
+            ctx.apply(Style::default().fg(color).bold()),
+        )
+    };
+    Line::from(vec![
+        detail_label_span("Inbound", ctx),
+        observation("IPv4", render_ctx.screen.ui.externally_accessable_port_v4),
+        Span::raw("   "),
+        observation("IPv6", render_ctx.screen.ui.externally_accessable_port_v6),
+    ])
+}
+
+fn build_path_detail_lines(
+    item: ConfigItem,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let draft_settings = if config_item_is_locked(item, render_ctx.shared_follower) {
+        render_ctx.screen.settings
+    } else {
+        render_ctx.settings
+    };
+    let (draft, active, description) = if item == ConfigItem::WatchFolder {
+        (
+            draft_settings.watch_folder.as_deref(),
+            crate::config::resolve_host_watch_path(render_ctx.screen.settings),
+            "Files placed here are discovered and queued for ingest.",
+        )
+    } else {
+        (
+            draft_settings.default_download_folder.as_deref(),
+            render_ctx.screen.settings.default_download_folder.clone(),
+            "New torrents use this location unless an add flow overrides it.",
+        )
+    };
+    let dirty = !config_item_is_locked(item, render_ctx.shared_follower)
+        && config_item_is_dirty(item, render_ctx.settings, render_ctx.screen.settings);
+    let mut lines = vec![
+        detail_row(
+            "Configured",
+            path_to_string(draft),
+            ctx.apply(
+                Style::default()
+                    .fg(if dirty {
+                        ctx.state_warning()
+                    } else {
+                        ctx.theme.semantic.text
+                    })
+                    .bold(),
+            ),
+            ctx,
+        ),
+        detail_row(
+            "Resolved",
+            path_to_string(active.as_deref()),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ctx,
+        ),
+        detail_row(
+            "State",
+            if draft.is_some() {
+                "Configured"
+            } else {
+                "Not set"
+            }
+            .to_string(),
+            ctx.apply(Style::default().fg(if draft.is_some() {
+                ctx.state_success()
+            } else {
+                ctx.theme.semantic.subtext0
+            })),
+            ctx,
+        ),
+        Line::from(""),
+        detail_divider(width, ctx),
+        Line::from(""),
+        Line::from(Span::styled(
+            description,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+        )),
+    ];
+    if config_item_is_locked(item, render_ctx.shared_follower) {
+        let message = if shared_path_is_manual(item) {
+            "This shared path is managed in the shared settings file."
+        } else {
+            "Shared settings are read-only while this node is a follower."
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            message,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        )));
+    }
+    lines
+}
+
+fn build_layout_detail_lines(
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let mode = if config_item_is_locked(ConfigItem::UiLayoutMode, render_ctx.shared_follower) {
+        render_ctx.screen.settings.ui_layout_mode
+    } else {
+        render_ctx.settings.ui_layout_mode
+    };
+    let kind_label = match render_ctx.layout_kind {
+        ConfigLayoutKind::Wide => "Wide",
+        ConfigLayoutKind::Stacked => "Stacked",
+        ConfigLayoutKind::Compact => "Compact",
+    };
+    let preview = match render_ctx.layout_kind {
+        ConfigLayoutKind::Wide => "[ Settings ][        Details        ]",
+        ConfigLayoutKind::Stacked => "[ Settings ]  /  [ Details ]",
+        ConfigLayoutKind::Compact => "[ Settings  ↔  Details ]",
+    };
+    vec![
+        choice_line(
+            "Mode",
+            &[
+                ("Auto", mode == crate::config::UiLayoutMode::Auto),
+                (
+                    "Horizontal",
+                    mode == crate::config::UiLayoutMode::Horizontal,
+                ),
+                ("Vertical", mode == crate::config::UiLayoutMode::Vertical),
+                ("Square", mode == crate::config::UiLayoutMode::Square),
+            ],
+            ctx,
+        ),
+        detail_row(
+            "Resolved",
+            format!(
+                "{kind_label}  ·  {}×{}",
+                render_ctx.terminal_area.width, render_ctx.terminal_area.height
+            ),
+            ctx.apply(Style::default().fg(ctx.state_success())),
+            ctx,
+        ),
+        Line::from(Span::styled(
+            preview,
+            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+        )),
+        Line::from(""),
+        detail_divider(width, ctx),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Auto follows the terminal shape. Forced modes preserve the preferred arrangement while still protecting minimum usable panel sizes.",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         )),
     ]
 }
 
-fn port_edit_field_line(
-    buffer: &str,
-    value_style: Style,
-    ctx: &crate::theme::ThemeContext,
-) -> Line<'static> {
-    let filler = " ".repeat(5_usize.saturating_sub(buffer.len()));
-    Line::from(vec![
-        Span::styled("[ ", value_style),
-        Span::styled(buffer.to_string(), value_style),
-        Span::styled("_", ctx.apply(Style::default().fg(ctx.state_warning()))),
-        Span::styled(filler, value_style),
-        Span::styled("]", value_style),
-    ])
+fn build_confirm_add_detail_lines(
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let enabled = render_ctx.settings.always_show_add_location_prompt;
+    let flow = if enabled {
+        "Add  →  Review location and priorities  →  Start"
+    } else {
+        "Add  →  Use the configured default  →  Start"
+    };
+    vec![
+        choice_line(
+            "Mode",
+            &[("Enabled", enabled), ("Disabled", !enabled)],
+            ctx,
+        ),
+        detail_row(
+            "Behavior",
+            if enabled {
+                "Always review"
+            } else {
+                "Use fast add paths"
+            }
+            .to_string(),
+            ctx.apply(Style::default().fg(if enabled {
+                ctx.state_success()
+            } else {
+                ctx.theme.semantic.subtext0
+            })),
+            ctx,
+        ),
+        Line::from(""),
+        Line::from(Span::styled(
+            flow,
+            ctx.apply(Style::default().fg(ctx.accent_sapphire()).bold()),
+        )),
+        Line::from(""),
+        detail_divider(width, ctx),
+        Line::from(""),
+        Line::from(Span::styled(
+            "When enabled, manual add flows pause for a location and file-priority review before starting.",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+        )),
+    ]
 }
 
-fn build_compact_port_details_lines(
-    model: &PortDetailsModel<'_>,
-    ctx: &crate::theme::ThemeContext,
+fn build_rate_detail_lines(
+    download: bool,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
 ) -> Vec<Line<'static>> {
-    let title_style = ctx.apply(
-        Style::default()
-            .fg(ctx.state_warning())
-            .add_modifier(Modifier::BOLD),
-    );
-    let label_style = ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0));
+    let ctx = render_ctx.screen.theme;
+    let item = if download {
+        ConfigItem::GlobalDownloadLimit
+    } else {
+        ConfigItem::GlobalUploadLimit
+    };
+    let draft_settings = if config_item_is_locked(item, render_ctx.shared_follower) {
+        render_ctx.screen.settings
+    } else {
+        render_ctx.settings
+    };
+    let draft = if download {
+        draft_settings.global_download_limit_bps
+    } else {
+        draft_settings.global_upload_limit_bps
+    };
+    let current = if download {
+        render_ctx
+            .screen
+            .ui
+            .avg_download_history
+            .last()
+            .copied()
+            .unwrap_or(0)
+    } else {
+        render_ctx
+            .screen
+            .ui
+            .avg_upload_history
+            .last()
+            .copied()
+            .unwrap_or(0)
+    };
+    let effective = if download {
+        render_ctx.screen.ui.effective_download_limit_bps
+    } else {
+        render_ctx.screen.settings.global_upload_limit_bps
+    };
+    let dirty = !config_item_is_locked(item, render_ctx.shared_follower)
+        && config_item_is_dirty(item, render_ctx.settings, render_ctx.screen.settings);
+    let metric_color = if download {
+        ctx.accent_sky()
+    } else {
+        ctx.accent_teal()
+    };
+    vec![
+        detail_row(
+            "Limit",
+            format_limit_bps(draft),
+            ctx.apply(
+                Style::default()
+                    .fg(if dirty {
+                        ctx.state_warning()
+                    } else {
+                        ctx.theme.semantic.text
+                    })
+                    .bold(),
+            ),
+            ctx,
+        ),
+        detail_row(
+            "Effective",
+            format_limit_bps(effective),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ctx,
+        ),
+        detail_row(
+            "Current",
+            format_speed(current),
+            ctx.apply(Style::default().fg(metric_color).bold()),
+            ctx,
+        ),
+        rate_gauge_line(current, effective, width, metric_color, ctx),
+        Line::from(""),
+        detail_divider(width, ctx),
+        Line::from(""),
+        Line::from(Span::styled(
+            if download && render_ctx.layout_kind == ConfigLayoutKind::Compact {
+                "Caps download traffic; disk protection may lower the live ceiling."
+            } else if download {
+                "Caps aggregate download traffic. The adaptive disk limiter may temporarily lower the effective ceiling."
+            } else {
+                "Caps aggregate upload traffic across active torrents."
+            },
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+        )),
+        detail_row(
+            "Step",
+            format_limit_bps(RATE_LIMIT_STEP_BPS),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ctx,
+        ),
+    ]
+}
+
+fn build_edit_detail_lines(
+    editor: &ConfigEditState,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let ctx = render_ctx.screen.theme;
+    let item = editor.item;
+    let buffer = editor.buffer.as_str();
+    let current = value_for_item(item, render_ctx.settings);
+    let (status, valid) = match item {
+        ConfigItem::ClientPort => (
+            port_edit_status_message(buffer),
+            buffer.parse::<u16>().is_ok_and(|port| port > 0),
+        ),
+        ConfigItem::GlobalDownloadLimit | ConfigItem::GlobalUploadLimit => {
+            let parsed = parse_rate_limit_input(buffer);
+            (
+                parsed
+                    .map(|rate| format!("Ready: {}", format_limit_bps(rate)))
+                    .unwrap_or_else(|| {
+                        "Use a value such as 25 Mbps, raw bits/s, or unlimited.".to_string()
+                    }),
+                parsed.is_some(),
+            )
+        }
+        _ => ("Ready".to_string(), true),
+    };
     let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Listen Port ", label_style),
-            Span::styled(model.draft_port.to_string(), title_style),
-            Span::raw("  "),
-            Span::styled(port_state_label(model), label_style),
-        ]),
-        Line::from(vec![
-            Span::raw("TCP/uTP  "),
-            port_family_badge("IPv4", model.ipv4_open, ctx),
-            Span::raw(" "),
-            port_family_badge("IPv6", model.ipv6_open, ctx),
-        ]),
+        detail_row(
+            "Current",
+            current,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ctx,
+        ),
+        Line::from(""),
     ];
-
-    if let Some(buffer) = model.editing_buffer {
-        lines.push(Line::from(vec![
-            Span::styled("New ", label_style),
-            Span::raw("["),
-            Span::styled(buffer.to_string(), title_style),
-            Span::styled("_", ctx.apply(Style::default().fg(ctx.state_warning()))),
-            Span::raw("]  1-65535"),
-        ]));
-    }
-
+    lines.extend(edit_field_lines(editor, width, ctx));
+    lines.extend([
+        Line::from(Span::styled(
+            status,
+            ctx.apply(Style::default().fg(if buffer.is_empty() {
+                ctx.theme.semantic.subtext1
+            } else if valid {
+                ctx.state_success()
+            } else {
+                ctx.state_error()
+            })),
+        )),
+        Line::from(""),
+        detail_divider(width, ctx),
+        Line::from(""),
+        Line::from(Span::styled(
+            if item == ConfigItem::ClientPort {
+                "Valid range: 1–65535. Enter validates and updates the runtime listener."
+            } else {
+                "Enter applies the rate in bits per second. Accepted suffixes: Kbps, Mbps, Gbps. Zero means unlimited."
+            },
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+        )),
+    ]);
     lines
 }
 
-fn port_family_badge(
-    family: &'static str,
-    open: bool,
+fn edit_field_lines(
+    editor: &ConfigEditState,
+    width: u16,
     ctx: &crate::theme::ThemeContext,
-) -> Span<'static> {
-    let status = if open { "OPEN" } else { "WAIT" };
-    let color = if open {
-        ctx.state_success()
+) -> Vec<Line<'static>> {
+    if width < 12 {
+        return vec![edit_prompt_line(&editor.buffer, ctx)];
+    }
+
+    let field_width = width.saturating_sub(2).min(46) as usize;
+    let content_width = field_width.saturating_sub(2);
+    let horizontal = "─".repeat(field_width);
+    let mut content_spans = vec![Span::styled(
+        "│ ",
+        ctx.apply(Style::default().fg(ctx.state_selected())),
+    )];
+    let rendered_content_width;
+
+    if editor.select_all {
+        let hint = "  type to replace";
+        let show_hint = editor.buffer.chars().count() + hint.chars().count() <= content_width;
+        let value_width =
+            content_width.saturating_sub(if show_hint { hint.chars().count() } else { 0 });
+        let visible_value = truncate_with_ellipsis(&editor.buffer, value_width);
+        rendered_content_width =
+            visible_value.chars().count() + if show_hint { hint.chars().count() } else { 0 };
+        content_spans.push(Span::styled(
+            visible_value,
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.theme.semantic.surface0)
+                    .bg(ctx.state_selected())
+                    .bold(),
+            ),
+        ));
+        if show_hint {
+            content_spans.push(Span::styled(
+                hint,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            ));
+        }
     } else {
-        ctx.theme.semantic.subtext0
-    };
+        let cursor = editor.cursor.min(editor.buffer.len());
+        let characters = editor.buffer.chars().collect::<Vec<_>>();
+        let cursor_character = editor.buffer[..cursor].chars().count();
+        let visible_characters = content_width.saturating_sub(1);
+        let mut start = cursor_character.saturating_sub(visible_characters / 2);
+        let end = (start + visible_characters).min(characters.len());
+        start = end.saturating_sub(visible_characters);
+        let before = characters[start..cursor_character]
+            .iter()
+            .collect::<String>();
+        let after = characters[cursor_character..end].iter().collect::<String>();
+        rendered_content_width = before.chars().count() + 1 + after.chars().count();
+        content_spans.push(Span::styled(
+            before,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+        ));
+        content_spans.push(Span::styled(
+            " ",
+            ctx.apply(
+                Style::default()
+                    .fg(ctx.theme.semantic.surface0)
+                    .bg(ctx.state_warning()),
+            ),
+        ));
+        content_spans.push(Span::styled(
+            after,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+        ));
+    }
+    content_spans.push(Span::raw(
+        " ".repeat(content_width.saturating_sub(rendered_content_width)),
+    ));
+    content_spans.push(Span::styled(
+        " │",
+        ctx.apply(Style::default().fg(ctx.state_selected())),
+    ));
+
+    vec![
+        Line::from(Span::styled(
+            format!("╭{horizontal}╮"),
+            ctx.apply(Style::default().fg(ctx.state_selected())),
+        )),
+        Line::from(content_spans),
+        Line::from(Span::styled(
+            format!("╰{horizontal}╯"),
+            ctx.apply(Style::default().fg(ctx.state_selected())),
+        )),
+    ]
+}
+
+fn edit_prompt_line(buffer: &str, ctx: &crate::theme::ThemeContext) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            "> ",
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+        ),
+        Span::styled(
+            buffer.to_string(),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text).bold()),
+        ),
+        Span::styled("_", ctx.apply(Style::default().fg(ctx.state_warning()))),
+    ])
+}
+
+fn detail_label_span(label: &'static str, ctx: &crate::theme::ThemeContext) -> Span<'static> {
     Span::styled(
-        format!("[{family} {status}]"),
-        ctx.apply(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        format!("{label:<14}"),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
     )
 }
 
-fn port_header_line(
-    model: &PortDetailsModel<'_>,
-    title_style: Style,
+fn detail_row(
+    label: &'static str,
+    value: String,
     value_style: Style,
-    muted_style: Style,
+    ctx: &crate::theme::ThemeContext,
 ) -> Line<'static> {
-    let mut spans = vec![
-        Span::styled("Listening Port: ", title_style),
-        Span::styled(model.draft_port.to_string(), value_style),
-    ];
-    if model.draft_port != model.active_port {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled("pending save", muted_style));
+    Line::from(vec![
+        detail_label_span(label, ctx),
+        Span::styled(value, value_style),
+    ])
+}
+
+fn detail_divider(width: u16, ctx: &crate::theme::ThemeContext) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat(width.saturating_sub(1).min(52) as usize),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+    ))
+}
+
+fn choice_line(
+    label: &'static str,
+    choices: &[(&'static str, bool)],
+    ctx: &crate::theme::ThemeContext,
+) -> Line<'static> {
+    let mut spans = vec![detail_label_span(label, ctx)];
+    for (index, (choice, active)) in choices.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(
+                "  ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+            ));
+        }
+        spans.push(Span::styled(
+            *choice,
+            if *active {
+                ctx.apply(
+                    Style::default()
+                        .fg(ctx.state_selected())
+                        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                )
+            } else {
+                ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
+            },
+        ));
     }
     Line::from(spans)
 }
 
-fn port_details_command_line(
-    editing: bool,
-    compact: bool,
+fn rate_gauge_line(
+    current: u64,
+    limit: u64,
+    width: u16,
+    metric_color: ratatui::style::Color,
     ctx: &crate::theme::ThemeContext,
 ) -> Line<'static> {
-    if editing {
+    if crate::config::is_unlimited_rate_limit_bps(limit) {
         return Line::from(vec![
-            Span::styled("[Enter]", footer_key_style(ctx, ActionTone::Confirm)),
-            Span::raw(" confirm  "),
-            Span::styled("[Esc]", footer_key_style(ctx, ActionTone::Cancel)),
-            Span::raw(" cancel"),
+            detail_label_span("Usage", ctx),
+            Span::styled(
+                "No configured ceiling",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            ),
         ]);
     }
-
-    if compact {
-        return Line::from(vec![
-            Span::styled("[e]", footer_key_style(ctx, ActionTone::Edit)),
-            Span::raw(" edit  "),
-            Span::styled("[r]", footer_key_style(ctx, ActionTone::Clear)),
-            Span::raw(" reset"),
-        ]);
-    }
-
+    let bar_width = width.saturating_sub(16).clamp(8, 28) as usize;
+    let ratio = (current as f64 / limit.max(1) as f64).clamp(0.0, 1.0);
+    let filled = (ratio * bar_width as f64).round() as usize;
     Line::from(vec![
-        Span::styled("[e]", footer_key_style(ctx, ActionTone::Edit)),
-        Span::raw(" change port  "),
-        Span::styled("[r]", footer_key_style(ctx, ActionTone::Clear)),
-        Span::raw(" reset  "),
-        Span::styled("[Tab]", footer_key_style(ctx, ActionTone::Navigate)),
-        Span::raw(" settings  "),
-        Span::styled("[Esc]|[Q]", footer_key_style(ctx, ActionTone::Confirm)),
-        Span::raw(" Save & Exit"),
-    ])
-}
-
-fn port_family_status_line(
-    family: &'static str,
-    open: bool,
-    ctx: &crate::theme::ThemeContext,
-) -> Line<'static> {
-    let status = if open { "open" } else { "waiting..." };
-
-    let color = if open {
-        ctx.state_success()
-    } else {
-        ctx.theme.semantic.subtext0
-    };
-
-    Line::from(vec![
+        detail_label_span("Usage", ctx),
         Span::styled(
-            family,
-            ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+            "█".repeat(filled),
+            ctx.apply(Style::default().fg(metric_color)),
         ),
-        Span::raw("  "),
         Span::styled(
-            status,
-            ctx.apply(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            "░".repeat(bar_width.saturating_sub(filled)),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.surface1)),
+        ),
+        Span::styled(
+            format!("  {:.0}%", ratio * 100.0),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
         ),
     ])
-}
-
-fn port_state_label(model: &PortDetailsModel<'_>) -> &'static str {
-    if model.draft_port == model.active_port {
-        "active"
-    } else {
-        "pending save"
-    }
 }
 
 fn port_edit_status_message(buffer: &str) -> String {
@@ -1168,54 +1712,199 @@ fn port_edit_status_message(buffer: &str) -> String {
 
     match buffer.parse::<u16>() {
         Ok(0) => "Port 0 is reserved for startup auto-bind.".to_string(),
-        Ok(port) => format!("Ready to bind port {port}."),
+        Ok(port) => format!("Ready to apply port {port}."),
         Err(_) => "Invalid port range. Use 1-65535.".to_string(),
     }
 }
 
-fn port_edit_validation_style(buffer: &str, ctx: &crate::theme::ThemeContext) -> Style {
-    let color = match buffer.parse::<u16>() {
-        Ok(port) if port > 0 => ctx.state_success(),
-        Ok(_) | Err(_) if !buffer.is_empty() => ctx.state_error(),
-        _ => ctx.theme.semantic.subtext1,
-    };
-    ctx.apply(Style::default().fg(color))
+fn render_config_footer(
+    f: &mut Frame,
+    render_ctx: &ConfigRenderContext<'_, '_>,
+    active_item: ConfigItem,
+    active_pane: ConfigPane,
+    area: Rect,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let locked = config_item_is_locked(active_item, render_ctx.shared_follower);
+    let mut actions = Vec::new();
+    if render_ctx.editing.is_some() {
+        actions.push(("Enter", "apply", ActionTone::Confirm));
+        actions.push(("Esc", "cancel", ActionTone::Cancel));
+        actions.push(("←/→", "cursor", ActionTone::Navigate));
+    } else if render_ctx.layout_kind == ConfigLayoutKind::Compact
+        && active_pane == ConfigPane::Settings
+    {
+        actions.push(("Enter", "details", ActionTone::Open));
+        actions.push(("Esc", "close", ActionTone::Cancel));
+        actions.push(("↑/↓", "setting", ActionTone::Navigate));
+    } else {
+        if !locked {
+            match descriptor_for_item(active_item).control {
+                ConfigControlKind::Bool => {
+                    actions.push(("Space", "toggle", ActionTone::Toggle));
+                }
+                ConfigControlKind::Enum => {
+                    actions.push(("Space", "next", ActionTone::Toggle));
+                    actions.push(("←/→", "choice", ActionTone::Navigate));
+                }
+                ConfigControlKind::Number | ConfigControlKind::RateLimit => {
+                    actions.push(("Space", "edit", ActionTone::Edit));
+                }
+                ConfigControlKind::Path => {
+                    actions.push(("Space", "browse", ActionTone::Open));
+                }
+            }
+        }
+        actions.push((
+            "Esc",
+            if render_ctx.layout_kind == ConfigLayoutKind::Compact
+                && active_pane == ConfigPane::Details
+            {
+                "settings"
+            } else {
+                "close"
+            },
+            ActionTone::Cancel,
+        ));
+        if !locked {
+            actions.push(("r", "reset", ActionTone::Clear));
+            if descriptor_for_item(active_item).control == ConfigControlKind::RateLimit {
+                actions.push(("←/→", "step", ActionTone::Navigate));
+            }
+        }
+        actions.push(("↑/↓", "setting", ActionTone::Navigate));
+    }
+    let line = footer_actions_line(&actions, area.width, render_ctx.screen.theme);
+    f.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }
 
-fn control_hint(control: ConfigControlKind, item: ConfigItem) -> &'static str {
-    match control {
-        ConfigControlKind::Bool => "Space/e toggles. t enables. f disables.",
-        ConfigControlKind::Enum => "←/→ cycles choices. e advances to the next choice.",
-        ConfigControlKind::Number => "e edits exact numeric value. r resets to default.",
-        ConfigControlKind::RateLimit => "←/→ changes in steps. e edits exact bytes/sec. r resets.",
-        ConfigControlKind::Path if shared_path_is_manual(item) => {
-            "Managed by shared config. Host-local settings still save here."
+fn footer_actions_line(
+    actions: &[(&str, &str, ActionTone)],
+    width: u16,
+    ctx: &crate::theme::ThemeContext,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for (key, label, tone) in actions {
+        let separator = if spans.is_empty() { 0 } else { 3 };
+        let action_width = key.chars().count() + label.chars().count() + 3;
+        if used + separator + action_width > width as usize {
+            continue;
         }
-        ConfigControlKind::Path => "e opens the directory picker. r resets to default.",
+        if !spans.is_empty() {
+            spans.push(Span::styled(
+                " | ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            ));
+            used += 3;
+        }
+        spans.push(Span::styled(
+            format!("[{key}]"),
+            footer_key_style(ctx, *tone),
+        ));
+        spans.push(Span::styled(
+            format!(" {label}"),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+        ));
+        used += action_width;
+    }
+    Line::from(spans)
+}
+
+fn action_mutates_selected_setting(action: &ConfigAction) -> bool {
+    matches!(
+        action,
+        ConfigAction::StartEditOrBrowse
+            | ConfigAction::ShiftSelected
+            | ConfigAction::SetSelectedBool(_)
+            | ConfigAction::ResetSelected
+            | ConfigAction::IncreaseSelected
+            | ConfigAction::DecreaseSelected
+    )
+}
+
+fn action_supported_for_item(action: &ConfigAction, item: ConfigItem) -> bool {
+    let control = descriptor_for_item(item).control;
+    match action {
+        ConfigAction::StartEditOrBrowse => false,
+        ConfigAction::ShiftSelected => {
+            matches!(
+                control,
+                ConfigControlKind::Bool
+                    | ConfigControlKind::Enum
+                    | ConfigControlKind::Number
+                    | ConfigControlKind::RateLimit
+                    | ConfigControlKind::Path
+            )
+        }
+        ConfigAction::SetSelectedBool(_) => control == ConfigControlKind::Bool,
+        ConfigAction::IncreaseSelected | ConfigAction::DecreaseSelected => matches!(
+            control,
+            ConfigControlKind::Enum | ConfigControlKind::RateLimit
+        ),
+        _ => true,
     }
 }
 
-pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool {
+fn exit_config(mode: &mut AppMode, file_browser_generation: &mut u64) {
+    *file_browser_generation = file_browser_generation.wrapping_add(1);
+    *mode = AppMode::Normal;
+}
+
+pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Option<Settings> {
+    if let CrosstermEvent::Paste(text) = &event {
+        let editor = ctx.editing.as_mut()?;
+        let item = editor.item;
+        for character in text
+            .chars()
+            .filter(|character| edit_character_allowed(item, *character))
+        {
+            insert_editor_character(editor, character);
+        }
+        return None;
+    }
+
     if let CrosstermEvent::Key(key) = event {
         if key.kind != KeyEventKind::Press {
-            return false;
+            return None;
         }
         if let Some(action) = map_key_to_config_action(key.code, ctx.editing) {
-            if action == ConfigAction::ToggleFocus {
-                toggle_config_pane(ctx.active_pane);
-                return true;
+            if action == ConfigAction::Exit {
+                if ctx.compact && *ctx.active_pane == ConfigPane::Details {
+                    *ctx.active_pane = ConfigPane::Settings;
+                } else {
+                    exit_config(ctx.mode, ctx.file_browser_generation);
+                }
+                return None;
             }
-            if *ctx.active_pane == ConfigPane::Details && controls_pane_ignores_action(&action) {
-                return true;
-            }
-            if *ctx.active_pane == ConfigPane::Settings && settings_pane_ignores_action(&action) {
-                return true;
-            }
-            if *ctx.active_pane == ConfigPane::Settings && settings_focus_moves_to_details(&action)
+
+            let active_item = selected_item(ctx.items, *ctx.selected_index);
+            if ctx.compact
+                && *ctx.active_pane == ConfigPane::Settings
+                && action == ConfigAction::StartEditOrBrowse
             {
                 *ctx.active_pane = ConfigPane::Details;
-                return true;
+                return None;
             }
+            if !action_supported_for_item(&action, active_item) {
+                return None;
+            }
+            if config_item_is_locked(active_item, ctx.shared_follower)
+                && action_mutates_selected_setting(&action)
+            {
+                *ctx.active_pane = ConfigPane::Details;
+                return None;
+            }
+
+            if ctx.compact
+                && *ctx.active_pane == ConfigPane::Settings
+                && action_mutates_selected_setting(&action)
+            {
+                *ctx.active_pane = ConfigPane::Details;
+            }
+
             let reduced = reduce_config_action(
                 action,
                 ctx.settings_edit,
@@ -1223,8 +1912,17 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool
                 ctx.items,
                 ctx.editing,
             );
+            let mut settings_update = None;
             for effect in reduced.effects {
                 match effect {
+                    ConfigEffect::ApplySettings => {
+                        settings_update = Some(merge_config_item_into_current(
+                            ctx.settings_edit,
+                            ctx.applied_settings,
+                            active_item,
+                            ctx.shared_follower,
+                        ));
+                    }
                     ConfigEffect::AppCommand(command) => {
                         let mut command = *command;
                         if let AppCommand::FetchFileTree {
@@ -1241,35 +1939,22 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> bool
                             command,
                         );
                     }
-                    ConfigEffect::SetDownloadRate(new_rate) => {
-                        let bucket = ctx.global_dl_bucket.clone();
-                        tokio::spawn(async move {
-                            bucket.set_rate(rate_limit_bps_to_bucket_bytes_per_sec(new_rate));
-                        });
-                    }
-                    ConfigEffect::SetUploadRate(new_rate) => {
-                        let bucket = ctx.global_ul_bucket.clone();
-                        tokio::spawn(async move {
-                            bucket.set_rate(rate_limit_bps_to_bucket_bytes_per_sec(new_rate));
-                        });
-                    }
-                    ConfigEffect::ToNormal => {
-                        *ctx.file_browser_generation = ctx.file_browser_generation.wrapping_add(1);
-                        *ctx.mode = AppMode::Normal;
-                    }
                 }
             }
-            return reduced.consumed;
+            return settings_update;
         }
     }
 
-    false
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::AppState;
+    use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
     use crate::theme::{Theme, ThemeContext, ThemeName};
+    use ratatui::{backend::TestBackend, Terminal};
     use strum::IntoEnumIterator;
 
     fn config_items() -> Vec<ConfigItem> {
@@ -1299,6 +1984,67 @@ mod tests {
                     .join("")
             })
             .collect()
+    }
+
+    fn editor(item: ConfigItem, buffer: &str) -> ConfigEditState {
+        ConfigEditState {
+            item,
+            buffer: buffer.to_string(),
+            cursor: buffer.len(),
+            select_all: false,
+        }
+    }
+
+    fn rendered_config(
+        width: u16,
+        height: u16,
+        layout_mode: crate::config::UiLayoutMode,
+        active_pane: ConfigPane,
+        selected_index: usize,
+    ) -> String {
+        let settings = Settings {
+            ui_layout_mode: layout_mode,
+            ..Settings::default()
+        };
+        let app_state = AppState::default();
+        let dht_status = DhtStatus::default();
+        let dht_wave_telemetry = DhtWaveTelemetry::default();
+        let theme = test_theme_context();
+        let screen = ScreenContext::new(
+            &app_state,
+            &dht_status,
+            &dht_wave_telemetry,
+            &settings,
+            &theme,
+        );
+        let items = config_items();
+        let editing = None;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &screen,
+                    ConfigDrawState {
+                        settings: &settings,
+                        selected_index,
+                        items: &items,
+                        active_pane,
+                        editing: &editing,
+                    },
+                );
+            })
+            .expect("render config");
+
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width.max(1) as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -1332,6 +2078,22 @@ mod tests {
             config_category_for_item(ConfigItem::UiLayoutMode),
             ConfigCategory::Ui
         );
+
+        for item in [
+            ConfigItem::ClientPort,
+            ConfigItem::WatchFolder,
+            ConfigItem::AlwaysShowAddLocationPrompt,
+        ] {
+            assert_eq!(descriptor_for_item(item).scope, ConfigScope::Host);
+        }
+        for item in [
+            ConfigItem::DefaultDownloadFolder,
+            ConfigItem::UiLayoutMode,
+            ConfigItem::GlobalDownloadLimit,
+            ConfigItem::GlobalUploadLimit,
+        ] {
+            assert_eq!(descriptor_for_item(item).scope, ConfigScope::Shared);
+        }
     }
 
     #[test]
@@ -1365,64 +2127,174 @@ mod tests {
     }
 
     #[test]
-    fn pane_content_margin_adds_adaptive_padding() {
-        let narrow = pane_content_margin(ratatui::layout::Rect::new(0, 0, 24, 10));
-        assert_eq!(narrow.horizontal, 1);
-        assert_eq!(narrow.vertical, 1);
+    fn wide_render_shows_master_detail_and_primary_footer_action() {
+        let rendered = rendered_config(
+            120,
+            30,
+            crate::config::UiLayoutMode::Horizontal,
+            ConfigPane::Settings,
+            0,
+        );
 
-        let medium = pane_content_margin(ratatui::layout::Rect::new(0, 0, 38, 16));
-        assert_eq!(medium.horizontal, 2);
-        assert_eq!(medium.vertical, 1);
-
-        let roomy = pane_content_margin(ratatui::layout::Rect::new(0, 0, 80, 24));
-        assert_eq!(roomy.horizontal, 3);
-        assert_eq!(roomy.vertical, 2);
+        assert!(rendered.contains("▶ Listen Port"));
+        assert!(!rendered.contains("Settings ·"));
+        assert!(rendered.contains("Listen Port · Network"));
+        assert!(rendered.contains("[Space] edit"));
     }
 
     #[test]
-    fn settings_pane_content_area_reserves_border_but_no_extra_top_padding() {
-        let area = ratatui::layout::Rect::new(4, 5, 38, 16);
-        let content = settings_pane_content_area(area);
+    fn pane_padding_adds_vertical_space_only_when_height_allows_it() {
+        let roomy_area = Rect::new(0, 0, 40, 15);
+        let compact_area = Rect::new(0, 0, 40, 14);
+        let roomy_inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(config_pane_padding(2, roomy_area, true))
+            .inner(roomy_area);
+        let compact_inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(config_pane_padding(2, compact_area, true))
+            .inner(compact_area);
 
-        assert_eq!(content.x, area.x + 2);
-        assert_eq!(content.y, area.y + 1);
-        assert_eq!(content.height, area.height - 2);
+        assert_eq!(roomy_inner.y, roomy_area.y + 2);
+        assert_eq!(roomy_inner.height, roomy_area.height - 4);
+        assert_eq!(compact_inner.y, compact_area.y + 1);
+        assert_eq!(compact_inner.height, compact_area.height - 2);
+
+        let navigation_inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(config_pane_padding(1, roomy_area, false))
+            .inner(roomy_area);
+        assert_eq!(navigation_inner.y, roomy_area.y + 1);
+        assert_eq!(navigation_inner.height, roomy_area.height - 3);
     }
 
     #[test]
-    fn settings_pane_action_controls_move_focus_to_details() {
-        assert!(settings_focus_moves_to_details(
-            &ConfigAction::StartEditOrBrowse
-        ));
-        assert!(!settings_focus_moves_to_details(
-            &ConfigAction::IncreaseSelected
-        ));
-        assert!(!settings_focus_moves_to_details(&ConfigAction::MoveDown));
-        assert!(!settings_focus_moves_to_details(&ConfigAction::SaveAndExit));
+    fn forced_vertical_render_keeps_selected_row_and_details_visible() {
+        let rendered = rendered_config(
+            80,
+            40,
+            crate::config::UiLayoutMode::Vertical,
+            ConfigPane::Settings,
+            6,
+        );
+
+        assert!(rendered.contains("Global Upload Limit"));
+        assert!(rendered.contains("Global Upload Limit · Downloads"));
+        assert!(rendered.contains("▶ Global Upload Limit"));
+        assert!(!rendered.contains("Settings ·"));
     }
 
     #[test]
-    fn settings_pane_ignores_left_right_adjustment_actions() {
-        assert!(settings_pane_ignores_action(
-            &ConfigAction::IncreaseSelected
-        ));
-        assert!(settings_pane_ignores_action(
-            &ConfigAction::DecreaseSelected
-        ));
-        assert!(!settings_pane_ignores_action(
-            &ConfigAction::StartEditOrBrowse
-        ));
-        assert!(!settings_pane_ignores_action(&ConfigAction::MoveDown));
+    fn compact_render_uses_one_full_height_pane_at_a_time() {
+        let settings_rendered = rendered_config(
+            50,
+            14,
+            crate::config::UiLayoutMode::Vertical,
+            ConfigPane::Settings,
+            0,
+        );
+        let details_rendered = rendered_config(
+            50,
+            14,
+            crate::config::UiLayoutMode::Vertical,
+            ConfigPane::Details,
+            0,
+        );
+
+        assert!(settings_rendered.contains("▶ Listen Port"));
+        assert!(!settings_rendered.contains("Settings ·"));
+        assert!(!settings_rendered.contains("Listen Port · Network"));
+        assert!(!settings_rendered.contains(&Settings::default().client_port.to_string()));
+        assert!(!settings_rendered.contains("Unlimited"));
+        assert!(details_rendered.contains("Listen Port · Network"));
+        assert!(!details_rendered.contains("Settings ·"));
+        assert!(details_rendered.contains("[Esc] settings"));
     }
 
     #[test]
-    fn controls_pane_ignores_menu_navigation_actions() {
-        assert!(controls_pane_ignores_action(&ConfigAction::MoveUp));
-        assert!(controls_pane_ignores_action(&ConfigAction::MoveDown));
-        assert!(!controls_pane_ignores_action(
-            &ConfigAction::IncreaseSelected
-        ));
-        assert!(!controls_pane_ignores_action(&ConfigAction::SaveAndExit));
+    fn tiny_render_is_safe() {
+        let rendered = rendered_config(
+            10,
+            4,
+            crate::config::UiLayoutMode::Vertical,
+            ConfigPane::Settings,
+            0,
+        );
+
+        assert!(!rendered.is_empty());
+    }
+
+    #[test]
+    fn config_list_viewport_keeps_selected_category_and_setting_visible() {
+        let rows = config_list_rows(&config_items());
+        let (start, end) = config_list_viewport(&rows, 6, 4);
+        let visible = &rows[start..end];
+
+        assert_eq!(
+            visible[0],
+            ConfigListRow::Category(ConfigCategory::Downloads)
+        );
+        assert!(visible.contains(&ConfigListRow::Setting {
+            global_index: 6,
+            item: ConfigItem::GlobalUploadLimit,
+        }));
+    }
+
+    #[test]
+    fn immediate_apply_merges_only_the_completed_setting() {
+        let current = Settings {
+            ui_layout_mode: crate::config::UiLayoutMode::Vertical,
+            global_download_limit_bps: 25_000_000,
+            max_connected_peers: 4_321,
+            ..Settings::default()
+        };
+        let mut draft = current.clone();
+        draft.client_port = draft.client_port.saturating_add(1);
+        draft.watch_folder = Some(std::path::PathBuf::from("/tmp/superseedr-watch"));
+        draft.always_show_add_location_prompt = !draft.always_show_add_location_prompt;
+        draft.ui_layout_mode = crate::config::UiLayoutMode::Horizontal;
+        draft.global_download_limit_bps = 50_000_000;
+
+        draft.max_connected_peers = 2_000;
+
+        let update = merge_config_item_into_current(&draft, &current, ConfigItem::ClientPort, true);
+
+        assert_eq!(update.client_port, draft.client_port);
+        assert_eq!(update.watch_folder, current.watch_folder);
+        assert_eq!(
+            update.always_show_add_location_prompt,
+            current.always_show_add_location_prompt
+        );
+        assert_eq!(update.ui_layout_mode, current.ui_layout_mode);
+        assert_eq!(
+            update.global_download_limit_bps,
+            current.global_download_limit_bps
+        );
+        assert_eq!(update.max_connected_peers, current.max_connected_peers);
+
+        let follower_shared_update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::UiLayoutMode, true);
+        assert_eq!(
+            follower_shared_update.ui_layout_mode,
+            current.ui_layout_mode
+        );
+
+        let leader_update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::UiLayoutMode, false);
+        assert_eq!(leader_update.ui_layout_mode, draft.ui_layout_mode);
+        assert_eq!(
+            leader_update.global_download_limit_bps,
+            current.global_download_limit_bps
+        );
+        assert_eq!(
+            leader_update.max_connected_peers,
+            current.max_connected_peers
+        );
+
+        let path_update =
+            merge_config_item_into_current(&draft, &current, ConfigItem::WatchFolder, false);
+        assert_eq!(path_update.watch_folder, draft.watch_folder);
+        assert_eq!(path_update.ui_layout_mode, current.ui_layout_mode);
     }
 
     #[test]
@@ -1446,11 +2318,11 @@ mod tests {
     }
 
     #[test]
-    fn reducer_edit_commit_updates_download_limit_and_emits_effect() {
+    fn reducer_edit_commit_requests_immediate_download_limit_apply() {
         let mut settings = Box::new(Settings::default());
         let mut idx = 5usize;
         let mut items = config_items();
-        let mut editing = Some((ConfigItem::GlobalDownloadLimit, "123".to_string()));
+        let mut editing = Some(editor(ConfigItem::GlobalDownloadLimit, "123"));
 
         let out = reduce_config_action(
             ConfigAction::EditCommit,
@@ -1462,8 +2334,10 @@ mod tests {
 
         assert_eq!(settings.global_download_limit_bps, 123);
         assert_eq!(editing, None);
-        assert_eq!(out.effects.len(), 1);
-        assert!(matches!(out.effects[0], ConfigEffect::SetDownloadRate(123)));
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
     }
 
     #[test]
@@ -1483,7 +2357,7 @@ mod tests {
         assert_eq!(settings.global_download_limit_bps, RATE_LIMIT_STEP_BPS);
         assert!(matches!(
             out.effects.as_slice(),
-            [ConfigEffect::SetDownloadRate(RATE_LIMIT_STEP_BPS)]
+            [ConfigEffect::ApplySettings]
         ));
 
         let out = reduce_config_action(
@@ -1496,7 +2370,7 @@ mod tests {
         assert_eq!(settings.global_download_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
         assert!(matches!(
             out.effects.as_slice(),
-            [ConfigEffect::SetDownloadRate(UNLIMITED_RATE_LIMIT_BPS)]
+            [ConfigEffect::ApplySettings]
         ));
 
         let out = reduce_config_action(
@@ -1506,11 +2380,10 @@ mod tests {
             items.as_mut_slice(),
             &mut editing,
         );
-        assert_eq!(settings.global_download_limit_bps, 0);
-        assert!(matches!(
-            out.effects.as_slice(),
-            [ConfigEffect::SetDownloadRate(0)]
-        ));
+        assert_eq!(settings.global_download_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
+        assert!(out.effects.is_empty());
+        assert_eq!(increase_rate_limit_bps(0), RATE_LIMIT_STEP_BPS);
+        assert_eq!(decrease_rate_limit_bps(0), 0);
     }
 
     #[test]
@@ -1532,7 +2405,7 @@ mod tests {
         assert_eq!(settings.global_upload_limit_bps, UNLIMITED_RATE_LIMIT_BPS);
         assert!(matches!(
             out.effects.as_slice(),
-            [ConfigEffect::SetUploadRate(UNLIMITED_RATE_LIMIT_BPS)]
+            [ConfigEffect::ApplySettings]
         ));
     }
 
@@ -1544,7 +2417,7 @@ mod tests {
         let mut editing = None;
 
         let out = reduce_config_action(
-            ConfigAction::ToggleSelectedBool,
+            ConfigAction::ShiftSelected,
             &mut settings,
             &mut idx,
             items.as_mut_slice(),
@@ -1552,6 +2425,10 @@ mod tests {
         );
         assert!(out.consumed);
         assert!(settings.always_show_add_location_prompt);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
 
         let out = reduce_config_action(
             ConfigAction::SetSelectedBool(false),
@@ -1562,6 +2439,10 @@ mod tests {
         );
         assert!(out.consumed);
         assert!(!settings.always_show_add_location_prompt);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
 
         let out = reduce_config_action(
             ConfigAction::SetSelectedBool(true),
@@ -1572,134 +2453,494 @@ mod tests {
         );
         assert!(out.consumed);
         assert!(settings.always_show_add_location_prompt);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::ApplySettings]
+        ));
     }
 
     #[test]
-    fn tab_toggles_active_config_pane() {
+    fn enter_does_not_trigger_space_driven_controls() {
+        let mut settings = Box::new(Settings::default());
+        let original = settings.clone();
+        let mut items = config_items();
+        let mut editing = None;
+
+        for index in 0usize..=6usize {
+            let mut selected_index = index;
+            let out = reduce_config_action(
+                ConfigAction::StartEditOrBrowse,
+                &mut settings,
+                &mut selected_index,
+                items.as_mut_slice(),
+                &mut editing,
+            );
+            assert!(out.effects.is_empty());
+        }
+
+        assert_eq!(settings.ui_layout_mode, original.ui_layout_mode);
+        assert_eq!(
+            settings.always_show_add_location_prompt,
+            original.always_show_add_location_prompt
+        );
+        assert!(editing.is_none());
+    }
+
+    #[test]
+    fn space_opens_global_rate_limit_exact_editor() {
+        let mut settings = Box::new(Settings::default());
+        let mut selected_index = 5usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert!(out.consumed);
+        assert!(out.effects.is_empty());
+        assert_eq!(
+            editing,
+            Some(ConfigEditState {
+                item: ConfigItem::GlobalDownloadLimit,
+                buffer: "Unlimited".to_string(),
+                cursor: "Unlimited".len(),
+                select_all: true,
+            })
+        );
+    }
+
+    #[test]
+    fn space_opens_listen_port_exact_editor() {
+        let mut settings = Box::new(Settings::default());
+        let mut selected_index = 0usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert!(out.consumed);
+        assert!(out.effects.is_empty());
+        assert_eq!(
+            editing,
+            Some(ConfigEditState {
+                item: ConfigItem::ClientPort,
+                buffer: settings.client_port.to_string(),
+                cursor: settings.client_port.to_string().len(),
+                select_all: true,
+            })
+        );
+    }
+
+    #[test]
+    fn space_opens_path_browser() {
+        let mut settings = Box::new(Settings::default());
+        let mut selected_index = 2usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut selected_index,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert!(out.consumed);
+        assert!(matches!(
+            out.effects.as_slice(),
+            [ConfigEffect::AppCommand(_)]
+        ));
+        assert!(editing.is_none());
+    }
+
+    #[test]
+    fn completed_toggle_returns_an_immediate_settings_update() {
+        let applied = Settings::default();
+        let mut settings_edit = Box::new(applied.clone());
+        let mut mode = AppMode::Config;
+        let mut selected_index = 4usize;
+        let mut items = config_items();
         let mut active_pane = ConfigPane::Settings;
+        let mut editing = None;
+        let mut file_browser_generation = 0;
+        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
-        toggle_config_pane(&mut active_pane);
-        assert_eq!(active_pane, ConfigPane::Details);
+        let update = handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
+                ' ',
+            ))),
+            ConfigHandleContext {
+                mode: &mut mode,
+                settings_edit: &mut settings_edit,
+                applied_settings: &applied,
+                selected_index: &mut selected_index,
+                items: items.as_mut_slice(),
+                active_pane: &mut active_pane,
+                editing: &mut editing,
+                shared_follower: false,
+                compact: false,
+                app_command_tx: &app_command_tx,
+                shutdown_tx: &shutdown_tx,
+                file_browser_generation: &mut file_browser_generation,
+            },
+        )
+        .expect("completed toggle should apply immediately");
 
-        toggle_config_pane(&mut active_pane);
+        assert!(update.always_show_add_location_prompt);
+        assert_eq!(update.client_port, applied.client_port);
         assert_eq!(active_pane, ConfigPane::Settings);
     }
 
     #[test]
-    fn e_key_starts_config_edit_or_open_action() {
+    fn space_advances_layout_mode_and_applies_immediately() {
+        let applied = Settings::default();
+        let mut settings_edit = Box::new(applied.clone());
+        let mut mode = AppMode::Config;
+        let mut selected_index = 3usize;
+        let mut items = config_items();
+        let mut active_pane = ConfigPane::Settings;
+        let mut editing = None;
+        let mut file_browser_generation = 0;
+        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        let update = handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
+                ' ',
+            ))),
+            ConfigHandleContext {
+                mode: &mut mode,
+                settings_edit: &mut settings_edit,
+                applied_settings: &applied,
+                selected_index: &mut selected_index,
+                items: items.as_mut_slice(),
+                active_pane: &mut active_pane,
+                editing: &mut editing,
+                shared_follower: false,
+                compact: false,
+                app_command_tx: &app_command_tx,
+                shutdown_tx: &shutdown_tx,
+                file_browser_generation: &mut file_browser_generation,
+            },
+        )
+        .expect("completed layout shift should apply immediately");
+
+        assert_eq!(
+            update.ui_layout_mode,
+            crate::config::UiLayoutMode::Horizontal
+        );
+        assert_eq!(update.client_port, applied.client_port);
+        assert_eq!(active_pane, ConfigPane::Settings);
+    }
+
+    #[test]
+    fn compact_enter_opens_details_before_activating_the_control() {
+        let applied = Settings::default();
+        let mut settings_edit = Box::new(applied.clone());
+        let mut mode = AppMode::Config;
+        let mut selected_index = 0usize;
+        let mut items = config_items();
+        let mut active_pane = ConfigPane::Settings;
+        let mut editing = None;
+        let mut file_browser_generation = 0;
+        let (app_command_tx, _app_command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
+        let update = handle_event(
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Enter)),
+            ConfigHandleContext {
+                mode: &mut mode,
+                settings_edit: &mut settings_edit,
+                applied_settings: &applied,
+                selected_index: &mut selected_index,
+                items: items.as_mut_slice(),
+                active_pane: &mut active_pane,
+                editing: &mut editing,
+                shared_follower: false,
+                compact: true,
+                app_command_tx: &app_command_tx,
+                shutdown_tx: &shutdown_tx,
+                file_browser_generation: &mut file_browser_generation,
+            },
+        );
+
+        assert!(update.is_none());
+        assert_eq!(active_pane, ConfigPane::Details);
+        assert!(editing.is_none());
+    }
+
+    #[test]
+    fn enter_and_e_share_the_same_primary_action() {
         assert_eq!(
             map_key_to_config_action(KeyCode::Char('e'), &None),
             Some(ConfigAction::StartEditOrBrowse)
         );
-        assert_eq!(map_key_to_config_action(KeyCode::Enter, &None), None);
         assert_eq!(
-            map_key_to_config_action(
-                KeyCode::Char('e'),
-                &Some((ConfigItem::ClientPort, String::new()))
-            ),
-            None
+            map_key_to_config_action(KeyCode::Enter, &None),
+            Some(ConfigAction::StartEditOrBrowse)
         );
+        let editing = Some(editor(ConfigItem::ClientPort, "6681"));
+        assert_eq!(map_key_to_config_action(KeyCode::Char('e'), &editing), None);
         assert_eq!(
-            map_key_to_config_action(
-                KeyCode::Enter,
-                &Some((ConfigItem::ClientPort, String::new()))
-            ),
+            map_key_to_config_action(KeyCode::Enter, &editing),
             Some(ConfigAction::EditCommit)
         );
     }
 
     #[test]
-    fn port_details_lines_show_pending_port_and_live_reachability() {
-        let ctx = test_theme_context();
-        let model = PortDetailsModel {
-            draft_port: 7001,
-            active_port: 6681,
-            default_port: 6681,
-            editing_buffer: None,
-            ipv4_open: true,
-            ipv6_open: false,
-            compact: false,
+    fn config_exit_is_immediate_and_has_no_apply_shortcut() {
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Esc, &None),
+            Some(ConfigAction::Exit)
+        );
+        assert_eq!(
+            map_key_to_config_action(KeyCode::Char('q'), &None),
+            Some(ConfigAction::Exit)
+        );
+        assert_eq!(map_key_to_config_action(KeyCode::Char('s'), &None), None);
+        assert_eq!(map_key_to_config_action(KeyCode::Tab, &None), None);
+        assert_eq!(map_key_to_config_action(KeyCode::BackTab, &None), None);
+    }
+
+    #[test]
+    fn exiting_config_invalidates_pending_file_browser_fetches() {
+        let mut mode = AppMode::Config;
+        let mut generation = 41;
+
+        exit_config(&mut mode, &mut generation);
+
+        assert!(matches!(mode, AppMode::Normal));
+        assert_eq!(generation, 42);
+    }
+
+    #[test]
+    fn control_shortcuts_only_apply_to_compatible_settings() {
+        assert!(!action_supported_for_item(
+            &ConfigAction::StartEditOrBrowse,
+            ConfigItem::AlwaysShowAddLocationPrompt,
+        ));
+        assert!(!action_supported_for_item(
+            &ConfigAction::StartEditOrBrowse,
+            ConfigItem::UiLayoutMode,
+        ));
+        assert!(!action_supported_for_item(
+            &ConfigAction::StartEditOrBrowse,
+            ConfigItem::ClientPort,
+        ));
+        assert!(!action_supported_for_item(
+            &ConfigAction::StartEditOrBrowse,
+            ConfigItem::GlobalDownloadLimit,
+        ));
+        assert!(!action_supported_for_item(
+            &ConfigAction::StartEditOrBrowse,
+            ConfigItem::WatchFolder,
+        ));
+        assert!(action_supported_for_item(
+            &ConfigAction::ShiftSelected,
+            ConfigItem::AlwaysShowAddLocationPrompt,
+        ));
+        assert!(action_supported_for_item(
+            &ConfigAction::ShiftSelected,
+            ConfigItem::ClientPort,
+        ));
+        assert!(action_supported_for_item(
+            &ConfigAction::ShiftSelected,
+            ConfigItem::UiLayoutMode,
+        ));
+        assert!(action_supported_for_item(
+            &ConfigAction::ShiftSelected,
+            ConfigItem::GlobalDownloadLimit,
+        ));
+        assert!(action_supported_for_item(
+            &ConfigAction::ShiftSelected,
+            ConfigItem::WatchFolder,
+        ));
+        assert!(action_supported_for_item(
+            &ConfigAction::IncreaseSelected,
+            ConfigItem::UiLayoutMode,
+        ));
+        assert!(action_supported_for_item(
+            &ConfigAction::IncreaseSelected,
+            ConfigItem::GlobalDownloadLimit,
+        ));
+        assert!(!action_supported_for_item(
+            &ConfigAction::IncreaseSelected,
+            ConfigItem::WatchFolder,
+        ));
+    }
+
+    #[test]
+    fn layout_choice_navigation_follows_the_visual_order() {
+        use crate::config::UiLayoutMode;
+
+        assert_eq!(UiLayoutMode::Auto.next(), UiLayoutMode::Horizontal);
+        assert_eq!(UiLayoutMode::Horizontal.next(), UiLayoutMode::Vertical);
+        assert_eq!(UiLayoutMode::Vertical.next(), UiLayoutMode::Square);
+        assert_eq!(UiLayoutMode::Square.next(), UiLayoutMode::Auto);
+
+        assert_eq!(UiLayoutMode::Auto.previous(), UiLayoutMode::Square);
+        assert_eq!(UiLayoutMode::Square.previous(), UiLayoutMode::Vertical);
+        assert_eq!(UiLayoutMode::Vertical.previous(), UiLayoutMode::Horizontal);
+        assert_eq!(UiLayoutMode::Horizontal.previous(), UiLayoutMode::Auto);
+    }
+
+    #[test]
+    fn rate_parser_accepts_human_units_and_unlimited() {
+        assert_eq!(parse_rate_limit_input("25 Mbps"), Some(25_000_000));
+        assert_eq!(parse_rate_limit_input("1.5 Gbps"), Some(1_500_000_000));
+        assert_eq!(parse_rate_limit_input("500 Kbps"), Some(500_000));
+        assert_eq!(
+            parse_rate_limit_input("unlimited"),
+            Some(UNLIMITED_RATE_LIMIT_BPS)
+        );
+        assert_eq!(parse_rate_limit_input("0"), Some(UNLIMITED_RATE_LIMIT_BPS));
+        assert_eq!(
+            parse_rate_limit_input("18446744073709551615"),
+            Some(UNLIMITED_RATE_LIMIT_BPS)
+        );
+        assert_eq!(parse_rate_limit_input("12 MB/s"), None);
+    }
+
+    #[test]
+    fn exact_editor_prefills_and_selects_the_current_value() {
+        let mut settings = Box::new(Settings::default());
+        settings.client_port = 7123;
+        let mut idx = 0usize;
+        let mut items = config_items();
+        let mut editing = None;
+
+        let out = reduce_config_action(
+            ConfigAction::ShiftSelected,
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        assert!(out.effects.is_empty());
+        assert_eq!(
+            editing,
+            Some(ConfigEditState {
+                item: ConfigItem::ClientPort,
+                buffer: "7123".to_string(),
+                cursor: 4,
+                select_all: true,
+            })
+        );
+    }
+
+    #[test]
+    fn first_typed_character_replaces_selected_editor_value() {
+        let mut settings = Box::new(Settings::default());
+        let mut idx = 0usize;
+        let mut items = config_items();
+        let mut editing = Some(ConfigEditState {
+            item: ConfigItem::ClientPort,
+            buffer: "6681".to_string(),
+            cursor: 4,
+            select_all: true,
+        });
+
+        reduce_config_action(
+            ConfigAction::EditInsert('7'),
+            &mut settings,
+            &mut idx,
+            items.as_mut_slice(),
+            &mut editing,
+        );
+
+        let editing = editing.expect("editor remains open");
+        assert_eq!(editing.buffer, "7");
+        assert_eq!(editing.cursor, 1);
+        assert!(!editing.select_all);
+    }
+
+    #[test]
+    fn pasted_editor_text_replaces_selection_and_filters_control_characters() {
+        let mut port_editor = ConfigEditState {
+            item: ConfigItem::ClientPort,
+            buffer: "6681".to_string(),
+            cursor: 4,
+            select_all: true,
         };
+        let port_item = port_editor.item;
+        for character in " 71x23\n"
+            .chars()
+            .filter(|character| edit_character_allowed(port_item, *character))
+        {
+            insert_editor_character(&mut port_editor, character);
+        }
+        assert_eq!(port_editor.buffer, "7123");
 
-        let lines = build_port_details_lines(&model, &ctx);
-        let rendered = plain_lines(&lines).join("\n");
-
-        assert!(rendered.contains("Listening Port: 7001"));
-        assert!(rendered.contains("pending save"));
-        assert!(rendered.contains("IPv4  open"));
-        assert!(rendered.contains("IPv6  waiting"));
-        assert!(rendered.contains("Inbound peer handshakes and DHT"));
-        assert!(rendered.contains("announces use this listener port."));
-        assert!(rendered.contains("Active bind: 6681"));
-        assert!(rendered.contains("Default: 6681"));
-    }
-
-    #[test]
-    fn port_details_edit_lines_render_visible_caret_after_buffer() {
-        let ctx = test_theme_context();
-        let model = PortDetailsModel {
-            draft_port: 6681,
-            active_port: 6681,
-            default_port: 6681,
-            editing_buffer: Some("7123"),
-            ipv4_open: false,
-            ipv6_open: false,
-            compact: false,
+        let mut rate_editor = ConfigEditState {
+            item: ConfigItem::GlobalDownloadLimit,
+            buffer: "Unlimited".to_string(),
+            cursor: 9,
+            select_all: true,
         };
-
-        let lines = build_port_details_lines(&model, &ctx);
-        let rendered = plain_lines(&lines).join("\n");
-
-        assert!(rendered.contains("Editing Listen Port"));
-        assert!(rendered.contains("Current: 6681"));
-        assert!(rendered.contains("New port"));
-        assert!(rendered.contains("[ 7123_ ]"));
-        assert!(rendered.contains("Valid range: 1-65535"));
-        assert!(rendered.contains("Ready to stage port 7123."));
+        let rate_item = rate_editor.item;
+        for character in "25 Mbps\n"
+            .chars()
+            .filter(|character| edit_character_allowed(rate_item, *character))
+        {
+            insert_editor_character(&mut rate_editor, character);
+        }
+        assert_eq!(rate_editor.buffer, "25 Mbps");
     }
 
     #[test]
-    fn port_details_command_line_uses_bespoke_edit_key() {
+    fn exact_editor_supports_cursor_navigation_and_deletion() {
+        let mut settings = Box::new(Settings::default());
+        let mut idx = 0usize;
+        let mut items = config_items();
+        let mut editing = Some(editor(ConfigItem::ClientPort, "7123"));
+
+        for action in [
+            ConfigAction::EditMoveLeft,
+            ConfigAction::EditMoveLeft,
+            ConfigAction::EditDelete,
+            ConfigAction::EditBackspace,
+        ] {
+            reduce_config_action(
+                action,
+                &mut settings,
+                &mut idx,
+                items.as_mut_slice(),
+                &mut editing,
+            );
+        }
+
+        let editing = editing.expect("editor remains open");
+        assert_eq!(editing.buffer, "73");
+        assert_eq!(editing.cursor, 1);
+    }
+
+    #[test]
+    fn exact_editor_draws_selection_and_field_chrome() {
         let ctx = test_theme_context();
-        let rendered = plain_lines(&[port_details_command_line(false, false, &ctx)]).join("\n");
-        let editing = plain_lines(&[port_details_command_line(true, false, &ctx)]).join("\n");
+        let mut editing = editor(ConfigItem::ClientPort, "7123");
+        editing.select_all = true;
+        let lines = plain_lines(&edit_field_lines(&editing, 40, &ctx));
+        let rendered = lines.join("\n");
 
-        assert!(rendered.contains("[e] change port"));
-        assert!(rendered.contains("[r] reset"));
-        assert!(rendered.contains("[Tab] settings"));
-        assert!(editing.contains("[Enter] confirm"));
-        assert!(editing.contains("[Esc] cancel"));
-    }
-
-    #[test]
-    fn port_details_content_area_is_vertically_centered() {
-        let area = ratatui::layout::Rect::new(4, 6, 50, 12);
-        let centered = centered_port_content_area(area, 6);
-
-        assert_eq!(centered.x, area.x);
-        assert_eq!(centered.width, area.width);
-        assert_eq!(centered.height, 6);
-        assert_eq!(centered.y, 9);
-    }
-
-    #[test]
-    fn port_details_command_row_reserves_matching_top_offset() {
-        let area = ratatui::layout::Rect::new(4, 6, 50, 12);
-        let (body, command) = port_details_body_and_command_areas(area, true);
-
-        assert_eq!(body.y, area.y + 1);
-        assert_eq!(body.height, area.height - 2);
-        assert_eq!(command.expect("command area").y, area.y + area.height - 1);
-    }
-
-    #[test]
-    fn port_details_command_row_degrades_without_top_offset_when_tiny() {
-        let area = ratatui::layout::Rect::new(4, 6, 50, 2);
-        let (body, command) = port_details_body_and_command_areas(area, true);
-
-        assert_eq!(body.y, area.y);
-        assert_eq!(body.height, 1);
-        assert_eq!(command.expect("command area").y, area.y + 1);
+        assert!(rendered.contains("╭"));
+        assert!(rendered.contains("7123"));
+        assert!(rendered.contains("type to replace"));
+        assert!(rendered.contains("╰"));
+        assert!(lines.iter().all(|line| line.chars().count() == 40));
     }
 
     #[test]
@@ -1711,7 +2952,7 @@ mod tests {
         );
         assert_eq!(
             port_edit_status_message("7123"),
-            "Ready to stage port 7123."
+            "Ready to apply port 7123."
         );
     }
 
@@ -1721,7 +2962,7 @@ mod tests {
         let original_port = settings.client_port;
         let mut idx = 0usize;
         let mut items = config_items();
-        let mut editing = Some((ConfigItem::ClientPort, "0".to_string()));
+        let mut editing = Some(editor(ConfigItem::ClientPort, "0"));
 
         let out = reduce_config_action(
             ConfigAction::EditCommit,
@@ -1733,26 +2974,6 @@ mod tests {
 
         assert!(out.consumed);
         assert_eq!(settings.client_port, original_port);
-        assert_eq!(editing, Some((ConfigItem::ClientPort, "0".to_string())));
-    }
-
-    #[test]
-    fn reducer_save_and_exit_emits_update_config_command() {
-        let mut settings = Box::new(Settings::default());
-        let mut idx = 0usize;
-        let mut items = config_items();
-        let mut editing = None;
-
-        let out = reduce_config_action(
-            ConfigAction::SaveAndExit,
-            &mut settings,
-            &mut idx,
-            items.as_mut_slice(),
-            &mut editing,
-        );
-
-        assert_eq!(out.effects.len(), 2);
-        assert!(matches!(out.effects[0], ConfigEffect::AppCommand(_)));
-        assert!(matches!(out.effects[1], ConfigEffect::ToNormal));
+        assert_eq!(editing, Some(editor(ConfigItem::ClientPort, "0")));
     }
 }

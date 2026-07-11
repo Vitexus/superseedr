@@ -61,8 +61,11 @@
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
-  - `Esc`/`Q` applies edited settings and returns to `Normal`.
-  - `Enter` edits field or opens `FileBrowser` for path selection.
+  - `Space` shifts boolean and choice settings immediately, opens value editing for the listen port and global rate limits, or opens a path browser; `Left`/`Right` (or `h`/`l`) moves backward/forward through choices and stepped values; `r` resets the focused setting immediately.
+  - While editing a value, `Enter` applies it and `Esc` cancels the current edit.
+  - Confirming a path in `FileBrowser` applies it and returns to Config.
+  - `Esc`/`q` closes Config immediately.
+  - In compact mode, `Enter` opens the selected setting's details; controls activate from there, and `Esc` returns to the settings list before closing Config.
 - `FileBrowser`:
   - `Y` confirms current action.
   - `Esc` returns to `Normal` or `Config` depending on browser mode.
@@ -81,13 +84,16 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `Normal` | `z` | `PowerSaving` | Zen mode |
 | `PowerSaving` | `z` | `Normal` | Return from zen |
 | `Normal` | `c` | `Config` | Open settings |
-| `Config` | `Esc` or `Q` | `Normal` | Save + exit |
+| `Config` | `Tab` | `Config` | Switch between settings and details panes |
+| `Config` | completed control change | `Config` | Apply toggles, choices, steps, resets, and exact edits immediately |
+| `Config` | `Esc` or `q` | `Normal` or `Config` | Close immediately; compact details first returns to the settings list |
 | `Normal` | `M` | `TorrentManagement` | Batch torrent management |
 | `TorrentManagement` | `Esc` or `q` | `Normal` | Close management |
 | `Normal` | `d`/`D` | `DeleteConfirm` | Selected torrent only |
 | `DeleteConfirm` | `Y` or `Esc` | `Normal` | Confirm/cancel dialog |
 | `Normal` | `a` | `FileBrowser` | Add torrent path flow |
-| `Config` | `Enter` on path item | `FileBrowser` | Path picker flow |
+| `Config` | `Enter` or `e` on path item | `FileBrowser` | Path picker flow |
+| `FileBrowser` config path picker | `Y` | `Config` | Apply the confirmed path immediately |
 | `FileBrowser` | `Esc` | `Normal` or `Config` | Depends on browser sub-mode |
 
 ### Forbidden/No-op examples
