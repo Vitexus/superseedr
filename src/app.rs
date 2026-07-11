@@ -31,6 +31,7 @@ use crate::control_service::{
     ControlExecutionPlan,
 };
 use crate::dht_service::{DhtService, DhtServiceConfig, DhtStatus, DhtWaveTelemetry};
+use crate::peer_manager::{PeerManagerService, PeerPolicy};
 use crate::persistence::activity_history::{
     load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
     ActivityHistoryRollupState,
@@ -109,7 +110,10 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use ratatui::prelude::Rect;
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{
+    backend::{Backend, CrosstermBackend},
+    Terminal,
+};
 
 use sysinfo::System;
 
@@ -2490,6 +2494,9 @@ pub struct App {
     incoming_peer_handshake_rx: mpsc::Receiver<IncomingPeerHandshake>,
     pub dht_service: DhtService,
     pub dht_status_rx: watch::Receiver<DhtStatus>,
+    pub peer_manager: PeerManagerService,
+    pub peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
+    peer_policy_open: bool,
     pub resource_manager: ResourceManagerClient,
     wake_lag_peer_throttle: WakeLagPeerThrottle,
     last_applied_resource_limits: Option<CalculatedLimits>,
@@ -2919,6 +2926,8 @@ impl App {
         let (rss_settings_tx, rss_settings_rx) = watch::channel(client_configs.clone());
         let (tui_event_tx, tui_event_rx) = mpsc::channel::<CrosstermEvent>(100);
         let (shutdown_tx, _) = broadcast::channel(1);
+        let peer_manager = PeerManagerService::new(shutdown_tx.subscribe());
+        let peer_policy_rx = peer_manager.handle().subscribe_policy();
         let shared_mode_enabled = runtime_mode.is_shared();
         let current_cluster_role = initial_cluster_role_for_runtime_mode(runtime_mode);
         let (persistence_tx, persistence_task) = if shared_mode_enabled
@@ -3065,6 +3074,9 @@ impl App {
             incoming_peer_handshake_rx,
             dht_service,
             dht_status_rx,
+            peer_manager,
+            peer_policy_rx,
+            peer_policy_open: true,
             resource_manager: resource_manager_client,
             wake_lag_peer_throttle: WakeLagPeerThrottle::default(),
             last_applied_resource_limits: Some(limits.clone()),
@@ -4540,6 +4552,17 @@ impl App {
                         self.handle_dht_status_changed();
                     }
                 }
+                policy_changed = self.peer_policy_rx.changed(), if self.peer_policy_open => {
+                    if policy_changed.is_ok() {
+                        let policy = self.peer_policy_rx.borrow_and_update();
+                        tracing::debug!(
+                            blocked_ips = policy.restrictions.len(),
+                            "App received peer policy"
+                        );
+                    } else {
+                        self.peer_policy_open = false;
+                    }
+                }
 
                 Some(command) = self.app_command_rx.recv() => {
                     self.handle_app_command(command).await;
@@ -5035,7 +5058,74 @@ impl App {
         flush_persistence_writer_parts(&mut self.persistence_tx, &mut self.persistence_task).await;
     }
 
-    async fn shutdown_sequence(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+    async fn shutdown_sequence<B: Backend>(&mut self, terminal: &mut Terminal<B>) {
+        let total_managers_to_shut_down = self.torrent_manager_command_txs.len();
+        let mut managers_shut_down = 0;
+
+        for manager_tx in self.torrent_manager_command_txs.values() {
+            let _ = manager_tx.try_send(ManagerCommand::Shutdown);
+        }
+
+        if total_managers_to_shut_down > 0 {
+            let shutdown_timeout = time::sleep(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS));
+            let mut draw_interval = time::interval(Duration::from_millis(100));
+            tokio::pin!(shutdown_timeout);
+
+            tracing_event!(
+                Level::INFO,
+                "Waiting for {} torrents to shut down...",
+                total_managers_to_shut_down
+            );
+
+            loop {
+                self.app_state.shutdown_progress =
+                    managers_shut_down as f64 / total_managers_to_shut_down as f64;
+                self.tick_ui_effects_clock();
+                let dht_status = self.dht_service.current_status();
+                let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
+                let _ = terminal.draw(|f| {
+                    draw(
+                        f,
+                        &self.app_state,
+                        &dht_status,
+                        &dht_wave_telemetry,
+                        &self.client_configs,
+                    );
+                });
+
+                tokio::select! {
+                    Some(event) = self.manager_event_rx.recv() => {
+                        match event {
+                            ManagerEvent::DeletionComplete(..) => {
+                                managers_shut_down += 1;
+                                if managers_shut_down == total_managers_to_shut_down {
+                                    tracing_event!(Level::INFO, "All torrents shut down gracefully.");
+                                    break;
+                                }
+                            }
+                            _ => {
+                                // CRITICAL: We must aggressively drain other events (Stats, BlockReceived, etc.)
+                                // so the managers don't get blocked on a full channel while trying to die.
+                            }
+                        }
+                    }
+
+                    _ = draw_interval.tick() => {
+                    }
+
+                    _ = &mut shutdown_timeout => {
+                        tracing_event!(Level::WARN, "Shutdown timed out. {}/{} managers did not reply. Forcing exit.",
+                            total_managers_to_shut_down - managers_shut_down,
+                            total_managers_to_shut_down
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Keep the peer manager alive until torrent managers have quiesced so it can consume
+        // their final metrics and continue enforcing policy during manager shutdown.
         let _ = self.shutdown_tx.send(());
 
         if let Some(handle) = self.tui_task.take() {
@@ -5045,72 +5135,7 @@ impl App {
             }
         }
 
-        let total_managers_to_shut_down = self.torrent_manager_command_txs.len();
-        let mut managers_shut_down = 0;
-
-        for manager_tx in self.torrent_manager_command_txs.values() {
-            let _ = manager_tx.try_send(ManagerCommand::Shutdown);
-        }
-
-        if total_managers_to_shut_down == 0 {
-            return;
-        }
-
-        let shutdown_timeout = time::sleep(Duration::from_secs(SHUTDOWN_TIMEOUT_SECS));
-        let mut draw_interval = time::interval(Duration::from_millis(100));
-        tokio::pin!(shutdown_timeout);
-
-        tracing_event!(
-            Level::INFO,
-            "Waiting for {} torrents to shut down...",
-            total_managers_to_shut_down
-        );
-
-        loop {
-            self.app_state.shutdown_progress =
-                managers_shut_down as f64 / total_managers_to_shut_down as f64;
-            self.tick_ui_effects_clock();
-            let dht_status = self.dht_service.current_status();
-            let dht_wave_telemetry = self.dht_service.current_wave_telemetry();
-            let _ = terminal.draw(|f| {
-                draw(
-                    f,
-                    &self.app_state,
-                    &dht_status,
-                    &dht_wave_telemetry,
-                    &self.client_configs,
-                );
-            });
-
-            tokio::select! {
-                Some(event) = self.manager_event_rx.recv() => {
-                    match event {
-                        ManagerEvent::DeletionComplete(..) => {
-                            managers_shut_down += 1;
-                            if managers_shut_down == total_managers_to_shut_down {
-                                tracing_event!(Level::INFO, "All torrents shut down gracefully.");
-                                break;
-                            }
-                        }
-                        _ => {
-                            // CRITICAL: We must aggressively drain other events (Stats, BlockReceived, etc.)
-                            // so the managers don't get blocked on a full channel while trying to die.
-                        }
-                    }
-                }
-
-                _ = draw_interval.tick() => {
-                }
-
-                _ = &mut shutdown_timeout => {
-                    tracing_event!(Level::WARN, "Shutdown timed out. {}/{} managers did not reply. Forcing exit.",
-                        total_managers_to_shut_down - managers_shut_down,
-                        total_managers_to_shut_down
-                    );
-                    break;
-                }
-            }
-        }
+        self.peer_manager.wait_for_shutdown().await;
     }
 
     fn route_incoming_peer_handshake(&mut self, incoming: IncomingPeerHandshake) {
@@ -5126,6 +5151,18 @@ impl App {
         let peer_addr = connection.remote_addr;
         let peer_info_hash = buffer[28..48].to_vec();
         let peer_info_hash_hex = hex::encode(&peer_info_hash);
+
+        if self
+            .peer_policy_rx
+            .borrow()
+            .blocks_ip(peer_addr.ip(), SystemTime::now())
+        {
+            tracing::trace!(
+                peer_ip = %peer_addr,
+                "Rejected inbound connection from blocked peer"
+            );
+            return;
+        }
 
         let Some(torrent_manager_tx) = self.torrent_manager_incoming_peer_txs.get(&peer_info_hash)
         else {
@@ -5268,6 +5305,10 @@ impl App {
         self.torrent_manager_command_txs.remove(info_hash);
         self.torrent_manager_incoming_peer_txs.remove(info_hash);
         self.torrent_metric_watch_rxs.remove(info_hash);
+        let _ = self
+            .peer_manager
+            .handle()
+            .unregister_torrent(info_hash.to_vec());
         self.integrity_scheduler.remove_torrent(info_hash);
         self.app_state
             .torrent_list_order
@@ -6030,6 +6071,10 @@ impl App {
                 self.torrent_manager_command_txs.remove(&info_hash);
                 self.torrent_manager_incoming_peer_txs.remove(&info_hash);
                 self.torrent_metric_watch_rxs.remove(&info_hash);
+                let _ = self
+                    .peer_manager
+                    .handle()
+                    .unregister_torrent(info_hash.clone());
                 self.integrity_scheduler.remove_torrent(&info_hash);
                 self.app_state
                     .torrent_list_order
@@ -6726,6 +6771,7 @@ impl App {
 
         for info_hash in closed_info_hashes {
             self.torrent_metric_watch_rxs.remove(&info_hash);
+            let _ = self.peer_manager.handle().unregister_torrent(info_hash);
         }
 
         if !completion_events.is_empty() {
@@ -7291,6 +7337,7 @@ impl App {
             .insert(info_hash.clone(), manager_command_tx);
 
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
+        let peer_metrics_rx = torrent_metrics_rx.clone();
         self.torrent_metric_watch_rxs
             .insert(info_hash.clone(), torrent_metrics_rx);
         let manager_event_tx_clone = self.manager_event_tx.clone();
@@ -7304,6 +7351,7 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
+            peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path,
             container_name: container_name.clone(),
@@ -7322,6 +7370,17 @@ impl App {
 
         match TorrentManager::from_torrent(torrent_params, torrent) {
             Ok(torrent_manager) => {
+                if !self
+                    .peer_manager
+                    .handle()
+                    .register_torrent(info_hash.clone(), peer_metrics_rx)
+                {
+                    tracing_event!(
+                        Level::WARN,
+                        info_hash = %hex::encode(&info_hash),
+                        "Peer manager was unavailable while registering torrent metrics"
+                    );
+                }
                 tokio::spawn(async move {
                     let _ = torrent_manager.run(start_paused).await;
                 });
@@ -7474,6 +7533,7 @@ impl App {
 
         let dht_handle = self.dht_service.handle();
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
+        let peer_metrics_rx = torrent_metrics_rx.clone();
         self.torrent_metric_watch_rxs
             .insert(info_hash.clone(), torrent_metrics_rx);
         let manager_event_tx_clone = self.manager_event_tx.clone();
@@ -7484,6 +7544,7 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
+            peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path.clone(),
             container_name: container_name.clone(),
@@ -7502,6 +7563,17 @@ impl App {
 
         match TorrentManager::from_magnet(torrent_params, magnet, &magnet_link) {
             Ok(torrent_manager) => {
+                if !self
+                    .peer_manager
+                    .handle()
+                    .register_torrent(info_hash.clone(), peer_metrics_rx)
+                {
+                    tracing_event!(
+                        Level::WARN,
+                        info_hash = %hex::encode(&info_hash),
+                        "Peer manager was unavailable while registering torrent metrics"
+                    );
+                }
                 tokio::spawn(async move {
                     let _ = torrent_manager.run(start_paused).await;
                 });
@@ -9415,13 +9487,16 @@ mod tests {
         reduce_browser_dialog_action, BrowserDialogAction, BrowserDialogEffect,
     };
     use crate::tui::tree::{RawNode, TreeViewState};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
     use std::collections::{HashMap, VecDeque};
     use std::env;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
-    use tokio::net::TcpListener;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant, SystemTime};
+    use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::sync::watch;
     use tokio::time;
@@ -11572,6 +11647,96 @@ mod tests {
         handshake[1..(1 + BITTORRENT_PROTOCOL_STR.len())].copy_from_slice(b"NotTorrent protocol");
 
         assert!(!is_valid_incoming_bittorrent_handshake(&handshake));
+    }
+
+    #[tokio::test]
+    async fn shutdown_keeps_peer_manager_alive_until_torrent_managers_quiesce() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let info_hash = vec![9; 20];
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        app.torrent_manager_command_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        let manager_event_tx = app.manager_event_tx.clone();
+        let policy_probe = app.peer_policy_rx.clone();
+        let manager_task = tokio::spawn(async move {
+            let command = time::timeout(Duration::from_secs(1), manager_rx.recv())
+                .await
+                .expect("torrent manager received shutdown before timeout")
+                .expect("torrent manager command channel remained open");
+            assert!(matches!(command, ManagerCommand::Shutdown));
+            assert!(
+                policy_probe.has_changed().is_ok(),
+                "peer manager stopped before the torrent manager quiesced"
+            );
+            manager_event_tx
+                .send(ManagerEvent::DeletionComplete(info_hash, Ok(())))
+                .await
+                .expect("acknowledge torrent manager shutdown");
+        });
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        app.shutdown_sequence(&mut terminal).await;
+        manager_task.await.expect("join fake torrent manager");
+    }
+
+    #[tokio::test]
+    async fn blocked_peer_policy_rejects_inbound_handshake_before_manager_routing() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let info_hash = vec![7; 20];
+        let (manager_tx, mut manager_rx) = mpsc::channel(1);
+        app.torrent_manager_incoming_peer_txs
+            .insert(info_hash.clone(), manager_tx);
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test listener");
+        let client = TcpStream::connect(listener.local_addr().expect("listener address"));
+        let (client, accepted) = tokio::join!(client, listener.accept());
+        let _client = client.expect("connect test peer");
+        let (stream, remote_addr) = accepted.expect("accept test peer");
+        let connection = crate::networking::TcpPeerTransport::incoming(stream, remote_addr);
+        let permit = app
+            .resource_manager
+            .acquire_peer_connection()
+            .await
+            .expect("acquire peer permit");
+
+        let (_policy_tx, policy_rx) = watch::channel(Arc::new(
+            crate::peer_manager::PeerPolicy::from_blocked_until(HashMap::from([(
+                remote_addr.ip(),
+                SystemTime::now() + Duration::from_secs(3_600),
+            )])),
+        ));
+        app.peer_policy_rx = policy_rx;
+
+        let mut buffer = vec![0; 68];
+        buffer[28..48].copy_from_slice(&info_hash);
+        app.route_incoming_peer_handshake(super::IncomingPeerHandshake {
+            connection,
+            buffer,
+            permit,
+        });
+
+        assert!(
+            time::timeout(Duration::from_millis(50), manager_rx.recv())
+                .await
+                .is_err(),
+            "blocked inbound peer was routed to the torrent manager"
+        );
     }
 
     #[tokio::test]

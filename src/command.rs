@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use std::fmt;
-#[cfg(feature = "pex")]
 use std::net::SocketAddr;
 
 use crate::torrent_file::Torrent;
@@ -18,6 +17,7 @@ use tokio::sync::mpsc::Sender;
 pub enum TorrentCommand {
     RegisterPeer {
         peer_id: String,
+        peer_addr: SocketAddr,
         tx: Sender<TorrentCommand>,
     },
     SuccessfullyConnected(String),

@@ -7,6 +7,7 @@ use tracing::Level;
 use crate::command::TorrentCommand;
 use crate::networking::transport::PeerTransportKind;
 use crate::networking::BlockInfo;
+use crate::peer_manager::PeerPolicy;
 use crate::storage::MultiFileInfo;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
@@ -25,6 +26,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use crate::torrent_file::{Torrent, V2RootInfo};
 use crate::torrent_manager::piece_manager::EffectivePiecePriority;
@@ -53,6 +55,9 @@ pub enum Action {
         is_paused: bool,
         announce_immediately: bool,
     },
+    PeerPolicyUpdated {
+        policy: Arc<PeerPolicy>,
+    },
     Tick {
         dt_ms: u64,
     },
@@ -66,6 +71,7 @@ pub enum Action {
     ConnectToWebSeeds,
     RegisterPeer {
         peer_id: String,
+        peer_addr: Option<SocketAddr>,
         tx: Sender<TorrentCommand>,
     },
     PeerTransportSelected {
@@ -364,6 +370,7 @@ pub struct TorrentState {
     pub pending_disconnects: Vec<String>,
     pub pending_failures: Vec<String>,
     pub accepting_new_peers: bool,
+    peer_policy: Arc<PeerPolicy>,
     pending_download_file_activity: Vec<FileActivityInterval>,
     pending_upload_file_activity: Vec<FileActivityInterval>,
 }
@@ -408,6 +415,7 @@ impl Default for TorrentState {
             pending_disconnects: Vec::with_capacity(100),
             pending_failures: Vec::with_capacity(100),
             accepting_new_peers: true,
+            peer_policy: Arc::new(PeerPolicy::default()),
             pending_download_file_activity: Vec::with_capacity(64),
             pending_upload_file_activity: Vec::with_capacity(64),
         }
@@ -484,6 +492,10 @@ impl TorrentState {
         state
     }
 
+    pub fn can_connect_to_peer(&self, addr: SocketAddr) -> bool {
+        !self.peer_policy.blocks_ip(addr.ip(), SystemTime::now())
+    }
+
     fn get_piece_size(&self, piece_index: u32) -> usize {
         if let Some(torrent) = &self.torrent {
             let piece_len = torrent.info.piece_length as u64;
@@ -543,6 +555,18 @@ impl TorrentState {
                     self.has_started_announce_sent = true;
                 }
 
+                effects
+            }
+            Action::PeerPolicyUpdated { policy } => {
+                let now = SystemTime::now();
+                let effects = self
+                    .peers
+                    .keys()
+                    .filter(|peer_id| policy.blocks_peer_address(peer_id, now))
+                    .cloned()
+                    .map(|peer_id| Effect::DisconnectPeer { peer_id })
+                    .collect();
+                self.peer_policy = policy;
                 effects
             }
             Action::Tick { dt_ms } => {
@@ -1106,7 +1130,17 @@ impl TorrentState {
                 effects
             }
 
-            Action::RegisterPeer { peer_id, tx } => {
+            Action::RegisterPeer {
+                peer_id,
+                peer_addr,
+                tx,
+            } => {
+                if peer_addr.is_some_and(|addr| !self.can_connect_to_peer(addr)) {
+                    return vec![Effect::DisconnectPeerSession {
+                        peer_id,
+                        peer_tx: tx,
+                    }];
+                }
                 if !self.peers.contains_key(&peer_id) {
                     let mut peer_state = PeerState::new(peer_id.clone(), tx, self.now);
                     peer_state.peer_id = peer_id.as_bytes().to_vec();
@@ -2867,6 +2901,73 @@ mod tests {
         state.peers.insert(id.to_string(), peer);
     }
 
+    #[test]
+    fn peer_policy_update_is_owned_by_state_and_disconnects_only_blocked_peers() {
+        let mut state = create_empty_state();
+        let blocked_peer = "tcp://203.0.113.20:6881";
+        let allowed_peer = "utp://198.51.100.20:6882";
+        let expired_peer = "tcp://192.0.2.20:6883";
+        add_peer(&mut state, blocked_peer);
+        add_peer(&mut state, allowed_peer);
+        add_peer(&mut state, expired_peer);
+
+        let blocked_ip = "203.0.113.20".parse().expect("valid blocked IP");
+        let expired_ip = "192.0.2.20".parse().expect("valid expired IP");
+        let blocked_until = std::time::SystemTime::now() + Duration::from_secs(3_600);
+        let policy = Arc::new(crate::peer_manager::PeerPolicy::from_blocked_until(
+            HashMap::from([
+                (blocked_ip, blocked_until),
+                (expired_ip, std::time::SystemTime::UNIX_EPOCH),
+            ]),
+        ));
+
+        let effects = state.update(Action::PeerPolicyUpdated {
+            policy: Arc::clone(&policy),
+        });
+
+        assert!(Arc::ptr_eq(&state.peer_policy, &policy));
+        assert!(
+            !state.can_connect_to_peer("203.0.113.20:7000".parse().expect("valid blocked peer"))
+        );
+        assert!(
+            state.can_connect_to_peer("198.51.100.20:7000".parse().expect("valid allowed peer"))
+        );
+        assert!(state.can_connect_to_peer("192.0.2.20:7000".parse().expect("valid expired peer")));
+        let disconnected = effects
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::DisconnectPeer { peer_id } => Some(peer_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(disconnected, vec![blocked_peer.to_string()]);
+    }
+
+    #[test]
+    fn register_peer_rechecks_current_state_policy_before_inserting() {
+        let mut state = create_empty_state();
+        let peer_addr: SocketAddr = "203.0.113.21:6881".parse().expect("valid peer address");
+        let blocked_until = SystemTime::now() + Duration::from_secs(3_600);
+        state.update(Action::PeerPolicyUpdated {
+            policy: Arc::new(crate::peer_manager::PeerPolicy::from_blocked_until(
+                HashMap::from([(peer_addr.ip(), blocked_until)]),
+            )),
+        });
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+
+        let effects = state.update(Action::RegisterPeer {
+            peer_id: peer_addr.to_string(),
+            peer_addr: Some(peer_addr),
+            tx: peer_tx,
+        });
+
+        assert!(!state.peers.contains_key(&peer_addr.to_string()));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::DisconnectPeerSession { peer_id, .. }] if peer_id == &peer_addr.to_string()
+        ));
+    }
+
     fn drained_download_paths_for_activity(
         state: &mut TorrentState,
         piece_index: u32,
@@ -2957,6 +3058,7 @@ mod tests {
             let (tx, _rx) = mpsc::channel(1);
             let _ = state.update(Action::RegisterPeer {
                 peer_id: format!("peer_{}", i),
+                peer_addr: None,
                 tx,
             });
         }
@@ -5062,10 +5164,12 @@ mod tests {
 
         state.update(Action::RegisterPeer {
             peer_id: "127.0.0.1:4101".into(),
+            peer_addr: None,
             tx: peer_a_tx,
         });
         state.update(Action::RegisterPeer {
             peer_id: "127.0.0.1:4102".into(),
+            peer_addr: None,
             tx: peer_b_tx,
         });
         let effects = state.update(Action::Pause);
@@ -9299,6 +9403,7 @@ mod prop_tests {
             let (tx, _rx) = mpsc::channel(16);
             let _ = state.update(Action::RegisterPeer {
                 peer_id: peer_id.clone(),
+                peer_addr: None,
                 tx,
             });
             let _ = state.update(Action::PeerSuccessfullyConnected {
@@ -11323,6 +11428,7 @@ mod integration_tests {
             dht_handle: crate::dht_service::DhtHandle::disabled(),
             incoming_peer_rx,
             metrics_tx,
+            peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
             torrent_data_path: Some(temp_dir),
             container_name: None,
