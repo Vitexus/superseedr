@@ -219,6 +219,7 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
                     items: app.app_state.ui.config.items.as_mut_slice(),
                     active_pane: &mut app.app_state.ui.config.active_pane,
                     editing: &mut app.app_state.ui.config.editing,
+                    reset_confirmation: &mut app.app_state.ui.config.reset_confirmation,
                     shared_follower,
                     compact: config_layout.kind
                         == crate::tui::layout::config::ConfigLayoutKind::Compact,

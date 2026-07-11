@@ -1662,6 +1662,7 @@ pub struct ConfigUiState {
     pub items: Vec<ConfigItem>,
     pub active_pane: ConfigPane,
     pub editing: Option<ConfigEditState>,
+    pub reset_confirmation: Option<ConfigItem>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

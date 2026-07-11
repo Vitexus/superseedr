@@ -571,14 +571,14 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         HelpSection::Screens,
         "Config",
         "Space / h / l",
-        "Shift or open a control; adjust choices and steps with h / l",
+        "Shift or open a control; move through choices with h / l",
         ActionTone::Navigate
     );
     action_item!(
         HelpSection::Screens,
         "Config",
         "r",
-        "Reset the focused setting and apply it immediately",
+        "Open confirmation before resetting the focused setting",
         ActionTone::Clear
     );
     action_item!(

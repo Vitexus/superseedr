@@ -2034,6 +2034,7 @@ pub fn confirm_config_path_selection(
             items: items.clone(),
             active_pane: crate::app::ConfigPane::Settings,
             editing: None,
+            reset_confirmation: None,
         });
     }
     None
@@ -2053,6 +2054,7 @@ pub fn escape_to_config_mode(browser_mode: &FileBrowserMode) -> Option<ConfigUiS
             items: items.clone(),
             active_pane: crate::app::ConfigPane::Settings,
             editing: None,
+            reset_confirmation: None,
         });
     }
     None

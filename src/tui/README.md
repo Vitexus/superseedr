@@ -61,7 +61,8 @@
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
-  - `Space` shifts boolean and choice settings immediately, opens value editing for the listen port and global rate limits, or opens a path browser; `Left`/`Right` (or `h`/`l`) moves backward/forward through choices and stepped values; `r` resets the focused setting immediately.
+  - `Space` shifts boolean and choice settings immediately, opens value editing for the listen port and global rate limits, or opens a path browser; `Left`/`Right` (or `h`/`l`) moves backward/forward through choices; `r` opens reset confirmation for the focused setting.
+  - In reset confirmation, `Y` restores the default and `Esc` cancels.
   - While editing a value, `Enter` applies it and `Esc` cancels the current edit.
   - Confirming a path in `FileBrowser` applies it and returns to Config.
   - `Esc`/`q` closes Config immediately.
@@ -85,7 +86,7 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `PowerSaving` | `z` | `Normal` | Return from zen |
 | `Normal` | `c` | `Config` | Open settings |
 | `Config` | `Tab` | `Config` | Switch between settings and details panes |
-| `Config` | completed control change | `Config` | Apply toggles, choices, steps, resets, and exact edits immediately |
+| `Config` | completed control change | `Config` | Apply toggles, choices, confirmed resets, and value edits immediately |
 | `Config` | `Esc` or `q` | `Normal` or `Config` | Close immediately; compact details first returns to the settings list |
 | `Normal` | `M` | `TorrentManagement` | Batch torrent management |
 | `TorrentManagement` | `Esc` or `q` | `Normal` | Close management |

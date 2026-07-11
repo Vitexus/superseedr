@@ -77,6 +77,7 @@ pub fn draw(
                     items: &app_state.ui.config.items,
                     active_pane: app_state.ui.config.active_pane,
                     editing: &app_state.ui.config.editing,
+                    reset_confirmation: &app_state.ui.config.reset_confirmation,
                 },
             );
             apply_theme_effects_to_frame(f, &ctx);
