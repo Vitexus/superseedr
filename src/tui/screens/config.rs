@@ -1211,10 +1211,10 @@ fn build_layout_detail_lines(
         ConfigLayoutKind::Stacked => "Stacked",
         ConfigLayoutKind::Compact => "Compact",
     };
-    let preview = match render_ctx.layout_kind {
-        ConfigLayoutKind::Wide => "[ Settings ][        Details        ]",
-        ConfigLayoutKind::Stacked => "[ Settings ]  /  [ Details ]",
-        ConfigLayoutKind::Compact => "[ Settings  ↔  Details ]",
+    let arrangement = match render_ctx.layout_kind {
+        ConfigLayoutKind::Wide => "Side by side",
+        ConfigLayoutKind::Stacked => "Settings above details",
+        ConfigLayoutKind::Compact => "One panel at a time",
     };
     vec![
         choice_line(
@@ -1240,17 +1240,25 @@ fn build_layout_detail_lines(
         info_section_heading("RESOLVED VIEW", ctx),
         detail_row(
             "Resolved",
-            format!(
-                "{kind_label}  ·  {}×{}",
-                render_ctx.terminal_area.width, render_ctx.terminal_area.height
-            ),
+            kind_label.to_string(),
             ctx.apply(Style::default().fg(ctx.state_success())),
             ctx,
         ),
-        Line::from(Span::styled(
-            preview,
-            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-        )),
+        detail_row(
+            "Viewport",
+            format!(
+                "{} × {}",
+                render_ctx.terminal_area.width, render_ctx.terminal_area.height
+            ),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ctx,
+        ),
+        detail_row(
+            "Arrangement",
+            arrangement.to_string(),
+            ctx.apply(Style::default().fg(ctx.accent_sapphire()).bold()),
+            ctx,
+        ),
     ]
 }
 
@@ -2302,8 +2310,15 @@ mod tests {
         assert_first_below_divider(&path_lines, "Files placed here");
 
         let layout_lines = build_layout_detail_lines(&render_ctx, 60);
-        assert_detail_hierarchy(&layout_lines, &["Mode"], &["Resolved"]);
+        assert_detail_hierarchy(
+            &layout_lines,
+            &["Mode"],
+            &["Resolved", "Viewport", "Arrangement"],
+        );
         assert_first_below_divider(&layout_lines, "Auto follows");
+        let layout_text = plain_lines(&layout_lines).join("\n");
+        assert!(layout_text.contains("Side by side"));
+        assert!(!layout_text.contains("[ Settings ]"));
 
         let confirm_lines = build_confirm_add_detail_lines(&render_ctx, 60);
         assert_detail_hierarchy(&confirm_lines, &["Mode"], &["Behavior"]);
