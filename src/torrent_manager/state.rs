@@ -11427,6 +11427,7 @@ mod integration_tests {
         let params = TorrentParameters {
             dht_handle: crate::dht_service::DhtHandle::disabled(),
             incoming_peer_rx,
+            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,

@@ -5320,6 +5320,18 @@ impl App {
     }
 
     async fn handle_incoming_peer(&mut self, mut connection: PeerConnection) {
+        if self
+            .peer_policy_rx
+            .borrow()
+            .blocks_ip(connection.remote_addr.ip(), SystemTime::now())
+        {
+            tracing::trace!(
+                peer_ip = %connection.remote_addr,
+                "Rejected inbound connection from blocked peer before handshake"
+            );
+            return;
+        }
+
         let resource_manager_clone = self.resource_manager.clone();
         let incoming_peer_handshake_tx = self.incoming_peer_handshake_tx.clone();
         let mut permit_shutdown_rx = self.shutdown_tx.subscribe();
@@ -7465,7 +7477,7 @@ impl App {
             .insert(info_hash.clone(), manager_command_tx);
 
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
-        let peer_metrics_rx = torrent_metrics_rx.clone();
+        let (peer_metrics_tx, peer_metrics_rx) = watch::channel(TorrentMetrics::default());
         self.torrent_metric_watch_rxs
             .insert(info_hash.clone(), torrent_metrics_rx);
         let manager_event_tx_clone = self.manager_event_tx.clone();
@@ -7479,6 +7491,7 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
+            peer_metrics_tx,
             peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path,
@@ -7661,7 +7674,7 @@ impl App {
 
         let dht_handle = self.dht_service.handle();
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
-        let peer_metrics_rx = torrent_metrics_rx.clone();
+        let (peer_metrics_tx, peer_metrics_rx) = watch::channel(TorrentMetrics::default());
         self.torrent_metric_watch_rxs
             .insert(info_hash.clone(), torrent_metrics_rx);
         let manager_event_tx_clone = self.manager_event_tx.clone();
@@ -7672,6 +7685,7 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
+            peer_metrics_tx,
             peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path.clone(),
@@ -9624,6 +9638,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{Duration, Instant, SystemTime};
+    use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::sync::watch;
@@ -11965,6 +11980,42 @@ mod tests {
                 .is_err(),
             "blocked inbound peer was routed to the torrent manager"
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_peer_policy_closes_inbound_before_waiting_for_handshake() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind test listener");
+        let client = TcpStream::connect(listener.local_addr().expect("listener address"));
+        let (client, accepted) = tokio::join!(client, listener.accept());
+        let mut client = client.expect("connect test peer");
+        let (stream, remote_addr) = accepted.expect("accept test peer");
+        let connection = crate::networking::TcpPeerTransport::incoming(stream, remote_addr);
+        let (_policy_tx, policy_rx) = watch::channel(Arc::new(
+            crate::peer_manager::PeerPolicy::from_blocked_until(HashMap::from([(
+                remote_addr.ip(),
+                SystemTime::now() + Duration::from_secs(3_600),
+            )])),
+        ));
+        app.peer_policy_rx = policy_rx;
+
+        app.handle_incoming_peer(connection).await;
+
+        let mut byte = [0_u8; 1];
+        let bytes_read = time::timeout(Duration::from_millis(100), client.read(&mut byte))
+            .await
+            .expect("blocked connection should close without waiting for a handshake")
+            .expect("read blocked connection closure");
+        assert_eq!(bytes_read, 0);
+        let _ = app.shutdown_tx.send(());
     }
 
     #[tokio::test]
