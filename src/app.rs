@@ -8117,6 +8117,8 @@ impl App {
         &mut self,
         request: &ControlRequest,
     ) -> Result<(String, Option<CommandIngestResult>), String> {
+        validate_runtime_control_request(request)?;
+
         match plan_control_request(&self.client_configs, request)? {
             ControlExecutionPlan::StatusNow => {
                 self.trigger_status_dump_now();
@@ -8297,6 +8299,7 @@ impl App {
     }
 
     async fn rebind_listener(&mut self, new_port: u16) -> bool {
+        let previous_bound_port = self.listener.as_ref().and_then(ListenerSet::local_port);
         match bind_peer_listener(new_port).await {
             Ok(new_listener) => {
                 self.listener = new_listener;
@@ -8308,6 +8311,9 @@ impl App {
                     .and_then(ListenerSet::local_port)
                     .unwrap_or(new_port);
                 self.client_configs.client_port = bound_port;
+                if previous_bound_port != Some(bound_port) {
+                    self.app_state.inbound_peer_transports = InboundPeerTransportStatus::default();
+                }
 
                 tracing_event!(
                     Level::INFO,
@@ -8838,6 +8844,16 @@ fn compose_system_warning(
         (None, Some(dht)) => Some(dht.to_string()),
         (None, None) => None,
     }
+}
+
+fn validate_runtime_control_request(request: &ControlRequest) -> Result<(), String> {
+    if matches!(request, ControlRequest::MoveTorrent { .. }) {
+        return Err(
+            "The move command is CLI-only and requires the superseedr client to be stopped."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub fn parse_hybrid_hashes(magnet_link: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
@@ -11731,6 +11747,8 @@ mod tests {
         let (manager_tx, mut manager_rx) = mpsc::channel(4);
         app.torrent_manager_command_txs
             .insert(b"port-update-test".to_vec(), manager_tx);
+        app.app_state.inbound_peer_transports.tcp_ipv4_seen = true;
+        app.app_state.inbound_peer_transports.utp_ipv6_seen = true;
 
         assert!(app.rebind_listener(0).await);
 
@@ -11745,8 +11763,24 @@ mod tests {
             command,
             ManagerCommand::UpdateListenPort(port) if port == bound_port
         ));
+        assert_eq!(
+            app.app_state.inbound_peer_transports,
+            InboundPeerTransportStatus::default()
+        );
 
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[test]
+    fn running_client_rejects_cli_only_move_requests() {
+        let error = super::validate_runtime_control_request(&ControlRequest::MoveTorrent {
+            info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+            download_path: PathBuf::from("/fictional-downloads"),
+        })
+        .expect_err("runtime move should be rejected");
+
+        assert!(error.contains("CLI-only"));
+        assert!(error.contains("stopped"));
     }
 
     #[tokio::test]

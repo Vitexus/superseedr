@@ -2374,6 +2374,12 @@ fn process_cli_request(
             info_hash_hex,
             path,
         } => {
+            if leader_is_running {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Stop the running superseedr client before using the move command.",
+                ));
+            }
             let request = build_move_torrent_request(settings, info_hash_hex, path)
                 .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
             process_control_requests(
@@ -3802,6 +3808,25 @@ mod tests {
         .expect_err("missing destination should fail");
 
         assert!(error.contains("does not exist"));
+    }
+
+    #[test]
+    fn move_command_rejects_a_running_client_before_touching_payloads() {
+        let destination = tempdir().expect("create destination");
+        let cli = Cli {
+            json: false,
+            input: None,
+            command: Some(Commands::Move {
+                info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+                path: destination.path().to_path_buf(),
+            }),
+        };
+
+        let error = process_cli_request(&cli, &Settings::default(), false, true, OutputMode::Text)
+            .expect_err("running client should reject move");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("Stop the running"));
     }
 
     #[test]

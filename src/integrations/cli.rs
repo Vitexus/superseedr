@@ -190,7 +190,7 @@ pub enum Commands {
         #[arg(help = "Priority to apply")]
         priority: CliPriority,
     },
-    #[command(about = "Move a torrent to an existing download directory")]
+    #[command(about = "Move a torrent while the superseedr client is stopped")]
     Move {
         #[arg(value_name = "INFO_HASH_HEX", help = "Torrent info hash")]
         info_hash_hex: String,
@@ -661,13 +661,6 @@ where
                 priority: (*priority).into(),
             }]))
         }
-        Commands::Move {
-            info_hash_hex,
-            path,
-        } => Ok(Some(vec![ControlRequest::MoveTorrent {
-            info_hash_hex: info_hash_hex.clone(),
-            download_path: path.clone(),
-        }])),
         Commands::Add { .. }
         | Commands::StopClient
         | Commands::Journal { .. }
@@ -683,7 +676,8 @@ where
         | Commands::Torrents
         | Commands::Info { .. }
         | Commands::Purge { .. }
-        | Commands::Files { .. } => Ok(None),
+        | Commands::Files { .. }
+        | Commands::Move { .. } => Ok(None),
         #[cfg(feature = "synthetic-load")]
         Commands::Benchmark(_) => Ok(None),
         #[cfg(feature = "synthetic-load")]
@@ -995,23 +989,13 @@ mod tests {
     }
 
     #[test]
-    fn move_command_maps_to_move_torrent_request() {
+    fn move_command_is_not_mapped_to_a_runtime_control_request() {
         let command = Commands::Move {
             info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             path: PathBuf::from("/tmp/fictional-downloads"),
         };
 
-        let request = command_to_control_request(&command)
-            .expect("move command should map")
-            .expect("move request");
-
-        assert_eq!(
-            request,
-            ControlRequest::MoveTorrent {
-                info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-                download_path: PathBuf::from("/tmp/fictional-downloads"),
-            }
-        );
+        assert_eq!(command_to_control_request(&command), Ok(None));
     }
 
     #[test]

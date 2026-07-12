@@ -13,7 +13,7 @@ use crate::torrent_identity::{decode_info_hash, info_hash_from_torrent_source};
 use crate::torrent_manager::state::calculate_deletion_lists;
 use crate::watch_inbox::is_cross_device_link_error;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::Path;
@@ -837,25 +837,21 @@ fn copy_for_cross_device_move(
     verify_moved_destination(source, destination, source_len)
 }
 
-fn move_torrent_payload_files_with_rename<F>(
-    plan: &MovePayloadPlan,
-    mut rename_op: F,
-) -> Result<usize, String>
-where
-    F: FnMut(&Path, &Path) -> io::Result<()>,
-{
-    let mut moved_count = 0;
-    let mut copied_cross_device_sources = Vec::new();
+fn preflight_move_payload_files(plan: &MovePayloadPlan) -> Result<(), String> {
+    let mut destinations = HashSet::new();
 
     for (source, destination) in &plan.files {
-        if !source.exists() {
+        if !source.exists() || same_existing_file(source, destination) {
             continue;
         }
         if !source.is_file() {
             return Err(format!("Move source is not a file: {}", source.display()));
         }
-        if same_existing_file(source, destination) {
-            continue;
+        if !destinations.insert(destination.clone()) {
+            return Err(format!(
+                "Move plan contains duplicate destination: {}",
+                destination.display()
+            ));
         }
         if destination.exists() {
             return Err(format!(
@@ -863,54 +859,141 @@ where
                 destination.display()
             ));
         }
-        let source_len = metadata_len(source)?;
+    }
+
+    for (_, destination) in &plan.files {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("Failed to create '{}': {}", parent.display(), error))?;
         }
-        match rename_op(source, destination) {
-            Ok(()) => {
-                verify_moved_destination(source, destination, source_len)?;
-                if source.exists() {
-                    return Err(format!(
-                        "Move metadata check failed because source still exists: {}",
-                        source.display()
-                    ));
-                }
-            }
-            Err(error) if is_cross_device_link_error(&error) => {
-                copy_for_cross_device_move(source, destination, source_len)?;
-                copied_cross_device_sources.push(source.clone());
-            }
-            Err(error) => {
-                return Err(format!(
-                    "Failed to move '{}' to '{}': {}",
-                    source.display(),
-                    destination.display(),
-                    error
-                ));
-            }
-        }
-        moved_count += 1;
     }
 
-    for (source, destination) in &plan.files {
-        if copied_cross_device_sources
-            .iter()
-            .any(|path| path == source)
-        {
-            verify_moved_destination(source, destination, metadata_len(source)?)?;
-        }
-    }
+    Ok(())
+}
 
-    for source in &copied_cross_device_sources {
-        fs::remove_file(source).map_err(|error| {
+fn rollback_completed_renames(renamed_files: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    for (source, destination) in renamed_files.iter().rev() {
+        if source.exists() {
+            return Err(format!(
+                "Cannot roll back '{}' because source already exists: {}",
+                destination.display(),
+                source.display()
+            ));
+        }
+        let destination_len = metadata_len(destination)?;
+        fs::rename(destination, source).map_err(|error| {
             format!(
-                "Failed to delete copied cross-volume source '{}': {}",
+                "Failed to roll back '{}' to '{}': {}",
+                destination.display(),
                 source.display(),
                 error
             )
         })?;
+        verify_moved_destination(destination, source, destination_len)?;
+    }
+    Ok(())
+}
+
+fn cleanup_cross_device_copies(copied_files: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    for (source, destination) in copied_files.iter().rev() {
+        if !source.exists() || !destination.exists() {
+            continue;
+        }
+        fs::remove_file(destination).map_err(|error| {
+            format!(
+                "Failed to remove copied destination '{}' during rollback: {}",
+                destination.display(),
+                error
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn move_torrent_payload_files_with_rename<F>(
+    plan: &MovePayloadPlan,
+    mut rename_op: F,
+) -> Result<usize, String>
+where
+    F: FnMut(&Path, &Path) -> io::Result<()>,
+{
+    preflight_move_payload_files(plan)?;
+
+    let mut moved_count = 0;
+    let mut renamed_files = Vec::new();
+    let mut copied_cross_device_files = Vec::new();
+
+    let move_result = (|| -> Result<(), String> {
+        for (source, destination) in &plan.files {
+            if !source.exists() {
+                continue;
+            }
+            if same_existing_file(source, destination) {
+                continue;
+            }
+            let source_len = metadata_len(source)?;
+            match rename_op(source, destination) {
+                Ok(()) => {
+                    renamed_files.push((source.clone(), destination.clone()));
+                    verify_moved_destination(source, destination, source_len)?;
+                    if source.exists() {
+                        return Err(format!(
+                            "Move metadata check failed because source still exists: {}",
+                            source.display()
+                        ));
+                    }
+                }
+                Err(error) if is_cross_device_link_error(&error) => {
+                    if let Err(copy_error) =
+                        copy_for_cross_device_move(source, destination, source_len)
+                    {
+                        if source.exists() && destination.exists() {
+                            let _ = fs::remove_file(destination);
+                        }
+                        return Err(copy_error);
+                    }
+                    copied_cross_device_files.push((source.clone(), destination.clone()));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Failed to move '{}' to '{}': {}",
+                        source.display(),
+                        destination.display(),
+                        error
+                    ));
+                }
+            }
+            moved_count += 1;
+        }
+
+        for (source, destination) in &copied_cross_device_files {
+            verify_moved_destination(source, destination, metadata_len(source)?)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = move_result {
+        let copy_cleanup_error = cleanup_cross_device_copies(&copied_cross_device_files).err();
+        let rename_rollback_error = rollback_completed_renames(&renamed_files).err();
+        let rollback_errors = [copy_cleanup_error, rename_rollback_error]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        return Err(if rollback_errors.is_empty() {
+            error
+        } else {
+            format!("{}. Rollback failed: {}", error, rollback_errors.join("; "))
+        });
+    }
+
+    for (source, _) in &copied_cross_device_files {
+        if let Err(error) = fs::remove_file(source) {
+            tracing::warn!(
+                "Move completed but copied cross-volume source could not be removed '{}': {}",
+                source.display(),
+                error
+            );
+        }
     }
     for dir_path in &plan.source_directories {
         if let Err(error) = fs::remove_dir(dir_path) {
@@ -1518,6 +1601,77 @@ mod tests {
         assert_eq!(fs::read(destination_b).expect("read moved b"), b"bravo");
         assert!(!source_a.exists());
         assert!(!source_b.exists());
+    }
+
+    #[test]
+    fn move_payload_preflights_later_destination_conflicts_before_moving_any_file() {
+        let source_root = tempfile::tempdir().expect("create source root");
+        let destination_root = tempfile::tempdir().expect("create destination root");
+        let source_a = source_root.path().join("a.bin");
+        let source_b = source_root.path().join("b.bin");
+        fs::write(&source_a, b"alpha").expect("write source a");
+        fs::write(&source_b, b"bravo").expect("write source b");
+        let destination_a = destination_root.path().join("a.bin");
+        let destination_b = destination_root.path().join("b.bin");
+        fs::write(&destination_b, b"existing").expect("write conflicting destination");
+        let plan = MovePayloadPlan {
+            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            destination_root: destination_root.path().to_path_buf(),
+            files: vec![
+                (source_a.clone(), destination_a.clone()),
+                (source_b.clone(), destination_b),
+            ],
+            source_directories: Vec::new(),
+        };
+
+        let error =
+            super::move_torrent_payload_files(&plan).expect_err("later conflict should fail");
+
+        assert!(error.contains("already exists"));
+        assert_eq!(fs::read(&source_a).expect("source a remains"), b"alpha");
+        assert_eq!(fs::read(&source_b).expect("source b remains"), b"bravo");
+        assert!(!destination_a.exists());
+    }
+
+    #[test]
+    fn move_payload_rolls_back_completed_renames_when_a_later_rename_fails() {
+        let source_root = tempfile::tempdir().expect("create source root");
+        let destination_root = tempfile::tempdir().expect("create destination root");
+        let source_a = source_root.path().join("a.bin");
+        let source_b = source_root.path().join("b.bin");
+        fs::write(&source_a, b"alpha").expect("write source a");
+        fs::write(&source_b, b"bravo").expect("write source b");
+        let destination_a = destination_root.path().join("a.bin");
+        let destination_b = destination_root.path().join("b.bin");
+        let plan = MovePayloadPlan {
+            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            destination_root: destination_root.path().to_path_buf(),
+            files: vec![
+                (source_a.clone(), destination_a.clone()),
+                (source_b.clone(), destination_b.clone()),
+            ],
+            source_directories: Vec::new(),
+        };
+        let mut rename_attempt = 0;
+
+        let error = move_torrent_payload_files_with_rename(&plan, |source, destination| {
+            rename_attempt += 1;
+            if rename_attempt == 2 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected rename failure",
+                ))
+            } else {
+                fs::rename(source, destination)
+            }
+        })
+        .expect_err("second rename should fail");
+
+        assert!(error.contains("injected rename failure"));
+        assert_eq!(fs::read(&source_a).expect("source a restored"), b"alpha");
+        assert_eq!(fs::read(&source_b).expect("source b remains"), b"bravo");
+        assert!(!destination_a.exists());
+        assert!(!destination_b.exists());
     }
 
     #[test]
