@@ -3,13 +3,8 @@
 
 use ratatui::layout::{Constraint, Layout, Rect};
 
-pub const WIDE_PEER_SCREEN_MIN_WIDTH: u16 = 120;
-pub const STACKED_PEER_SCREEN_MIN_WIDTH: u16 = 80;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerBodyLayout {
-    Wide { table: Rect, details: Rect },
-    Stacked { table: Rect, details: Rect },
     TableOnly { table: Rect },
     DetailsOnly { details: Rect },
 }
@@ -42,24 +37,7 @@ pub fn calculate_peer_screen_layout(
     let body_area = vertical[2];
     let footer = vertical[3];
 
-    let body = if content.width >= WIDE_PEER_SCREEN_MIN_WIDTH && body_area.height >= 8 {
-        let columns = Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
-            .split(body_area);
-        PeerBodyLayout::Wide {
-            table: columns[0],
-            details: columns[1],
-        }
-    } else if content.width >= STACKED_PEER_SCREEN_MIN_WIDTH && body_area.height >= 16 {
-        let details_height = (body_area.height / 3)
-            .clamp(7, 12)
-            .min(body_area.height.saturating_sub(5));
-        let rows = Layout::vertical([Constraint::Min(5), Constraint::Length(details_height)])
-            .split(body_area);
-        PeerBodyLayout::Stacked {
-            table: rows[0],
-            details: rows[1],
-        }
-    } else if show_details {
+    let body = if show_details {
         PeerBodyLayout::DetailsOnly { details: body_area }
     } else {
         PeerBodyLayout::TableOnly { table: body_area }
@@ -91,34 +69,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wide_layout_keeps_table_and_details_side_by_side() {
-        let layout = calculate_peer_screen_layout(Rect::new(0, 0, 150, 40), false, false);
-
-        let PeerBodyLayout::Wide { table, details } = layout.body else {
-            panic!("expected wide layout");
-        };
-        assert!(table.width > details.width);
-        assert_eq!(table.height, details.height);
-    }
-
-    #[test]
-    fn medium_layout_stacks_details_under_table() {
-        let layout = calculate_peer_screen_layout(Rect::new(0, 0, 100, 32), false, false);
-
-        let PeerBodyLayout::Stacked { table, details } = layout.body else {
-            panic!("expected stacked layout");
-        };
-        assert!(table.height >= 5);
-        assert!(details.y >= table.y + table.height);
-    }
-
-    #[test]
-    fn narrow_details_replace_the_table_only_when_requested() {
-        let table = calculate_peer_screen_layout(Rect::new(0, 0, 70, 24), false, false);
+    fn details_replace_the_table_at_every_screen_width() {
+        let table = calculate_peer_screen_layout(Rect::new(0, 0, 150, 40), false, false);
         assert!(matches!(table.body, PeerBodyLayout::TableOnly { .. }));
 
-        let details = calculate_peer_screen_layout(Rect::new(0, 0, 70, 24), false, true);
+        let details = calculate_peer_screen_layout(Rect::new(0, 0, 150, 40), false, true);
         assert!(matches!(details.body, PeerBodyLayout::DetailsOnly { .. }));
+
+        let narrow_details = calculate_peer_screen_layout(Rect::new(0, 0, 70, 24), false, true);
+        assert!(matches!(
+            narrow_details.body,
+            PeerBodyLayout::DetailsOnly { .. }
+        ));
     }
 
     #[test]
@@ -128,14 +90,17 @@ mod tests {
 
         assert!(with_search.search.is_some());
         assert_eq!(with_search.search.unwrap().height, 3);
-        let without_table_height = match without_search.body {
-            PeerBodyLayout::Stacked { table, .. } => table.height,
-            _ => panic!("expected stacked layout"),
+        let PeerBodyLayout::TableOnly {
+            table: without_table,
+        } = without_search.body
+        else {
+            panic!("expected table layout");
         };
-        let with_table_height = match with_search.body {
-            PeerBodyLayout::Stacked { table, .. } => table.height,
-            _ => panic!("expected stacked layout"),
+        let PeerBodyLayout::TableOnly { table: with_table } = with_search.body else {
+            panic!("expected table layout");
         };
+        let without_table_height = without_table.height;
+        let with_table_height = with_table.height;
         assert!(with_table_height < without_table_height);
     }
 }

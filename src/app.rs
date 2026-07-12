@@ -2001,6 +2001,11 @@ pub struct PeerManagementUiState {
     pub sort_column_index: Option<usize>,
     pub sort_direction: SortDirection,
     pub show_details: bool,
+    pub details_peer_ip: Option<IpAddr>,
+    pub details_scroll_offset: usize,
+    pub details_is_searching: bool,
+    pub details_search_query: String,
+    pub details_search_mode: SearchMode,
     pub status_message: Option<String>,
 }
 
@@ -2012,10 +2017,15 @@ impl Default for PeerManagementUiState {
             is_searching: false,
             search_query: String::new(),
             search_mode: SearchMode::Regex,
-            selected_column_index: 2,
-            sort_column_index: Some(2),
+            selected_column_index: 0,
+            sort_column_index: Some(0),
             sort_direction: SortDirection::Descending,
             show_details: false,
+            details_peer_ip: None,
+            details_scroll_offset: 0,
+            details_is_searching: false,
+            details_search_query: String::new(),
+            details_search_mode: SearchMode::Regex,
             status_message: None,
         }
     }
@@ -11841,9 +11851,10 @@ mod tests {
                 uploaded_evidence_bytes: 2_048,
                 transfer_threshold_bytes: 256 * 1024 * 1024,
                 reconnect_count: 1,
-                reconnect_limit: 6,
-                reconnect_window_secs: 300,
+                reconnect_limit: 10,
+                reconnect_window_secs: 10,
                 last_seen: Some(SystemTime::now()),
+                clients: vec!["Unknown (ZZ1234)".to_string()],
             }],
         });
         view_tx.send_replace(Arc::clone(&updated_view));
@@ -11858,6 +11869,10 @@ mod tests {
         assert_eq!(
             app_state.peer_manager_view.tracked_peers[0].torrent_name,
             "Silver Current"
+        );
+        assert_eq!(
+            app_state.peer_manager_view.tracked_peers[0].clients,
+            vec!["Unknown (ZZ1234)".to_string()]
         );
         assert!(app_state.ui.needs_redraw);
     }

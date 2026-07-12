@@ -8,7 +8,7 @@ use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -23,9 +23,8 @@ use tokio::task::JoinHandle;
 const METRICS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const MIN_TRANSFER_ABUSE_BYTES: u64 = 256 * 1024 * 1024;
 const TRANSFER_ABUSE_MULTIPLIER: u64 = 2;
-const CONNECTION_LIMIT: usize = 7;
-const RECONNECT_LIMIT: usize = CONNECTION_LIMIT - 1;
-const RECONNECT_WINDOW: Duration = Duration::from_secs(5 * 60);
+const RECONNECT_LIMIT: usize = 10;
+const RECONNECT_WINDOW: Duration = Duration::from_secs(10);
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
@@ -43,6 +42,44 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
         IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4),
         IpAddr::V4(_) => ip,
     }
+}
+
+pub fn parse_peer_client(peer_id: &[u8]) -> String {
+    if peer_id.len() < 8 {
+        return "Unknown".to_string();
+    }
+
+    if peer_id[0] == b'-' && peer_id[7] == b'-' {
+        let client_code = &peer_id[1..3];
+        let version = &peer_id[3..7];
+        let client_name = match client_code {
+            b"TR" => "Transmission",
+            b"UT" => "µTorrent",
+            b"qB" => "qBittorrent",
+            b"AZ" => "Vuze/Azureus",
+            b"LT" => "libtorrent",
+            b"DE" => "Deluge",
+            b"S" | b"SD" => "Shadow",
+            _ => {
+                return format!(
+                    "Unknown ({}{})",
+                    String::from_utf8_lossy(client_code),
+                    String::from_utf8_lossy(version)
+                );
+            }
+        };
+        return format!("{} {}", client_name, String::from_utf8_lossy(version));
+    }
+
+    if peer_id.starts_with(b"M")
+        && peer_id[1..8]
+            .iter()
+            .all(|c| c.is_ascii_digit() || *c == b'-')
+    {
+        return "BitComet".to_string();
+    }
+
+    "Unknown".to_string()
 }
 
 fn transfer_abuse_limit(total_size: u64) -> u64 {
@@ -229,6 +266,7 @@ struct PeerTorrentHistory {
     uploaded_bytes: u64,
     reconnects: VecDeque<SystemTime>,
     last_seen: Option<SystemTime>,
+    clients: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +290,7 @@ pub struct PeerManagerTrackedPeer {
     pub reconnect_limit: u32,
     pub reconnect_window_secs: u64,
     pub last_seen: Option<SystemTime>,
+    pub clients: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -265,6 +304,7 @@ impl PeerTorrentHistory {
     fn observe_presence(
         &mut self,
         endpoint_transfers: HashMap<String, EndpointTransferTotals>,
+        clients: BTreeSet<String>,
         now: SystemTime,
     ) {
         let endpoints_replaced = self.present
@@ -311,6 +351,9 @@ impl PeerTorrentHistory {
             self.uploaded_bytes = self.uploaded_bytes.saturating_add(uploaded_delta);
         }
         self.endpoint_transfers = endpoint_transfers;
+        if !clients.is_empty() {
+            self.clients = clients;
+        }
     }
 
     fn observe_absence(&mut self, now: SystemTime) {
@@ -360,11 +403,18 @@ impl PeerPolicyReducer {
     ) -> bool {
         let mut changed = false;
         let mut observed = HashMap::<IpAddr, HashMap<String, EndpointTransferTotals>>::new();
+        let mut observed_clients = HashMap::<IpAddr, BTreeSet<String>>::new();
 
         for peer in &metrics.peers {
             let Some(ip) = parse_peer_ip(&peer.address) else {
                 continue;
             };
+            if !peer.peer_id.is_empty() {
+                observed_clients
+                    .entry(ip)
+                    .or_default()
+                    .insert(parse_peer_client(&peer.peer_id));
+            }
             let endpoint_transfers = observed.entry(ip).or_default();
             let totals = endpoint_transfers.entry(peer.address.clone()).or_default();
             totals.downloaded = totals.downloaded.max(peer.total_downloaded);
@@ -384,7 +434,11 @@ impl PeerPolicyReducer {
 
             for (ip, endpoint_transfers) in observed {
                 let history = torrent_histories.entry(ip).or_default();
-                history.observe_presence(endpoint_transfers, now);
+                history.observe_presence(
+                    endpoint_transfers,
+                    observed_clients.remove(&ip).unwrap_or_default(),
+                    now,
+                );
 
                 let reason = if history.uploaded_bytes > transfer_limit {
                     Some(PeerRestrictionReason::ExcessiveUpload {
@@ -476,6 +530,7 @@ impl PeerPolicyReducer {
                     reconnect_limit: RECONNECT_LIMIT as u32,
                     reconnect_window_secs: RECONNECT_WINDOW.as_secs(),
                     last_seen: history.last_seen,
+                    clients: history.clients.iter().cloned().collect(),
                 });
             }
         }
@@ -1511,6 +1566,7 @@ mod tests {
             32 * MIB,
         );
         metrics.torrent_name = "Nebula Archive".to_string();
+        metrics.peers[0].peer_id = b"-ZZ1234-abcdefghijkl".to_vec();
         let mut reducer = PeerPolicyReducer::default();
 
         assert!(!reducer.reduce_metrics(&info_hash, &metrics, now));
@@ -1532,6 +1588,7 @@ mod tests {
         assert_eq!(tracked.reconnect_limit, RECONNECT_LIMIT as u32);
         assert_eq!(tracked.reconnect_window_secs, RECONNECT_WINDOW.as_secs());
         assert_eq!(tracked.last_seen, Some(now));
+        assert_eq!(tracked.clients, vec!["Unknown (ZZ1234)".to_string()]);
         assert_eq!(
             tracked.endpoints,
             vec![PeerManagerEndpointView {
@@ -1552,6 +1609,7 @@ mod tests {
         assert_eq!(tracked.last_seen, Some(now));
         assert_eq!(tracked.downloaded_evidence_bytes, 64 * MIB);
         assert_eq!(tracked.uploaded_evidence_bytes, 32 * MIB);
+        assert_eq!(tracked.clients, vec!["Unknown (ZZ1234)".to_string()]);
     }
 
     #[tokio::test]
@@ -1910,7 +1968,7 @@ mod tests {
             now,
         ));
         for reconnect in 1..RECONNECT_LIMIT {
-            let base = now + Duration::from_secs((reconnect as u64) * 2);
+            let base = now + Duration::from_secs(reconnect as u64);
             assert!(!reducer.reduce_metrics(
                 &info_hash,
                 &metrics_with_peer(&info_hash, torrent_size, "tcp://192.0.2.70:6000", 0),
@@ -1925,7 +1983,7 @@ mod tests {
         assert!(reducer.reduce_metrics(
             &info_hash,
             &metrics_with_peer(&info_hash, torrent_size, "tcp://192.0.2.70:6000", 0),
-            now + Duration::from_secs((RECONNECT_LIMIT as u64) * 2),
+            now + Duration::from_secs(RECONNECT_LIMIT as u64),
         ));
         assert!(reducer.policy().restrictions.contains_key(&ip));
     }
@@ -2304,7 +2362,7 @@ mod tests {
     }
 
     #[test]
-    fn seventh_connection_within_five_minutes_blocks_for_two_hours() {
+    fn eleventh_connection_within_ten_seconds_blocks_for_two_hours() {
         let mut reducer = PeerPolicyReducer::default();
         let info_hash = vec![3; 20];
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 30));
@@ -2317,7 +2375,7 @@ mod tests {
             now,
         ));
         for reconnect in 1..RECONNECT_LIMIT {
-            let offset = Duration::from_secs((reconnect as u64) * 2);
+            let offset = Duration::from_secs(reconnect as u64);
             assert!(!reducer.reduce_metrics(
                 &info_hash,
                 &metrics_with_peer(
@@ -2330,7 +2388,7 @@ mod tests {
             ));
         }
 
-        let final_offset = Duration::from_secs((RECONNECT_LIMIT as u64) * 2);
+        let final_offset = Duration::from_secs(RECONNECT_LIMIT as u64);
         assert!(reducer.reduce_metrics(
             &info_hash,
             &metrics_with_peer(&info_hash, torrent_size, "192.0.2.30:7000", 0),
@@ -2461,7 +2519,7 @@ mod tests {
             now,
         ));
         for reconnect in 1..=RECONNECT_LIMIT {
-            let offset = 1 + ((reconnect - 1) as u64 * 60);
+            let offset = 1 + ((reconnect - 1) as u64 * RECONNECT_WINDOW.as_secs());
             assert!(!reducer.reduce_metrics(
                 &info_hash,
                 &metrics_with_peer(

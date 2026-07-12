@@ -6,7 +6,9 @@ use crate::config::SortDirection;
 use crate::peer_manager::{PeerManagerTrackedPeer, PeerRestriction, PeerRestrictionReason};
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
-use crate::tui::formatters::{anonymize_preserving_shape, format_bytes, sanitize_text};
+use crate::tui::formatters::{
+    anonymize_preserving_shape, format_bytes, sanitize_text, truncate_with_ellipsis,
+};
 use crate::tui::layout::common::{compute_smart_table_layout, SmartCol};
 use crate::tui::layout::peers::{calculate_peer_screen_layout, PeerBodyLayout};
 use crate::tui::screen_context::ScreenContext;
@@ -16,9 +18,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
-use ratatui::widgets::{
-    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 use regex::RegexBuilder;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,6 +53,16 @@ pub enum PeerManagementAction {
     TogglePrivacy,
     ToggleDetails,
     CloseDetails,
+    ScrollDetailsUp,
+    ScrollDetailsDown,
+    ScrollDetailsPageUp,
+    ScrollDetailsPageDown,
+    StartDetailsSearch,
+    DetailsSearchInsert(char),
+    DetailsSearchBackspace,
+    DetailsSearchCommit,
+    DetailsSearchCancel,
+    ToggleDetailsSearchMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +81,7 @@ enum PeerColumnId {
     State,
     Address,
     Torrents,
+    Client,
     Evidence,
     LastSeen,
     Restriction,
@@ -123,16 +134,20 @@ impl PeerEvidence {
 }
 
 #[derive(Clone, Debug)]
-struct PeerRowModel {
+struct PeerRowModel<'a> {
     ip: IpAddr,
-    tracked: Vec<PeerManagerTrackedPeer>,
-    restriction: Option<PeerRestriction>,
+    tracked: Vec<&'a PeerManagerTrackedPeer>,
+    restriction: Option<&'a PeerRestriction>,
     torrent_count: usize,
+    is_active: bool,
+    last_seen: Option<SystemTime>,
+    strongest_evidence: PeerEvidence,
+    client_label: String,
 }
 
-impl PeerRowModel {
+impl PeerRowModel<'_> {
     fn is_active(&self) -> bool {
-        self.tracked.iter().any(|peer| peer.is_active)
+        self.is_active
     }
 
     fn is_restricted(&self) -> bool {
@@ -149,20 +164,29 @@ impl PeerRowModel {
         }
     }
 
-    fn last_seen(&self) -> Option<SystemTime> {
-        self.tracked.iter().filter_map(|peer| peer.last_seen).max()
+    fn state_sort_rank(&self) -> u8 {
+        if self.is_restricted() {
+            2
+        } else if self.is_active() {
+            1
+        } else {
+            0
+        }
     }
 
-    fn torrent_hashes(&self) -> BTreeSet<Vec<u8>> {
+    fn last_seen(&self) -> Option<SystemTime> {
+        self.last_seen
+    }
+
+    fn torrent_hashes(&self) -> BTreeSet<&[u8]> {
         let mut hashes = self
             .tracked
             .iter()
-            .map(|peer| peer.torrent_info_hash.clone())
+            .map(|peer| peer.torrent_info_hash.as_slice())
             .collect::<BTreeSet<_>>();
         if let Some(hash) = self
             .restriction
-            .as_ref()
-            .and_then(|restriction| restriction.torrent_info_hash.clone())
+            .and_then(|restriction| restriction.torrent_info_hash.as_deref())
         {
             hashes.insert(hash);
         }
@@ -177,25 +201,56 @@ impl PeerRowModel {
             .len()
     }
 
-    fn strongest_evidence(&self) -> PeerEvidence {
-        let mut candidates = self
-            .tracked
-            .iter()
-            .flat_map(tracked_peer_evidence)
-            .collect::<Vec<_>>();
-        if let Some(restriction) = &self.restriction {
-            candidates.push(restriction_evidence(&restriction.reason));
-        }
-        candidates
-            .into_iter()
-            .max_by(compare_evidence)
-            .unwrap_or(PeerEvidence {
-                kind: EvidenceKind::Reconnect,
-                observed: 0,
-                threshold: 0,
-                from_policy: false,
-            })
+    fn strongest_evidence(&self) -> &PeerEvidence {
+        &self.strongest_evidence
     }
+}
+
+fn strongest_peer_evidence(
+    tracked: &[&PeerManagerTrackedPeer],
+    restriction: Option<&PeerRestriction>,
+) -> PeerEvidence {
+    tracked
+        .iter()
+        .flat_map(|peer| tracked_peer_evidence(peer))
+        .chain(restriction.map(|restriction| restriction_evidence(&restriction.reason)))
+        .max_by(compare_evidence)
+        .unwrap_or(PeerEvidence {
+            kind: EvidenceKind::Reconnect,
+            observed: 0,
+            threshold: 0,
+            from_policy: false,
+        })
+}
+
+fn peer_client_label(tracked: &[&PeerManagerTrackedPeer]) -> String {
+    preferred_client_label(
+        tracked
+            .iter()
+            .flat_map(|peer| peer.clients.iter().map(String::as_str)),
+    )
+}
+
+fn preferred_client_label<'a>(clients: impl Iterator<Item = &'a str>) -> String {
+    let clients = clients.collect::<BTreeSet<_>>();
+    if clients.is_empty() {
+        return "Unknown".to_string();
+    }
+
+    let resolved = clients
+        .iter()
+        .copied()
+        .filter(|client| !is_unknown_client_label(client))
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        clients.into_iter().collect::<Vec<_>>().join(", ")
+    } else {
+        resolved.join(", ")
+    }
+}
+
+fn is_unknown_client_label(client: &str) -> bool {
+    client == "Unknown" || client.starts_with("Unknown (")
 }
 
 pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
@@ -224,6 +279,17 @@ fn map_key_to_peer_management_action(
     key_code: KeyCode,
     app_state: &AppState,
 ) -> Option<PeerManagementAction> {
+    if app_state.ui.peer_management.details_is_searching {
+        return match key_code {
+            KeyCode::Esc => Some(PeerManagementAction::DetailsSearchCancel),
+            KeyCode::Enter => Some(PeerManagementAction::DetailsSearchCommit),
+            KeyCode::Tab => Some(PeerManagementAction::ToggleDetailsSearchMode),
+            KeyCode::Backspace => Some(PeerManagementAction::DetailsSearchBackspace),
+            KeyCode::Char(c) => Some(PeerManagementAction::DetailsSearchInsert(c)),
+            _ => None,
+        };
+    }
+
     if app_state.ui.peer_management.is_searching {
         return match key_code {
             KeyCode::Esc => Some(PeerManagementAction::SearchCancel),
@@ -235,19 +301,43 @@ fn map_key_to_peer_management_action(
         };
     }
 
-    if peer_search_panel_active(app_state) && matches!(key_code, KeyCode::Esc) {
+    if peer_details_overlay_active(app_state)
+        && peer_details_search_panel_active(app_state)
+        && matches!(key_code, KeyCode::Esc)
+    {
+        return Some(PeerManagementAction::DetailsSearchCancel);
+    }
+
+    if peer_details_overlay_active(app_state)
+        && peer_details_search_panel_active(app_state)
+        && matches!(key_code, KeyCode::Tab)
+    {
+        return Some(PeerManagementAction::ToggleDetailsSearchMode);
+    }
+
+    if peer_table_search_panel_active(app_state) && matches!(key_code, KeyCode::Esc) {
         return Some(PeerManagementAction::SearchCancel);
     }
 
-    if peer_search_panel_active(app_state) && matches!(key_code, KeyCode::Tab) {
+    if peer_table_search_panel_active(app_state) && matches!(key_code, KeyCode::Tab) {
         return Some(PeerManagementAction::ToggleSearchMode);
+    }
+
+    if peer_details_overlay_active(app_state) {
+        return match key_code {
+            KeyCode::Esc | KeyCode::Enter => Some(PeerManagementAction::CloseDetails),
+            KeyCode::Char('q') => Some(PeerManagementAction::ToNormal),
+            KeyCode::Up | KeyCode::Char('k') => Some(PeerManagementAction::ScrollDetailsUp),
+            KeyCode::Down | KeyCode::Char('j') => Some(PeerManagementAction::ScrollDetailsDown),
+            KeyCode::PageUp => Some(PeerManagementAction::ScrollDetailsPageUp),
+            KeyCode::PageDown => Some(PeerManagementAction::ScrollDetailsPageDown),
+            KeyCode::Char('/') => Some(PeerManagementAction::StartDetailsSearch),
+            _ => None,
+        };
     }
 
     match key_code {
         KeyCode::Char('q') => Some(PeerManagementAction::ToNormal),
-        KeyCode::Esc if peer_details_overlay_active(app_state) => {
-            Some(PeerManagementAction::CloseDetails)
-        }
         KeyCode::Esc => Some(PeerManagementAction::ToNormal),
         KeyCode::Up | KeyCode::Char('k') => Some(PeerManagementAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(PeerManagementAction::MoveDown),
@@ -285,31 +375,35 @@ pub fn reduce_peer_management_action(
             app_state.ui.peer_management.is_searching = false;
             app_state.ui.peer_management.search_query.clear();
             app_state.ui.peer_management.show_details = false;
+            app_state.ui.peer_management.details_peer_ip = None;
+            app_state.ui.peer_management.details_scroll_offset = 0;
+            app_state.ui.peer_management.details_is_searching = false;
+            app_state.ui.peer_management.details_search_query.clear();
             result.effects.push(PeerManagementEffect::ToNormal);
         }
         PeerManagementAction::MoveUp => {
-            let rows = build_peer_rows_at(app_state, now);
-            move_peer_selection(app_state, &rows, -1);
+            let row_count = build_peer_rows_at(app_state, now).len();
+            move_peer_selection(app_state, row_count, -1);
         }
         PeerManagementAction::MoveDown => {
-            let rows = build_peer_rows_at(app_state, now);
-            move_peer_selection(app_state, &rows, 1);
+            let row_count = build_peer_rows_at(app_state, now).len();
+            move_peer_selection(app_state, row_count, 1);
         }
         PeerManagementAction::MovePageUp => {
-            let rows = build_peer_rows_at(app_state, now);
-            move_peer_selection(app_state, &rows, -(peer_page_rows(app_state) as isize));
+            let row_count = build_peer_rows_at(app_state, now).len();
+            move_peer_selection(app_state, row_count, -(peer_page_rows(app_state) as isize));
         }
         PeerManagementAction::MovePageDown => {
-            let rows = build_peer_rows_at(app_state, now);
-            move_peer_selection(app_state, &rows, peer_page_rows(app_state) as isize);
+            let row_count = build_peer_rows_at(app_state, now).len();
+            move_peer_selection(app_state, row_count, peer_page_rows(app_state) as isize);
         }
         PeerManagementAction::MoveFirst => {
-            let rows = build_peer_rows_at(app_state, now);
-            select_peer_index(app_state, &rows, 0);
+            let row_count = build_peer_rows_at(app_state, now).len();
+            select_peer_index(app_state, row_count, 0);
         }
         PeerManagementAction::MoveLast => {
-            let rows = build_peer_rows_at(app_state, now);
-            select_peer_index(app_state, &rows, rows.len().saturating_sub(1));
+            let row_count = build_peer_rows_at(app_state, now).len();
+            select_peer_index(app_state, row_count, row_count.saturating_sub(1));
         }
         PeerManagementAction::MoveColumnLeft => move_peer_column(app_state, -1),
         PeerManagementAction::MoveColumnRight => move_peer_column(app_state, 1),
@@ -370,10 +464,93 @@ pub fn reduce_peer_management_action(
             }
         }
         PeerManagementAction::ToggleDetails => {
-            app_state.ui.peer_management.show_details = !app_state.ui.peer_management.show_details;
+            if app_state.ui.peer_management.show_details {
+                app_state.ui.peer_management.show_details = false;
+                app_state.ui.peer_management.details_peer_ip = None;
+            } else {
+                let rows = build_peer_rows_at(app_state, now);
+                app_state.ui.peer_management.details_peer_ip =
+                    selected_peer_row(app_state, &rows).map(|row| row.ip);
+                app_state.ui.peer_management.show_details =
+                    app_state.ui.peer_management.details_peer_ip.is_some();
+            }
+            app_state.ui.peer_management.details_scroll_offset = 0;
+            app_state.ui.peer_management.details_is_searching = false;
+            app_state.ui.peer_management.details_search_query.clear();
         }
         PeerManagementAction::CloseDetails => {
             app_state.ui.peer_management.show_details = false;
+            app_state.ui.peer_management.details_peer_ip = None;
+            app_state.ui.peer_management.details_scroll_offset = 0;
+            app_state.ui.peer_management.details_is_searching = false;
+            app_state.ui.peer_management.details_search_query.clear();
+        }
+        PeerManagementAction::ScrollDetailsUp => {
+            let max_scroll = peer_details_max_scroll_at(app_state, now);
+            app_state.ui.peer_management.details_scroll_offset = app_state
+                .ui
+                .peer_management
+                .details_scroll_offset
+                .min(max_scroll)
+                .saturating_sub(1);
+        }
+        PeerManagementAction::ScrollDetailsDown => {
+            let max_scroll = peer_details_max_scroll_at(app_state, now);
+            app_state.ui.peer_management.details_scroll_offset = app_state
+                .ui
+                .peer_management
+                .details_scroll_offset
+                .min(max_scroll)
+                .saturating_add(1)
+                .min(max_scroll);
+        }
+        PeerManagementAction::ScrollDetailsPageUp => {
+            let page = peer_details_page_rows(app_state);
+            let max_scroll = peer_details_max_scroll_at(app_state, now);
+            app_state.ui.peer_management.details_scroll_offset = app_state
+                .ui
+                .peer_management
+                .details_scroll_offset
+                .min(max_scroll)
+                .saturating_sub(page);
+        }
+        PeerManagementAction::ScrollDetailsPageDown => {
+            let page = peer_details_page_rows(app_state);
+            let max_scroll = peer_details_max_scroll_at(app_state, now);
+            app_state.ui.peer_management.details_scroll_offset = app_state
+                .ui
+                .peer_management
+                .details_scroll_offset
+                .min(max_scroll)
+                .saturating_add(page)
+                .min(max_scroll);
+        }
+        PeerManagementAction::StartDetailsSearch => {
+            app_state.ui.peer_management.details_is_searching = true;
+        }
+        PeerManagementAction::DetailsSearchInsert(c) => {
+            app_state.ui.peer_management.details_search_query.push(c);
+            app_state.ui.peer_management.details_scroll_offset = 0;
+        }
+        PeerManagementAction::DetailsSearchBackspace => {
+            app_state.ui.peer_management.details_search_query.pop();
+            app_state.ui.peer_management.details_scroll_offset = 0;
+        }
+        PeerManagementAction::DetailsSearchCommit => {
+            app_state.ui.peer_management.details_is_searching = false;
+        }
+        PeerManagementAction::DetailsSearchCancel => {
+            app_state.ui.peer_management.details_is_searching = false;
+            app_state.ui.peer_management.details_search_query.clear();
+            app_state.ui.peer_management.details_scroll_offset = 0;
+        }
+        PeerManagementAction::ToggleDetailsSearchMode => {
+            app_state.ui.peer_management.details_search_mode =
+                match app_state.ui.peer_management.details_search_mode {
+                    SearchMode::Fuzzy => SearchMode::Regex,
+                    SearchMode::Regex => SearchMode::Fuzzy,
+                };
+            app_state.ui.peer_management.details_scroll_offset = 0;
         }
     }
 
@@ -394,7 +571,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let ctx = screen.theme;
     let area = f.area();
     let now = SystemTime::now();
-    let search_visible = peer_search_panel_active(app_state);
+    let search_visible = active_peer_search_panel_active(app_state);
     let layout = calculate_peer_screen_layout(
         area,
         search_visible,
@@ -409,17 +586,6 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     draw_peer_summary(f, app_state, layout.summary, rows.len(), now, ctx);
 
     match layout.body {
-        PeerBodyLayout::Wide { table, details } | PeerBodyLayout::Stacked { table, details } => {
-            draw_peer_table(f, app_state, &rows, table, now, ctx);
-            draw_peer_details(
-                f,
-                app_state,
-                selected_peer_row(app_state, &rows),
-                details,
-                now,
-                ctx,
-            );
-        }
         PeerBodyLayout::TableOnly { table } => {
             draw_peer_table(f, app_state, &rows, table, now, ctx);
         }
@@ -427,7 +593,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             draw_peer_details(
                 f,
                 app_state,
-                selected_peer_row(app_state, &rows),
+                pinned_peer_detail_row(app_state, &rows),
                 details,
                 now,
                 ctx,
@@ -437,11 +603,11 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     draw_peer_footer(f, app_state, layout.footer, ctx);
 }
 
-fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel> {
+fn build_peer_rows_at<'a>(app_state: &'a AppState, now: SystemTime) -> Vec<PeerRowModel<'a>> {
     #[cfg(test)]
     PEER_ROW_BUILD_COUNT.with(|count| count.set(count.get().saturating_add(1)));
 
-    let mut by_ip = BTreeMap::<IpAddr, PeerRowModel>::new();
+    let mut by_ip = BTreeMap::<IpAddr, PeerRowModel<'a>>::new();
     for tracked in &app_state.peer_manager_view.tracked_peers {
         let ip = normalize_peer_ip(tracked.ip);
         by_ip
@@ -451,10 +617,15 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
                 tracked: Vec::new(),
                 restriction: None,
                 torrent_count: 0,
+                is_active: false,
+                last_seen: None,
+                strongest_evidence: strongest_peer_evidence(&[], None),
+                client_label: String::new(),
             })
             .tracked
-            .push(tracked.clone());
+            .push(tracked);
     }
+
     for (policy_ip, restriction) in &app_state.peer_policy.restrictions {
         if restriction.blocked_until <= now {
             continue;
@@ -465,13 +636,16 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
             tracked: Vec::new(),
             restriction: None,
             torrent_count: 0,
+            is_active: false,
+            last_seen: None,
+            strongest_evidence: strongest_peer_evidence(&[], None),
+            client_label: String::new(),
         });
         if row
             .restriction
-            .as_ref()
             .is_none_or(|current| restriction.blocked_until > current.blocked_until)
         {
-            row.restriction = Some(restriction.clone());
+            row.restriction = Some(restriction);
         }
     }
 
@@ -483,12 +657,19 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
                 .then_with(|| left.torrent_info_hash.cmp(&right.torrent_info_hash))
         });
         row.torrent_count = row.torrent_hashes().len();
+        row.is_active = row.tracked.iter().any(|peer| peer.is_active);
+        row.last_seen = row.tracked.iter().filter_map(|peer| peer.last_seen).max();
+        row.strongest_evidence = strongest_peer_evidence(&row.tracked, row.restriction);
+        row.client_label = peer_client_label(&row.tracked);
     }
+
     rows.retain(|row| peer_matches_filter(row, app_state.ui.peer_management.filter));
+
     let search = PeerSearchMatcher::new(app_state);
     if !matches!(&search, PeerSearchMatcher::MatchAll) {
         rows.retain(|row| search.matches(&peer_search_text(row, app_state)));
     }
+
     sort_peer_rows(app_state, &mut rows);
     rows
 }
@@ -500,7 +681,7 @@ fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn peer_matches_filter(row: &PeerRowModel, filter: PeerManagementFilter) -> bool {
+fn peer_matches_filter(row: &PeerRowModel<'_>, filter: PeerManagementFilter) -> bool {
     match filter {
         PeerManagementFilter::All => true,
         PeerManagementFilter::Active => row.is_active() && !row.is_restricted(),
@@ -521,11 +702,25 @@ enum PeerSearchMatcher {
 
 impl PeerSearchMatcher {
     fn new(app_state: &AppState) -> Self {
-        let query = app_state.ui.peer_management.search_query.trim();
+        Self::from_query(
+            &app_state.ui.peer_management.search_query,
+            app_state.ui.peer_management.search_mode,
+        )
+    }
+
+    fn details(app_state: &AppState) -> Self {
+        Self::from_query(
+            &app_state.ui.peer_management.details_search_query,
+            app_state.ui.peer_management.details_search_mode,
+        )
+    }
+
+    fn from_query(query: &str, mode: SearchMode) -> Self {
+        let query = query.trim();
         if query.is_empty() {
             return Self::MatchAll;
         }
-        match app_state.ui.peer_management.search_mode {
+        match mode {
             SearchMode::Fuzzy => Self::Fuzzy {
                 query: query.to_string(),
                 matcher: Box::new(SkimMatcherV2::default().ignore_case()),
@@ -547,8 +742,12 @@ impl PeerSearchMatcher {
     }
 }
 
-fn peer_search_text(row: &PeerRowModel, app_state: &AppState) -> String {
-    let mut fields = vec![row.ip.to_string(), row.state_label().to_string()];
+fn peer_search_text(row: &PeerRowModel<'_>, app_state: &AppState) -> String {
+    let mut fields = vec![
+        row.ip.to_string(),
+        row.state_label().to_string(),
+        row.client_label.clone(),
+    ];
     for tracked in &row.tracked {
         fields.push(tracked.torrent_name.clone());
         fields.push(hex::encode(&tracked.torrent_info_hash));
@@ -667,8 +866,8 @@ fn evidence_ratio_parts(evidence: &PeerEvidence) -> (u128, u128) {
     }
 }
 
-fn peer_columns() -> Vec<PeerColumnDefinition> {
-    vec![
+fn peer_columns() -> &'static [PeerColumnDefinition] {
+    static COLUMNS: [PeerColumnDefinition; 7] = [
         PeerColumnDefinition {
             id: PeerColumnId::State,
             header: "State",
@@ -691,6 +890,13 @@ fn peer_columns() -> Vec<PeerColumnDefinition> {
             constraint: Constraint::Length(10),
         },
         PeerColumnDefinition {
+            id: PeerColumnId::Client,
+            header: "Client",
+            min_width: 18,
+            priority: 2,
+            constraint: Constraint::Length(18),
+        },
+        PeerColumnDefinition {
             id: PeerColumnId::Evidence,
             header: "Evidence",
             min_width: 15,
@@ -711,7 +917,8 @@ fn peer_columns() -> Vec<PeerColumnDefinition> {
             priority: 1,
             constraint: Constraint::Length(12),
         },
-    ]
+    ];
+    &COLUMNS
 }
 
 fn compute_visible_peer_management_columns(available_width: u16) -> (Vec<Constraint>, Vec<usize>) {
@@ -735,32 +942,17 @@ fn peer_table_width_for_state(app_state: &AppState) -> u16 {
     };
     let layout = calculate_peer_screen_layout(
         area,
-        peer_search_panel_active(app_state),
+        active_peer_search_panel_active(app_state),
         app_state.ui.peer_management.show_details,
     );
     match layout.body {
-        PeerBodyLayout::Wide { table, .. }
-        | PeerBodyLayout::Stacked { table, .. }
-        | PeerBodyLayout::TableOnly { table } => table.width,
+        PeerBodyLayout::TableOnly { table } => table.width,
         PeerBodyLayout::DetailsOnly { details } => details.width,
     }
 }
 
-fn peer_uses_details_overlay(app_state: &AppState) -> bool {
-    let area = if app_state.screen_area.width == 0 {
-        Rect::new(0, 0, 140, 36)
-    } else {
-        app_state.screen_area
-    };
-    matches!(
-        calculate_peer_screen_layout(
-            area,
-            peer_search_panel_active(app_state),
-            app_state.ui.peer_management.show_details,
-        )
-        .body,
-        PeerBodyLayout::TableOnly { .. } | PeerBodyLayout::DetailsOnly { .. }
-    )
+fn peer_uses_details_overlay(_app_state: &AppState) -> bool {
+    true
 }
 
 fn peer_details_overlay_active(app_state: &AppState) -> bool {
@@ -843,7 +1035,7 @@ fn reverse_sort_direction(direction: SortDirection) -> SortDirection {
 
 fn peer_column_default_direction(column: PeerColumnId) -> SortDirection {
     match column {
-        PeerColumnId::Address => SortDirection::Ascending,
+        PeerColumnId::Address | PeerColumnId::Client => SortDirection::Ascending,
         PeerColumnId::State
         | PeerColumnId::Torrents
         | PeerColumnId::Evidence
@@ -860,20 +1052,28 @@ fn peer_sort_column(app_state: &AppState) -> Option<PeerColumnId> {
         .and_then(|index| peer_columns().get(index).map(|column| column.id))
 }
 
-fn sort_peer_rows(app_state: &AppState, rows: &mut [PeerRowModel]) {
-    rows.sort_by(|left, right| compare_peer_rows(app_state, left, right));
+fn sort_peer_rows(app_state: &AppState, rows: &mut [PeerRowModel<'_>]) {
+    let column = peer_sort_column(app_state);
+    let direction = app_state.ui.peer_management.sort_direction;
+    rows.sort_by(|left, right| compare_peer_rows(column, direction, left, right));
 }
 
-fn compare_peer_rows(app_state: &AppState, left: &PeerRowModel, right: &PeerRowModel) -> Ordering {
-    let Some(column) = peer_sort_column(app_state) else {
+fn compare_peer_rows(
+    column: Option<PeerColumnId>,
+    direction: SortDirection,
+    left: &PeerRowModel<'_>,
+    right: &PeerRowModel<'_>,
+) -> Ordering {
+    let Some(column) = column else {
         return default_peer_order(left, right);
     };
     let ordering = match column {
-        PeerColumnId::State => default_peer_order_values(left, right),
+        PeerColumnId::State => left.state_sort_rank().cmp(&right.state_sort_rank()),
         PeerColumnId::Address => left.ip.cmp(&right.ip),
         PeerColumnId::Torrents => left.torrent_count.cmp(&right.torrent_count),
+        PeerColumnId::Client => left.client_label.cmp(&right.client_label),
         PeerColumnId::Evidence => {
-            compare_evidence_ratio(&left.strongest_evidence(), &right.strongest_evidence())
+            compare_evidence_ratio(left.strongest_evidence(), right.strongest_evidence())
         }
         PeerColumnId::LastSeen => left.last_seen().cmp(&right.last_seen()),
         PeerColumnId::Restriction => left
@@ -887,22 +1087,27 @@ fn compare_peer_rows(app_state: &AppState, left: &PeerRowModel, right: &PeerRowM
                     .map(|restriction| restriction.blocked_until),
             ),
     };
-    apply_sort_direction(ordering, app_state.ui.peer_management.sort_direction)
+    apply_sort_direction(ordering, direction)
+        .then_with(|| {
+            if matches!(column, PeerColumnId::LastSeen) {
+                Ordering::Equal
+            } else {
+                right.last_seen().cmp(&left.last_seen())
+            }
+        })
         .then_with(|| left.ip.cmp(&right.ip))
 }
 
-fn default_peer_order(left: &PeerRowModel, right: &PeerRowModel) -> Ordering {
+fn default_peer_order(left: &PeerRowModel<'_>, right: &PeerRowModel<'_>) -> Ordering {
     default_peer_order_values(left, right)
         .reverse()
         .then_with(|| left.ip.cmp(&right.ip))
 }
 
-fn default_peer_order_values(left: &PeerRowModel, right: &PeerRowModel) -> Ordering {
+fn default_peer_order_values(left: &PeerRowModel<'_>, right: &PeerRowModel<'_>) -> Ordering {
     left.is_restricted()
         .cmp(&right.is_restricted())
-        .then_with(|| {
-            compare_evidence_ratio(&left.strongest_evidence(), &right.strongest_evidence())
-        })
+        .then_with(|| compare_evidence_ratio(left.strongest_evidence(), right.strongest_evidence()))
         .then_with(|| left.is_active().cmp(&right.is_active()))
         .then_with(|| left.last_seen().cmp(&right.last_seen()))
 }
@@ -917,43 +1122,58 @@ fn apply_sort_direction(ordering: Ordering, direction: SortDirection) -> Orderin
 fn reset_peer_selection(app_state: &mut AppState) {
     app_state.ui.peer_management.selected_index = 0;
     app_state.ui.peer_management.show_details = false;
+    app_state.ui.peer_management.details_peer_ip = None;
+    app_state.ui.peer_management.details_scroll_offset = 0;
+    app_state.ui.peer_management.details_is_searching = false;
+    app_state.ui.peer_management.details_search_query.clear();
 }
 
-fn reconcile_peer_selection(app_state: &mut AppState, rows: &[PeerRowModel]) {
-    if rows.is_empty() {
+fn reconcile_peer_selection(app_state: &mut AppState, row_count: usize) {
+    if row_count == 0 {
         app_state.ui.peer_management.selected_index = 0;
         app_state.ui.peer_management.show_details = false;
+        app_state.ui.peer_management.details_peer_ip = None;
+        app_state.ui.peer_management.details_scroll_offset = 0;
+        app_state.ui.peer_management.details_is_searching = false;
+        app_state.ui.peer_management.details_search_query.clear();
         return;
     }
     app_state.ui.peer_management.selected_index = app_state
         .ui
         .peer_management
         .selected_index
-        .min(rows.len() - 1);
+        .min(row_count - 1);
 }
 
-fn move_peer_selection(app_state: &mut AppState, rows: &[PeerRowModel], delta: isize) {
-    if rows.is_empty() {
-        reconcile_peer_selection(app_state, rows);
+fn move_peer_selection(app_state: &mut AppState, row_count: usize, delta: isize) {
+    if row_count == 0 {
+        reconcile_peer_selection(app_state, row_count);
         return;
     }
-    reconcile_peer_selection(app_state, rows);
-    let current = selected_peer_index(app_state, rows).unwrap_or(0);
+    reconcile_peer_selection(app_state, row_count);
+    let current = app_state.ui.peer_management.selected_index;
     let next = current
         .saturating_add_signed(delta)
-        .min(rows.len().saturating_sub(1));
+        .min(row_count.saturating_sub(1));
+    if next != current {
+        app_state.ui.peer_management.details_scroll_offset = 0;
+    }
     app_state.ui.peer_management.selected_index = next;
 }
 
-fn select_peer_index(app_state: &mut AppState, rows: &[PeerRowModel], index: usize) {
-    if rows.is_empty() {
-        reconcile_peer_selection(app_state, rows);
+fn select_peer_index(app_state: &mut AppState, row_count: usize, index: usize) {
+    if row_count == 0 {
+        reconcile_peer_selection(app_state, row_count);
         return;
     }
-    app_state.ui.peer_management.selected_index = index.min(rows.len() - 1);
+    let next = index.min(row_count - 1);
+    if next != app_state.ui.peer_management.selected_index {
+        app_state.ui.peer_management.details_scroll_offset = 0;
+    }
+    app_state.ui.peer_management.selected_index = next;
 }
 
-fn selected_peer_index(app_state: &AppState, rows: &[PeerRowModel]) -> Option<usize> {
+fn selected_peer_index(app_state: &AppState, rows: &[PeerRowModel<'_>]) -> Option<usize> {
     if rows.is_empty() {
         return None;
     }
@@ -966,11 +1186,19 @@ fn selected_peer_index(app_state: &AppState, rows: &[PeerRowModel]) -> Option<us
     )
 }
 
-fn selected_peer_row<'a>(
+fn selected_peer_row<'a, 'state>(
     app_state: &AppState,
-    rows: &'a [PeerRowModel],
-) -> Option<&'a PeerRowModel> {
+    rows: &'a [PeerRowModel<'state>],
+) -> Option<&'a PeerRowModel<'state>> {
     selected_peer_index(app_state, rows).and_then(|index| rows.get(index))
+}
+
+fn pinned_peer_detail_row<'a, 'state>(
+    app_state: &AppState,
+    rows: &'a [PeerRowModel<'state>],
+) -> Option<&'a PeerRowModel<'state>> {
+    let ip = app_state.ui.peer_management.details_peer_ip?;
+    rows.iter().find(|row| row.ip == ip)
 }
 
 fn peer_page_rows(app_state: &AppState) -> usize {
@@ -981,30 +1209,148 @@ fn peer_page_rows(app_state: &AppState) -> usize {
     };
     let layout = calculate_peer_screen_layout(
         area,
-        peer_search_panel_active(app_state),
+        active_peer_search_panel_active(app_state),
         app_state.ui.peer_management.show_details,
     );
     let table_height = match layout.body {
-        PeerBodyLayout::Wide { table, .. }
-        | PeerBodyLayout::Stacked { table, .. }
-        | PeerBodyLayout::TableOnly { table } => table.height,
+        PeerBodyLayout::TableOnly { table } => table.height,
         PeerBodyLayout::DetailsOnly { details } => details.height,
     };
     table_height.saturating_sub(3).max(1) as usize
 }
 
-fn peer_search_panel_active(app_state: &AppState) -> bool {
+fn peer_details_area_for_state(app_state: &AppState) -> Option<Rect> {
+    let area = if app_state.screen_area.width == 0 || app_state.screen_area.height == 0 {
+        Rect::new(0, 0, 140, 36)
+    } else {
+        app_state.screen_area
+    };
+    match calculate_peer_screen_layout(
+        area,
+        active_peer_search_panel_active(app_state),
+        app_state.ui.peer_management.show_details,
+    )
+    .body
+    {
+        PeerBodyLayout::DetailsOnly { details } => Some(details),
+        PeerBodyLayout::TableOnly { .. } => None,
+    }
+}
+
+fn peer_details_inner_area(area: Rect) -> Rect {
+    Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::new(1, 1, 0, 0))
+        .inner(area)
+}
+
+fn peer_details_content_height(line_count: usize, inner_height: u16) -> usize {
+    let height = usize::from(inner_height);
+    if line_count > height {
+        height.saturating_sub(1)
+    } else {
+        height
+    }
+}
+
+fn tracked_peer_detail_line_count(peer: &PeerManagerTrackedPeer) -> usize {
+    if peer.endpoints.is_empty() {
+        7
+    } else {
+        7 + peer.endpoints.len()
+    }
+}
+
+fn matching_detail_torrents<'peer>(
+    app_state: &AppState,
+    row: &PeerRowModel<'peer>,
+) -> Vec<&'peer PeerManagerTrackedPeer> {
+    let matcher = PeerSearchMatcher::details(app_state);
+    row.tracked
+        .iter()
+        .copied()
+        .filter(|peer| matcher.matches(&peer.torrent_name))
+        .collect()
+}
+
+fn peer_detail_line_count(app_state: &AppState, row: &PeerRowModel<'_>) -> usize {
+    let header_and_policy = if row.restriction.is_some() { 8 } else { 4 };
+    if row.tracked.is_empty() {
+        return header_and_policy + 2;
+    }
+    let matching = matching_detail_torrents(app_state, row);
+    if matching.is_empty() {
+        return header_and_policy + 3;
+    }
+    header_and_policy
+        + 2
+        + matching
+            .iter()
+            .map(|peer| tracked_peer_detail_line_count(peer))
+            .sum::<usize>()
+        + matching.len().saturating_sub(1)
+}
+
+fn peer_details_max_scroll_at(app_state: &AppState, now: SystemTime) -> usize {
+    let Some(area) = peer_details_area_for_state(app_state) else {
+        return 0;
+    };
+    let rows = build_peer_rows_at(app_state, now);
+    let Some(row) = pinned_peer_detail_row(app_state, &rows) else {
+        return 0;
+    };
+    let line_count = peer_detail_line_count(app_state, row);
+    let inner = peer_details_inner_area(area);
+    line_count.saturating_sub(peer_details_content_height(line_count, inner.height))
+}
+
+fn peer_details_page_rows(app_state: &AppState) -> usize {
+    let Some(area) = peer_details_area_for_state(app_state) else {
+        return 1;
+    };
+    usize::from(peer_details_inner_area(area).height)
+        .saturating_sub(2)
+        .max(1)
+}
+
+fn peer_table_search_panel_active(app_state: &AppState) -> bool {
     app_state.ui.peer_management.is_searching
         || !app_state.ui.peer_management.search_query.is_empty()
 }
 
+fn peer_details_search_panel_active(app_state: &AppState) -> bool {
+    app_state.ui.peer_management.details_is_searching
+        || !app_state.ui.peer_management.details_search_query.is_empty()
+}
+
+fn active_peer_search_panel_active(app_state: &AppState) -> bool {
+    if peer_details_overlay_active(app_state) {
+        peer_details_search_panel_active(app_state)
+    } else {
+        peer_table_search_panel_active(app_state)
+    }
+}
+
 fn draw_peer_search_panel(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &ThemeContext) {
+    let (title, query, mode) = if peer_details_overlay_active(app_state) {
+        (
+            " Torrent Search ",
+            app_state.ui.peer_management.details_search_query.as_str(),
+            app_state.ui.peer_management.details_search_mode,
+        )
+    } else {
+        (
+            " Peer Search ",
+            app_state.ui.peer_management.search_query.as_str(),
+            app_state.ui.peer_management.search_mode,
+        )
+    };
     draw_prompt_panel(
         f,
         area,
-        " Peer Search ".to_string(),
-        sanitize_text(&app_state.ui.peer_management.search_query),
-        peer_search_mode_spans(app_state.ui.peer_management.search_mode, ctx),
+        title.to_string(),
+        sanitize_text(query),
+        peer_search_mode_spans(mode, ctx),
         ctx,
     );
 }
@@ -1110,8 +1456,8 @@ fn draw_peer_summary(
             ctx.apply(Style::default().fg(ctx.state_warning()).bold()),
         ));
     }
-    if let Some(message) =
-        peer_search_error(app_state).or_else(|| app_state.ui.peer_management.status_message.clone())
+    if let Some(message) = active_peer_search_error(app_state)
+        .or_else(|| app_state.ui.peer_management.status_message.clone())
     {
         count_spans.push(Span::styled(
             format!("  |  {}", sanitize_text(&message)),
@@ -1152,8 +1498,30 @@ fn draw_peer_summary(
 }
 
 fn peer_search_error(app_state: &AppState) -> Option<String> {
-    let query = app_state.ui.peer_management.search_query.trim();
-    if query.is_empty() || !matches!(app_state.ui.peer_management.search_mode, SearchMode::Regex) {
+    search_error(
+        &app_state.ui.peer_management.search_query,
+        app_state.ui.peer_management.search_mode,
+    )
+}
+
+fn peer_details_search_error(app_state: &AppState) -> Option<String> {
+    search_error(
+        &app_state.ui.peer_management.details_search_query,
+        app_state.ui.peer_management.details_search_mode,
+    )
+}
+
+fn active_peer_search_error(app_state: &AppState) -> Option<String> {
+    if peer_details_overlay_active(app_state) {
+        peer_details_search_error(app_state)
+    } else {
+        peer_search_error(app_state)
+    }
+}
+
+fn search_error(query: &str, mode: SearchMode) -> Option<String> {
+    let query = query.trim();
+    if query.is_empty() || !matches!(mode, SearchMode::Regex) {
         return None;
     }
     RegexBuilder::new(query)
@@ -1166,7 +1534,7 @@ fn peer_search_error(app_state: &AppState) -> Option<String> {
 fn draw_peer_table(
     f: &mut Frame,
     app_state: &AppState,
-    rows: &[PeerRowModel],
+    rows: &[PeerRowModel<'_>],
     area: Rect,
     now: SystemTime,
     ctx: &ThemeContext,
@@ -1203,20 +1571,15 @@ fn draw_peer_table(
             })
             .collect::<Vec<_>>(),
     );
-    let table_rows = rows
+    let selected_index = selected_peer_index(app_state, rows);
+    let viewport = peer_table_viewport(rows.len(), selected_index, area.height);
+    let table_rows = rows[viewport.clone()]
         .iter()
         .map(|row| peer_table_row(app_state, row, &visible, now, ctx))
         .collect::<Vec<_>>();
     let table = Table::new(table_rows, constraints)
         .header(header)
-        .row_highlight_style(
-            ctx.apply(
-                Style::default()
-                    .fg(ctx.theme.semantic.text)
-                    .bg(ctx.theme.semantic.surface0)
-                    .bold(),
-            ),
-        )
+        .row_highlight_style(peer_row_highlight_style(ctx))
         .block(
             Block::default()
                 .title(Span::styled(
@@ -1228,7 +1591,7 @@ fn draw_peer_table(
                 .padding(Padding::horizontal(1)),
         );
     let mut table_state = TableState::default();
-    table_state.select(selected_peer_index(app_state, rows));
+    table_state.select(selected_index.map(|selected| selected.saturating_sub(viewport.start)));
     f.render_stateful_widget(table, area, &mut table_state);
 
     if rows.is_empty() {
@@ -1253,9 +1616,30 @@ fn draw_peer_table(
     }
 }
 
+fn peer_row_highlight_style(ctx: &ThemeContext) -> Style {
+    ctx.apply(Style::default().fg(ctx.state_warning()).bold())
+}
+
+fn peer_table_viewport(
+    row_count: usize,
+    selected_index: Option<usize>,
+    area_height: u16,
+) -> std::ops::Range<usize> {
+    if row_count == 0 {
+        return 0..0;
+    }
+
+    let capacity = usize::from(area_height.saturating_sub(3).max(1));
+    let selected = selected_index.unwrap_or(0).min(row_count - 1);
+    let start = selected
+        .saturating_sub(capacity.saturating_sub(1))
+        .min(row_count.saturating_sub(capacity));
+    start..start.saturating_add(capacity).min(row_count)
+}
+
 fn peer_table_row<'a>(
     app_state: &AppState,
-    row: &PeerRowModel,
+    row: &PeerRowModel<'_>,
     visible: &[usize],
     now: SystemTime,
     ctx: &ThemeContext,
@@ -1269,6 +1653,7 @@ fn peer_table_row<'a>(
                 Cell::from(display_ip(row.ip, app_state.anonymize_torrent_names))
             }
             PeerColumnId::Torrents => Cell::from(peer_torrents_label(row)),
+            PeerColumnId::Client => Cell::from(sanitize_text(&row.client_label)),
             PeerColumnId::Evidence => Cell::from(row.strongest_evidence().compact_label()),
             PeerColumnId::LastSeen => Cell::from(
                 row.last_seen()
@@ -1292,7 +1677,7 @@ fn peer_table_row<'a>(
     })
 }
 
-fn peer_state_style(row: &PeerRowModel, ctx: &ThemeContext) -> Style {
+fn peer_state_style(row: &PeerRowModel<'_>, ctx: &ThemeContext) -> Style {
     if row.is_restricted() {
         ctx.apply(Style::default().fg(ctx.state_error()).bold())
     } else if row.is_active() {
@@ -1307,6 +1692,7 @@ fn peer_column_header_color(column: PeerColumnId, ctx: &ThemeContext) -> Color {
         PeerColumnId::State => ctx.state_success(),
         PeerColumnId::Address => ctx.accent_sky(),
         PeerColumnId::Torrents => ctx.accent_teal(),
+        PeerColumnId::Client => ctx.accent_sapphire(),
         PeerColumnId::Evidence => ctx.state_warning(),
         PeerColumnId::LastSeen => ctx.state_info(),
         PeerColumnId::Restriction => ctx.state_error(),
@@ -1320,13 +1706,13 @@ fn peer_sort_arrow(direction: SortDirection) -> &'static str {
     }
 }
 
-fn peer_torrents_label(row: &PeerRowModel) -> String {
+fn peer_torrents_label(row: &PeerRowModel<'_>) -> String {
     row.torrent_count.to_string()
 }
 
 fn torrent_name_for_hash<'a>(
     app_state: &'a AppState,
-    row: &'a PeerRowModel,
+    row: &PeerRowModel<'a>,
     hash: &[u8],
 ) -> Option<&'a str> {
     row.tracked
@@ -1341,7 +1727,7 @@ fn torrent_name_for_hash<'a>(
         })
 }
 
-fn torrent_label_for_hash(app_state: &AppState, row: &PeerRowModel, hash: &[u8]) -> String {
+fn torrent_label_for_hash(app_state: &AppState, row: &PeerRowModel<'_>, hash: &[u8]) -> String {
     let name = torrent_name_for_hash(app_state, row, hash);
     let Some(name) = name else {
         return short_info_hash(hash, app_state.anonymize_torrent_names);
@@ -1352,7 +1738,7 @@ fn torrent_label_for_hash(app_state: &AppState, row: &PeerRowModel, hash: &[u8])
 fn draw_peer_details(
     f: &mut Frame,
     app_state: &AppState,
-    row: Option<&PeerRowModel>,
+    row: Option<&PeerRowModel<'_>>,
     area: Rect,
     now: SystemTime,
     ctx: &ThemeContext,
@@ -1382,6 +1768,55 @@ fn draw_peer_details(
         return;
     };
 
+    let lines = peer_detail_lines(app_state, row, now, inner.width, ctx);
+    let line_count = lines.len();
+    let content_height = peer_details_content_height(line_count, inner.height);
+    let max_scroll = line_count.saturating_sub(content_height);
+    let scroll = app_state
+        .ui
+        .peer_management
+        .details_scroll_offset
+        .min(max_scroll);
+    let content_area = Rect::new(inner.x, inner.y, inner.width, content_height as u16);
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text))),
+        content_area,
+    );
+
+    if max_scroll > 0 {
+        let status_area = Rect::new(
+            inner.x,
+            inner.y.saturating_add(content_height as u16),
+            inner.width,
+            1,
+        );
+        let end = scroll.saturating_add(content_height).min(line_count);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "↑/↓ scroll",
+                    ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+                ),
+                Span::styled(
+                    format!("  lines {}–{} of {}", scroll + 1, end, line_count),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+                ),
+            ]))
+            .alignment(Alignment::Right),
+            status_area,
+        );
+    }
+}
+
+fn peer_detail_lines(
+    app_state: &AppState,
+    row: &PeerRowModel<'_>,
+    now: SystemTime,
+    available_width: u16,
+    ctx: &ThemeContext,
+) -> Vec<Line<'static>> {
     let privacy = app_state.anonymize_torrent_names;
     let mut lines = vec![Line::from(vec![
         Span::styled(
@@ -1389,17 +1824,29 @@ fn draw_peer_details(
             ctx.apply(Style::default().fg(ctx.accent_sky()).bold()),
         ),
         Span::styled(
+            format!("  {}", row.state_label()),
+            peer_state_style(row, ctx),
+        ),
+        Span::styled(
             format!(
-                "  {}  {} torrent{}  {} endpoint{}",
-                row.state_label(),
+                "  •  {} torrent{}  •  {} endpoint{}",
                 row.torrent_count,
                 plural_suffix(row.torrent_count),
                 row.endpoint_count(),
                 plural_suffix(row.endpoint_count())
             ),
-            peer_state_style(row, ctx),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ),
     ])];
+    lines.push(key_value_line(
+        if row.client_label.contains(", ") {
+            "Clients"
+        } else {
+            "Client"
+        },
+        row.client_label.clone(),
+        ctx,
+    ));
 
     if let Some(restriction) = &row.restriction {
         lines.push(Line::from(""));
@@ -1440,76 +1887,173 @@ fn draw_peer_details(
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1).italic()),
         )));
     } else {
+        let matching = matching_detail_torrents(app_state, row);
         lines.push(Line::from(""));
-        lines.push(section_line("Per-torrent evidence", ctx));
-        for tracked in &row.tracked {
-            lines.extend(tracked_peer_detail_lines(tracked, privacy, ctx));
+        lines.push(section_line(
+            &format!(
+                "Per-torrent evidence  •  {} of {}",
+                matching.len(),
+                row.tracked.len()
+            ),
+            ctx,
+        ));
+        if matching.is_empty() {
+            lines.push(Line::from(Span::styled(
+                if peer_details_search_error(app_state).is_some() {
+                    "Fix the search expression to see torrents."
+                } else {
+                    "No torrent names match this search."
+                },
+                ctx.apply(Style::default().fg(ctx.state_warning())),
+            )));
+        }
+        for (index, tracked) in matching.iter().enumerate() {
+            if index > 0 {
+                lines.push(Line::from(""));
+            }
+            lines.extend(tracked_peer_detail_lines(
+                tracked,
+                index + 1,
+                privacy,
+                available_width,
+                ctx,
+            ));
         }
     }
-
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text))),
-        inner,
-    );
+    lines
 }
 
 fn tracked_peer_detail_lines(
     peer: &PeerManagerTrackedPeer,
+    index: usize,
     privacy: bool,
+    available_width: u16,
     ctx: &ThemeContext,
 ) -> Vec<Line<'static>> {
     let torrent_name = display_torrent_name(&peer.torrent_name, privacy);
     let hash = short_info_hash(&peer.torrent_info_hash, privacy);
+    let client_label = tracked_peer_client_label(peer);
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            format!("{} ", sanitize_text(&torrent_name)),
+            format!("{:02}  ", index),
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+        ),
+        Span::styled(
+            truncate_with_ellipsis(
+                &sanitize_text(&torrent_name),
+                usize::from(available_width).saturating_sub(4).max(1),
+            ),
             ctx.apply(Style::default().fg(ctx.accent_teal()).bold()),
         ),
-        Span::styled(
-            "— ",
-            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
-        ),
+    ])];
+    lines.push(Line::from(vec![
+        detail_label_span("  Hash ", ctx),
         Span::styled(
             hash,
-            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
         ),
-    ])];
-    lines.push(Line::from(format!(
-        "  UL {} / {} ({:.0}%)  DL {} / {} ({:.0}%)",
-        format_bytes(peer.uploaded_evidence_bytes),
-        format_bytes(peer.transfer_threshold_bytes),
-        evidence_percent(peer.uploaded_evidence_bytes, peer.transfer_threshold_bytes),
-        format_bytes(peer.downloaded_evidence_bytes),
-        format_bytes(peer.transfer_threshold_bytes),
-        evidence_percent(
-            peer.downloaded_evidence_bytes,
-            peer.transfer_threshold_bytes
+    ]));
+    lines.push(Line::from(vec![
+        detail_label_span("  Client ", ctx),
+        Span::styled(
+            sanitize_text(&client_label),
+            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
         ),
-    )));
-    lines.push(Line::from(format!(
-        "  Reconnects: {} observed, {} limit ({} window)",
-        peer.reconnect_count,
-        peer.reconnect_limit,
-        compact_duration(Duration::from_secs(peer.reconnect_window_secs))
-    )));
-    if peer.endpoints.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  Current endpoints: none",
+    ]));
+    lines.push(Line::from(vec![
+        detail_label_span("  Upload    ", ctx),
+        Span::styled(
+            format!(
+                "{} / {} ({:.0}%)",
+                format_bytes(peer.uploaded_evidence_bytes),
+                format_bytes(peer.transfer_threshold_bytes),
+                evidence_percent(peer.uploaded_evidence_bytes, peer.transfer_threshold_bytes),
+            ),
+            ctx.apply(Style::default().fg(ctx.accent_teal())),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        detail_label_span("  Download  ", ctx),
+        Span::styled(
+            format!(
+                "{} / {} ({:.0}%)",
+                format_bytes(peer.downloaded_evidence_bytes),
+                format_bytes(peer.transfer_threshold_bytes),
+                evidence_percent(
+                    peer.downloaded_evidence_bytes,
+                    peer.transfer_threshold_bytes
+                ),
+            ),
+            ctx.apply(Style::default().fg(ctx.accent_sky())),
+        ),
+    ]));
+    lines.push(Line::from(vec![
+        detail_label_span("  Reconnects  ", ctx),
+        Span::styled(
+            peer.reconnect_count.to_string(),
+            ctx.apply(Style::default().fg(if peer.reconnect_count == 0 {
+                ctx.state_success()
+            } else {
+                ctx.state_warning()
+            })),
+        ),
+        Span::styled(
+            format!(
+                " / {}  •  {} window",
+                peer.reconnect_limit,
+                compact_duration(Duration::from_secs(peer.reconnect_window_secs))
+            ),
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
-        )));
+        ),
+    ]));
+    if peer.endpoints.is_empty() {
+        lines.push(Line::from(vec![
+            detail_label_span("  Endpoints  ", ctx),
+            Span::styled(
+                "none",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0).italic()),
+            ),
+        ]));
     } else {
-        for endpoint in &peer.endpoints {
-            lines.push(Line::from(format!(
-                "  {}  DL {}  UL {}",
-                display_endpoint(&endpoint.address, privacy),
-                format_bytes(endpoint.total_downloaded),
-                format_bytes(endpoint.total_uploaded)
-            )));
+        lines.push(Line::from(detail_label_span("  Endpoints", ctx)));
+        for (index, endpoint) in peer.endpoints.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("    {}  ", index + 1),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+                ),
+                Span::styled(
+                    display_endpoint(&endpoint.address, privacy),
+                    ctx.apply(Style::default().fg(ctx.accent_sky())),
+                ),
+                detail_separator_span(ctx),
+                detail_label_span("DL ", ctx),
+                Span::raw(format_bytes(endpoint.total_downloaded)),
+                detail_separator_span(ctx),
+                detail_label_span("UL ", ctx),
+                Span::raw(format_bytes(endpoint.total_uploaded)),
+            ]));
         }
     }
     lines
+}
+
+fn detail_label_span(label: &'static str, ctx: &ThemeContext) -> Span<'static> {
+    Span::styled(
+        label,
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+    )
+}
+
+fn detail_separator_span(ctx: &ThemeContext) -> Span<'static> {
+    Span::styled(
+        "  •  ",
+        ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+    )
+}
+
+fn tracked_peer_client_label(peer: &PeerManagerTrackedPeer) -> String {
+    preferred_client_label(peer.clients.iter().map(String::as_str))
 }
 
 fn section_line(label: &str, ctx: &ThemeContext) -> Line<'static> {
@@ -1579,18 +2123,28 @@ fn draw_peer_footer(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &Theme
         ));
     };
 
-    if app_state.ui.peer_management.is_searching {
+    if app_state.ui.peer_management.is_searching
+        || app_state.ui.peer_management.details_is_searching
+    {
         push("Enter", "apply", ActionTone::Confirm);
         push("Tab", "mode", ActionTone::Mode);
         push("Esc", "clear", ActionTone::Cancel);
     } else if peer_details_overlay_active(app_state) {
-        push("Enter/Esc", "table", ActionTone::Navigate);
+        push("↑/↓", "scroll", ActionTone::Navigate);
+        push("/", "search", ActionTone::Search);
+        if peer_details_search_panel_active(app_state) {
+            push("Tab", "mode", ActionTone::Mode);
+            push("Esc", "clear", ActionTone::Clear);
+            push("Enter", "table", ActionTone::Navigate);
+        } else {
+            push("Enter/Esc", "table", ActionTone::Navigate);
+        }
         push("q", "back", ActionTone::Cancel);
     } else {
         push("arrows", "nav", ActionTone::Navigate);
         push("h/l", "column", ActionTone::Navigate);
         push("s", "ort", ActionTone::Sort);
-        if peer_search_panel_active(app_state) {
+        if peer_table_search_panel_active(app_state) {
             push("Tab", "mode", ActionTone::Mode);
             push("Shift+Tab", "filter", ActionTone::Mode);
         } else {
@@ -1601,7 +2155,7 @@ fn draw_peer_footer(f: &mut Frame, app_state: &AppState, area: Rect, ctx: &Theme
             push("Enter", "details", ActionTone::Info);
         }
         push("x", "privacy", ActionTone::Toggle);
-        if peer_search_panel_active(app_state) {
+        if peer_table_search_panel_active(app_state) {
             push("Esc", "clear", ActionTone::Clear);
             push("q", "back", ActionTone::Cancel);
         } else {
@@ -1735,11 +2289,24 @@ fn centered_line_rect(area: Rect) -> Rect {
 mod tests {
     use super::*;
     use crate::peer_manager::{PeerManagerEndpointView, PeerManagerView, PeerPolicy};
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    use ratatui::Terminal;
     use std::collections::HashMap;
     use std::sync::Arc;
 
     fn test_now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(10_000)
+    }
+
+    #[test]
+    fn peer_table_viewport_builds_only_rows_that_can_be_rendered() {
+        assert_eq!(peer_table_viewport(0, None, 14), 0..0);
+        assert_eq!(peer_table_viewport(5, Some(4), 14), 0..5);
+        assert_eq!(peer_table_viewport(100, Some(0), 14), 0..11);
+        assert_eq!(peer_table_viewport(100, Some(10), 14), 0..11);
+        assert_eq!(peer_table_viewport(100, Some(11), 14), 1..12);
+        assert_eq!(peer_table_viewport(100, Some(99), 14), 89..100);
     }
 
     fn tracked_peer(ip: &str, name: &str, hash_seed: u8) -> PeerManagerTrackedPeer {
@@ -1753,9 +2320,10 @@ mod tests {
             uploaded_evidence_bytes: 0,
             transfer_threshold_bytes: 100,
             reconnect_count: 0,
-            reconnect_limit: 6,
-            reconnect_window_secs: 300,
+            reconnect_limit: 10,
+            reconnect_window_secs: 10,
             last_seen: Some(test_now() - Duration::from_secs(30)),
+            clients: Vec::new(),
         }
     }
 
@@ -1791,6 +2359,35 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .concat()
+    }
+
+    fn rendered_peer_details(state: &AppState) -> String {
+        let rows = build_peer_rows_at(state, test_now());
+        let row = pinned_peer_detail_row(state, &rows);
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_peer_details(
+                    frame,
+                    state,
+                    row,
+                    Rect::new(0, 0, 100, 24),
+                    test_now(),
+                    &ctx,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn take_peer_row_build_count() -> usize {
@@ -1861,7 +2458,8 @@ mod tests {
             )]),
         });
 
-        let evidence = build_peer_rows_at(&state, test_now())[0].strongest_evidence();
+        let rows = build_peer_rows_at(&state, test_now());
+        let evidence = rows[0].strongest_evidence();
 
         assert_eq!(evidence.kind, EvidenceKind::Download);
         assert_eq!(evidence.observed, 125);
@@ -1894,6 +2492,7 @@ mod tests {
     fn filters_and_both_search_modes_use_peer_manager_fields() {
         let mut active = tracked_peer("192.0.2.1", "Quartz Archive", 4);
         active.is_active = true;
+        active.clients = vec!["Unknown (ZZ1234)".to_string()];
         active.endpoints.push(PeerManagerEndpointView {
             address: "192.0.2.1:6881".to_string(),
             total_downloaded: 10,
@@ -1915,6 +2514,9 @@ mod tests {
         assert_eq!(build_peer_rows_at(&state, test_now()).len(), 1);
 
         state.ui.peer_management.search_mode = SearchMode::Regex;
+        state.ui.peer_management.search_query = "ZZ1234".to_string();
+        assert_eq!(build_peer_rows_at(&state, test_now()).len(), 1);
+
         state.ui.peer_management.search_query = "[".to_string();
         assert!(build_peer_rows_at(&state, test_now()).is_empty());
         assert_eq!(
@@ -1930,16 +2532,57 @@ mod tests {
         let mut higher = tracked_peer("192.0.2.12", "Sable Ledger", 7);
         higher.uploaded_evidence_bytes = 90;
         let mut state = state_with_peers(vec![lower, higher]);
+        let evidence_index = peer_columns()
+            .iter()
+            .position(|column| column.id == PeerColumnId::Evidence)
+            .unwrap();
         state.ui.peer_management.selected_index = 1;
-        state.ui.peer_management.selected_column_index = 3;
+        state.ui.peer_management.selected_column_index = evidence_index;
         state.ui.peer_management.sort_column_index = None;
 
         reduce_peer_management_action(&mut state, PeerManagementAction::SortBySelectedColumn);
 
         assert_eq!(state.ui.peer_management.selected_index, 1);
-        assert_eq!(state.ui.peer_management.sort_column_index, Some(3));
+        assert_eq!(
+            state.ui.peer_management.sort_column_index,
+            Some(evidence_index)
+        );
         let rows = build_peer_rows_at(&state, test_now());
         assert_eq!(rows[1].ip, "192.0.2.11".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn client_metadata_is_aggregated_for_the_peer_row() {
+        let mut first = tracked_peer("192.0.2.24", "Copper Notebook", 12);
+        first.clients = vec!["Unknown (BB2000)".to_string()];
+        let mut second = tracked_peer("192.0.2.24", "Quartz Notebook", 13);
+        second.clients = vec!["Unknown (AA1000)".to_string()];
+        let state = state_with_peers(vec![first, second]);
+
+        let rows = build_peer_rows_at(&state, test_now());
+
+        assert_eq!(rows[0].client_label, "Unknown (AA1000), Unknown (BB2000)");
+    }
+
+    #[test]
+    fn resolved_clients_suppress_unknown_variants() {
+        let mut unresolved = tracked_peer("192.0.2.26", "Copper Notebook", 14);
+        unresolved.clients = vec!["Unknown".to_string(), "Unknown (AA1000)".to_string()];
+        let mut resolved = tracked_peer("192.0.2.26", "Quartz Notebook", 15);
+        resolved.clients = vec![
+            "Unknown (BB2000)".to_string(),
+            "Resolved Client 3000".to_string(),
+        ];
+        let state = state_with_peers(vec![unresolved, resolved.clone()]);
+
+        let rows = build_peer_rows_at(&state, test_now());
+
+        assert_eq!(rows[0].client_label, "Resolved Client 3000");
+        assert_eq!(tracked_peer_client_label(&resolved), "Resolved Client 3000");
+        assert_eq!(
+            preferred_client_label(std::iter::empty::<&str>()),
+            "Unknown"
+        );
     }
 
     #[test]
@@ -1948,6 +2591,11 @@ mod tests {
         let second = tracked_peer("192.0.2.12", "Sable Ledger", 7);
         let mut state = state_with_peers(vec![first, second]);
         state.ui.peer_management.selected_index = 1;
+        reduce_peer_management_action(&mut state, PeerManagementAction::ToggleDetails);
+        assert_eq!(
+            state.ui.peer_management.details_peer_ip,
+            Some("192.0.2.12".parse::<IpAddr>().unwrap())
+        );
 
         Arc::make_mut(&mut state.peer_manager_view)
             .tracked_peers
@@ -1959,6 +2607,10 @@ mod tests {
         assert_eq!(
             selected_peer_row(&state, &rows).unwrap().ip,
             "192.0.2.11".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            pinned_peer_detail_row(&state, &rows).unwrap().ip,
+            "192.0.2.12".parse::<IpAddr>().unwrap()
         );
     }
 
@@ -1990,23 +2642,43 @@ mod tests {
     }
 
     #[test]
-    fn torrents_are_numeric_and_sort_by_count_by_default() {
-        let two_first = tracked_peer("192.0.2.21", "Zephyr Notebook", 9);
-        let one = tracked_peer("192.0.2.22", "Amber Notebook", 10);
-        let two_second = tracked_peer("192.0.2.21", "Cinder Notebook", 11);
+    fn torrents_are_numeric_and_state_sort_is_default() {
+        let mut two_first = tracked_peer("192.0.2.21", "Zephyr Notebook", 9);
+        two_first.uploaded_evidence_bytes = 90;
+        let mut one = tracked_peer("192.0.2.22", "Amber Notebook", 10);
+        one.is_active = true;
+        let mut two_second = tracked_peer("192.0.2.21", "Cinder Notebook", 11);
+        two_second.uploaded_evidence_bytes = 80;
         let state = state_with_peers(vec![two_first, one, two_second]);
 
-        assert_eq!(state.ui.peer_management.selected_column_index, 2);
-        assert_eq!(state.ui.peer_management.sort_column_index, Some(2));
+        assert_eq!(state.ui.peer_management.selected_column_index, 0);
+        assert_eq!(state.ui.peer_management.sort_column_index, Some(0));
         assert_eq!(
             state.ui.peer_management.sort_direction,
             SortDirection::Descending
         );
         let rows = build_peer_rows_at(&state, test_now());
-        assert_eq!(rows[0].torrent_count, 2);
-        assert_eq!(rows[1].torrent_count, 1);
-        assert_eq!(peer_torrents_label(&rows[0]), "2");
-        assert_eq!(peer_torrents_label(&rows[1]), "1");
+        assert!(rows[0].is_active());
+        assert_eq!(rows[0].torrent_count, 1);
+        assert_eq!(rows[1].torrent_count, 2);
+        assert_eq!(peer_torrents_label(&rows[0]), "1");
+        assert_eq!(peer_torrents_label(&rows[1]), "2");
+    }
+
+    #[test]
+    fn primary_sort_ties_use_last_seen_newest_first() {
+        let mut older = tracked_peer("192.0.2.31", "Copper Notebook", 31);
+        older.is_active = true;
+        older.last_seen = Some(test_now() - Duration::from_secs(90));
+        let mut newer = tracked_peer("192.0.2.32", "Quartz Notebook", 32);
+        newer.is_active = true;
+        newer.last_seen = Some(test_now() - Duration::from_secs(5));
+        let state = state_with_peers(vec![older, newer]);
+
+        let rows = build_peer_rows_at(&state, test_now());
+
+        assert_eq!(rows[0].ip, "192.0.2.32".parse::<IpAddr>().unwrap());
+        assert_eq!(rows[1].ip, "192.0.2.31".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -2016,20 +2688,117 @@ mod tests {
         let state = state_with_peers(vec![peer.clone()]);
         let ctx = ThemeContext::new(state.theme, 0.0);
 
-        let lines = tracked_peer_detail_lines(&peer, false, &ctx);
-        assert!(line_text(&lines[0]).contains("Copper Notebook — "));
-        assert_eq!(
-            line_text(&lines[2]),
-            "  Reconnects: 3 observed, 6 limit (5m window)"
-        );
+        let lines = tracked_peer_detail_lines(&peer, 1, false, 80, &ctx);
+        assert_eq!(line_text(&lines[0]), "01  Copper Notebook");
+        assert!(line_text(&lines[1]).contains("Hash "));
+        assert_eq!(line_text(&lines[2]), "  Client Unknown");
+        assert_eq!(line_text(&lines[5]), "  Reconnects  3 / 10  •  10s window");
 
         let evidence = PeerEvidence {
             kind: EvidenceKind::Reconnect,
             observed: 3,
-            threshold: 6,
+            threshold: 10,
             from_policy: false,
         };
-        assert_eq!(evidence.compact_label(), "Reconnect 3/6");
+        assert_eq!(evidence.compact_label(), "Reconnect 3/10");
+    }
+
+    #[test]
+    fn details_search_filters_only_torrent_names_for_the_pinned_peer() {
+        let first = tracked_peer("192.0.2.27", "Quartz Archive", 27);
+        let second = tracked_peer("192.0.2.27", "Cinder Atlas", 28);
+        let mut state = state_with_peers(vec![first, second]);
+        state.screen_area = Rect::new(0, 0, 100, 30);
+        reduce_peer_management_action(&mut state, PeerManagementAction::ToggleDetails);
+
+        assert_eq!(
+            map_key_to_peer_management_action(KeyCode::Char('/'), &state),
+            Some(PeerManagementAction::StartDetailsSearch)
+        );
+        reduce_peer_management_action(&mut state, PeerManagementAction::StartDetailsSearch);
+        for character in "quartz".chars() {
+            reduce_peer_management_action(
+                &mut state,
+                PeerManagementAction::DetailsSearchInsert(character),
+            );
+        }
+        reduce_peer_management_action(&mut state, PeerManagementAction::DetailsSearchCommit);
+
+        let rows = build_peer_rows_at(&state, test_now());
+        let row = pinned_peer_detail_row(&state, &rows).unwrap();
+        let matching = matching_detail_torrents(&state, row);
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let rendered = peer_detail_lines(&state, row, test_now(), 80, &ctx)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].torrent_name, "Quartz Archive");
+        assert!(rendered.contains("1 of 2"));
+        assert!(rendered.contains("Quartz Archive"));
+        assert!(!rendered.contains("Cinder Atlas"));
+        assert_eq!(
+            state.ui.peer_management.details_peer_ip,
+            Some("192.0.2.27".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn peer_details_scroll_through_large_torrent_histories() {
+        let peers = (0..40)
+            .map(|index| {
+                tracked_peer(
+                    "192.0.2.24",
+                    &format!("Archive Volume {}", index + 1),
+                    index as u8,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = state_with_peers(peers);
+        state.screen_area = Rect::new(0, 0, 140, 36);
+        reduce_peer_management_action(&mut state, PeerManagementAction::ToggleDetails);
+        let rows = build_peer_rows_at(&state, test_now());
+        let row = &rows[0];
+        let ctx = ThemeContext::new(state.theme, 0.0);
+
+        assert_eq!(row.torrent_count, 40);
+        assert_eq!(
+            peer_detail_lines(&state, row, test_now(), 48, &ctx).len(),
+            peer_detail_line_count(&state, row)
+        );
+        assert!(peer_details_max_scroll_at(&state, test_now()) > 0);
+
+        let before_scroll = rendered_peer_details(&state);
+        state.ui.needs_redraw = false;
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut state,
+        );
+        assert_eq!(state.ui.peer_management.details_scroll_offset, 1);
+        assert!(state.ui.needs_redraw);
+        assert_ne!(rendered_peer_details(&state), before_scroll);
+        reduce_peer_management_action(&mut state, PeerManagementAction::ScrollDetailsPageDown);
+        assert!(state.ui.peer_management.details_scroll_offset > 1);
+        reduce_peer_management_action(&mut state, PeerManagementAction::ScrollDetailsUp);
+        assert!(state.ui.peer_management.details_scroll_offset > 0);
+    }
+
+    #[test]
+    fn details_overlay_owns_plain_navigation_keys_at_wide_widths() {
+        let mut state = state_with_peers(vec![tracked_peer("192.0.2.25", "Copper Notebook", 25)]);
+        state.screen_area = Rect::new(0, 0, 150, 40);
+        state.ui.peer_management.show_details = true;
+
+        assert_eq!(
+            map_key_to_peer_management_action(KeyCode::Down, &state),
+            Some(PeerManagementAction::ScrollDetailsDown)
+        );
+        assert_eq!(
+            map_key_to_peer_management_action(KeyCode::Enter, &state),
+            Some(PeerManagementAction::CloseDetails)
+        );
     }
 
     #[test]
@@ -2110,5 +2879,18 @@ mod tests {
         assert!(ids.contains(&PeerColumnId::Address));
         assert!(ids.contains(&PeerColumnId::Evidence));
         assert!(!ids.contains(&PeerColumnId::Torrents));
+        assert!(!ids.contains(&PeerColumnId::Client));
+    }
+
+    #[test]
+    fn selected_peer_row_uses_torrent_manager_warning_highlight() {
+        let state = state_with_peers(Vec::new());
+        let ctx = ThemeContext::new(state.theme, 0.0);
+
+        let style = peer_row_highlight_style(&ctx);
+
+        assert_eq!(style.fg, Some(ctx.state_warning()));
+        assert_eq!(style.bg, None);
+        assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 }
