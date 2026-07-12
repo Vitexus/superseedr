@@ -1910,6 +1910,7 @@ pub struct JournalUiState {
 
 pub struct TorrentManagementUiState {
     pub selected_index: usize,
+    pub cursor_hash: Option<Vec<u8>>,
     pub selected_hashes: HashSet<Vec<u8>>,
     pub pending_commands: Vec<TorrentManagementPendingCommand>,
     pub is_searching: bool,
@@ -1920,12 +1921,15 @@ pub struct TorrentManagementUiState {
     pub sort_direction: SortDirection,
     pub status_message: Option<String>,
     pub confirm_submit: bool,
+    pub review_scroll_offset: usize,
+    pub input_latch: Option<ratatui::crossterm::event::KeyCode>,
 }
 
 impl Default for TorrentManagementUiState {
     fn default() -> Self {
         Self {
             selected_index: 0,
+            cursor_hash: None,
             selected_hashes: HashSet::new(),
             pending_commands: Vec::new(),
             is_searching: false,
@@ -1936,6 +1940,8 @@ impl Default for TorrentManagementUiState {
             sort_direction: SortDirection::Ascending,
             status_message: None,
             confirm_submit: false,
+            review_scroll_offset: 0,
+            input_latch: None,
         }
     }
 }
