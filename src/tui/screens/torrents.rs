@@ -11,8 +11,8 @@ use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_batch_sender;
 use crate::tui::formatters::{
-    anonymize_preserving_shape, centered_rect, format_bytes, format_duration, format_speed,
-    sanitize_text, speed_to_style, truncate_with_ellipsis,
+    anonymize_preserving_shape, format_bytes, format_duration, format_speed, sanitize_text,
+    speed_to_style, truncate_with_ellipsis,
 };
 use crate::tui::layout::common::{compute_smart_table_layout, SmartCol};
 use crate::tui::screen_context::ScreenContext;
@@ -25,7 +25,10 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Padding, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, Table, TableState,
+};
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::time::{Duration, UNIX_EPOCH};
@@ -152,6 +155,28 @@ struct PendingManagementReviewGroups {
     delete: Vec<String>,
     purge: Vec<String>,
     purge_total_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ManagementReviewAction {
+    Pause,
+    Resume,
+    Remove,
+    Purge,
+}
+
+struct ManagementReviewSection<'a> {
+    action: ManagementReviewAction,
+    names: &'a [String],
+    detail: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ManagementReviewRegions {
+    summary: Rect,
+    body: Rect,
+    footer: Rect,
+    compact: bool,
 }
 
 pub fn handle_event(event: CrosstermEvent, app: &mut App) -> bool {
@@ -1136,149 +1161,234 @@ fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &Theme
     let area = management_review_popup_area(f.area(), &groups);
     f.render_widget(Clear, area);
 
+    let horizontal_padding = management_review_horizontal_padding(area.width);
     let block = Block::default()
         .title(Span::styled(
-            " Review Changes ",
+            " Review Queued Changes ",
             ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
         ))
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)))
-        .padding(Padding::new(2, 2, 1, 1));
-    let inner = block.inner(area);
+        .padding(Padding::horizontal(horizontal_padding));
     f.render_widget(block, area);
-    let inner_rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-    let body_area = inner_rows[0];
-    let footer_area = inner_rows[1];
 
-    let body = pending_management_review_lines(&groups, body_area.width as usize, ctx);
-    let line_count = body.len();
-    let max_scroll = line_count.saturating_sub(body_area.height as usize);
+    let regions = management_review_regions(area);
+    let sections = pending_management_review_sections(&groups);
+    let line_count = pending_management_review_line_count(&sections);
+    let body_height = regions.body.height as usize;
+    let max_scroll = line_count.saturating_sub(body_height);
     let scroll_offset = app_state
         .ui
         .torrent_management
         .review_scroll_offset
-        .min(max_scroll)
-        .min(u16::MAX as usize) as u16;
+        .min(max_scroll);
+    let body_columns = if max_scroll > 0 && regions.body.width > 1 {
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(1)]).split(regions.body)
+    } else {
+        Layout::horizontal([Constraint::Min(1), Constraint::Length(0)]).split(regions.body)
+    };
+    let body_content_area = body_columns[0];
+    let body = pending_management_review_visible_lines(
+        &sections,
+        scroll_offset,
+        body_height,
+        body_content_area.width as usize,
+        ctx,
+    );
 
     f.render_widget(
-        Paragraph::new(body)
-            .alignment(Alignment::Left)
-            .scroll((scroll_offset, 0)),
-        body_area,
+        Paragraph::new(body).alignment(Alignment::Left),
+        body_content_area,
     );
-    draw_management_review_footer(f, app_state, footer_area, max_scroll, ctx);
+    if max_scroll > 0 && regions.body.width > 1 {
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .thumb_symbol("█")
+            .track_symbol(Some("│"))
+            .begin_symbol(Some("▲"))
+            .end_symbol(Some("▼"))
+            .thumb_style(ctx.apply(Style::default().fg(ctx.state_selected())))
+            .track_style(ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)))
+            .begin_style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)))
+            .end_style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
+        let mut scrollbar_state = ScrollbarState::new(line_count)
+            .position(scroll_offset)
+            .viewport_content_length(body_height);
+        f.render_stateful_widget(scrollbar, regions.body, &mut scrollbar_state);
+    }
+
+    draw_management_review_summary(f, &groups, regions, ctx);
+    draw_management_review_footer(f, &groups, regions, scroll_offset, line_count, ctx);
 }
 
-fn pending_management_review_lines(
+fn pending_management_review_sections(
     groups: &PendingManagementReviewGroups,
+) -> Vec<ManagementReviewSection<'_>> {
+    let mut sections = Vec::new();
+    if !groups.pause.is_empty() {
+        sections.push(ManagementReviewSection {
+            action: ManagementReviewAction::Pause,
+            names: &groups.pause,
+            detail: None,
+        });
+    }
+    if !groups.resume.is_empty() {
+        sections.push(ManagementReviewSection {
+            action: ManagementReviewAction::Resume,
+            names: &groups.resume,
+            detail: None,
+        });
+    }
+    if !groups.delete.is_empty() {
+        sections.push(ManagementReviewSection {
+            action: ManagementReviewAction::Remove,
+            names: &groups.delete,
+            detail: None,
+        });
+    }
+    if !groups.purge.is_empty() {
+        sections.push(ManagementReviewSection {
+            action: ManagementReviewAction::Purge,
+            names: &groups.purge,
+            detail: Some(format_gb(groups.purge_total_bytes)),
+        });
+    }
+    sections
+}
+
+fn pending_management_review_line_count(sections: &[ManagementReviewSection<'_>]) -> usize {
+    sections
+        .iter()
+        .map(|section| 1usize.saturating_add(section.names.len()))
+        .sum::<usize>()
+        .saturating_add(sections.len().saturating_sub(1))
+}
+
+fn pending_management_review_visible_lines(
+    sections: &[ManagementReviewSection<'_>],
+    scroll_offset: usize,
+    max_lines: usize,
     max_line_width: usize,
     ctx: &ThemeContext,
 ) -> Vec<Line<'static>> {
-    let mut body = Vec::new();
-    push_pending_review_section(
-        &mut body,
-        "Pause",
-        &groups.pause,
-        None,
-        max_line_width,
-        ctx.theme.semantic.surface2,
-        ctx,
-    );
-    if !groups.resume.is_empty() {
-        push_pending_review_section(
-            &mut body,
-            "Resume",
-            &groups.resume,
-            None,
-            max_line_width,
-            ctx.state_success(),
-            ctx,
-        );
+    if max_lines == 0 {
+        return Vec::new();
     }
-    push_pending_review_section(
-        &mut body,
-        "Remove from client",
-        &groups.delete,
-        None,
-        max_line_width,
-        ctx.state_warning(),
-        ctx,
-    );
-    push_pending_review_section(
-        &mut body,
-        "Purge torrent and files",
-        &groups.purge,
-        Some(format_gb(groups.purge_total_bytes)),
-        max_line_width,
-        ctx.state_error(),
-        ctx,
-    );
-    body.pop();
+
+    let viewport_end = scroll_offset.saturating_add(max_lines);
+    let mut body = Vec::new();
+    let mut logical_index = 0usize;
+    for (section_index, section) in sections.iter().enumerate() {
+        if section_index > 0 {
+            if (scroll_offset..viewport_end).contains(&logical_index) {
+                body.push(Line::from(""));
+            }
+            logical_index = logical_index.saturating_add(1);
+            if logical_index >= viewport_end {
+                break;
+            }
+        }
+
+        if (scroll_offset..viewport_end).contains(&logical_index) {
+            body.push(pending_review_section_header_line(
+                section,
+                max_line_width,
+                ctx,
+            ));
+        }
+        logical_index = logical_index.saturating_add(1);
+        if logical_index >= viewport_end {
+            break;
+        }
+
+        let names_start = logical_index;
+        let first_name = scroll_offset
+            .saturating_sub(names_start)
+            .min(section.names.len());
+        let last_name = viewport_end
+            .saturating_sub(names_start)
+            .min(section.names.len());
+        for name in &section.names[first_name..last_name] {
+            body.push(pending_review_name_line(name, max_line_width, ctx));
+        }
+        logical_index = logical_index.saturating_add(section.names.len());
+        if logical_index >= viewport_end {
+            break;
+        }
+    }
     body
 }
 
-fn pending_management_review_plain_lines(
-    groups: &PendingManagementReviewGroups,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    push_pending_review_plain_section(&mut lines, "Pause", &groups.pause, None);
-    if !groups.resume.is_empty() {
-        push_pending_review_plain_section(&mut lines, "Resume", &groups.resume, None);
-    }
-    push_pending_review_plain_section(&mut lines, "Remove from client", &groups.delete, None);
-    push_pending_review_plain_section(
-        &mut lines,
-        "Purge torrent and files",
-        &groups.purge,
-        Some(format_gb(groups.purge_total_bytes)),
-    );
-    lines.pop();
-    lines
-}
-
-fn push_pending_review_plain_section(
-    body: &mut Vec<Line<'static>>,
-    title: &str,
-    names: &[String],
-    detail: Option<String>,
-) {
-    body.push(Line::from(section_header_text(
-        title,
-        names.len(),
-        detail.as_deref(),
-    )));
-    if names.is_empty() {
-        body.push(Line::from("  None"));
-    } else {
-        body.extend(names.iter().map(|name| Line::from(format!("  {name}"))));
-    }
-    body.push(Line::from(""));
-}
-
 fn management_review_popup_area(frame_area: Rect, groups: &PendingManagementReviewGroups) -> Rect {
-    let max_area = centered_rect(80, 80, frame_area);
-    let width = pending_management_review_popup_width(groups, max_area.width);
+    let max_width = frame_area
+        .width
+        .saturating_mul(86)
+        .saturating_div(100)
+        .max(frame_area.width.min(72))
+        .min(frame_area.width);
+    let max_height = frame_area
+        .height
+        .saturating_mul(88)
+        .saturating_div(100)
+        .max(frame_area.height.min(12))
+        .min(frame_area.height);
+    let width = pending_management_review_popup_width(groups, max_width);
+    let height = max_height;
     Rect::new(
         frame_area.x + frame_area.width.saturating_sub(width) / 2,
-        max_area.y,
+        frame_area.y + frame_area.height.saturating_sub(height) / 2,
         width,
-        max_area.height,
+        height,
     )
+}
+
+fn management_review_horizontal_padding(popup_width: u16) -> u16 {
+    if popup_width > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn management_review_inner_area(popup_area: Rect) -> Rect {
+    let horizontal_padding = management_review_horizontal_padding(popup_area.width);
+    Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::horizontal(horizontal_padding))
+        .inner(popup_area)
+}
+
+fn management_review_regions(popup_area: Rect) -> ManagementReviewRegions {
+    let inner = management_review_inner_area(popup_area);
+    let footer_target = if inner.height >= 8 { 2 } else { 1 };
+    let footer_height = footer_target.min(inner.height.saturating_sub(1));
+    let summary_target = if inner.height >= 9 { 3 } else { 2 };
+    let summary_height =
+        summary_target.min(inner.height.saturating_sub(footer_height).saturating_sub(1));
+    let compact = inner.width < 50 || summary_height < 3 || footer_height < 2;
+    let regions = Layout::vertical([
+        Constraint::Length(summary_height),
+        Constraint::Min(1),
+        Constraint::Length(footer_height),
+    ])
+    .split(inner);
+    ManagementReviewRegions {
+        summary: regions[0],
+        body: regions[1],
+        footer: regions[2],
+        compact,
+    }
 }
 
 fn management_review_body_area(frame_area: Rect, groups: &PendingManagementReviewGroups) -> Rect {
     let popup_area = management_review_popup_area(frame_area, groups);
-    let inner = Block::default()
-        .borders(Borders::ALL)
-        .padding(Padding::new(2, 2, 1, 1))
-        .inner(popup_area);
-    Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner)[0]
+    management_review_regions(popup_area).body
 }
 
 fn management_review_page_lines(app_state: &AppState) -> usize {
     let groups = pending_management_review_groups(app_state);
     management_review_body_area(app_state.screen_area, &groups)
         .height
+        .saturating_sub(1)
         .max(1) as usize
 }
 
@@ -1289,9 +1399,8 @@ fn max_management_review_scroll_offset(app_state: &AppState) -> usize {
 
     let groups = pending_management_review_groups(app_state);
     let body_area = management_review_body_area(app_state.screen_area, &groups);
-    pending_management_review_plain_lines(&groups)
-        .len()
-        .saturating_sub(body_area.height as usize)
+    let sections = pending_management_review_sections(&groups);
+    pending_management_review_line_count(&sections).saturating_sub(body_area.height as usize)
 }
 
 fn clamp_management_review_scroll(app_state: &mut AppState) {
@@ -1321,157 +1430,456 @@ fn pending_management_review_popup_width(
     groups: &PendingManagementReviewGroups,
     max_width: u16,
 ) -> u16 {
-    let mut longest = terminal_text_width(" Review Changes ");
-    for (title, names, detail, include_empty) in [
-        ("Pause", groups.pause.as_slice(), None, true),
-        (
-            "Resume",
-            groups.resume.as_slice(),
-            None,
-            !groups.resume.is_empty(),
-        ),
-        ("Remove from client", groups.delete.as_slice(), None, true),
-        (
-            "Purge torrent and files",
-            groups.purge.as_slice(),
-            Some(format_gb(groups.purge_total_bytes)),
-            true,
-        ),
-    ] {
-        if !include_empty {
-            continue;
-        }
-        longest = longest.max(terminal_text_width(&section_header_text(
-            title,
-            names.len(),
-            detail.as_deref(),
+    if max_width == 0 {
+        return 0;
+    }
+    let sections = pending_management_review_sections(groups);
+    let mut longest = terminal_text_width(" Review Queued Changes ");
+    for section in sections {
+        longest = longest.max(terminal_text_width(&format!(
+            "{}{}",
+            section.action.title(),
+            section_header_suffix(section.names.len(), section.detail.as_deref())
         )));
-        if names.is_empty() {
-            longest = longest.max(terminal_text_width("  None"));
-        } else {
-            for name in names {
-                longest = longest.max(terminal_text_width(&format!("  {name}")));
-            }
+        for name in section.names {
+            longest = longest.max(terminal_text_width(&format!("• {name}")));
         }
     }
 
     let max_width = max_width as usize;
     let desired = longest.saturating_add(6).min(max_width);
-    desired.max(1).max(64.min(max_width)) as u16
+    desired.max(1).max(72.min(max_width)) as u16
+}
+
+fn pending_management_review_total(groups: &PendingManagementReviewGroups) -> usize {
+    groups
+        .pause
+        .len()
+        .saturating_add(groups.resume.len())
+        .saturating_add(groups.delete.len())
+        .saturating_add(groups.purge.len())
+}
+
+fn management_review_visible_range(
+    scroll_offset: usize,
+    viewport_height: usize,
+    line_count: usize,
+) -> String {
+    if line_count == 0 || viewport_height == 0 {
+        return "0 / 0".to_string();
+    }
+    let first = scroll_offset.min(line_count.saturating_sub(1));
+    let last = first
+        .saturating_add(viewport_height)
+        .min(line_count)
+        .max(first.saturating_add(1));
+    format!("{}–{last} / {line_count}", first.saturating_add(1))
+}
+
+fn management_review_compact_visible_range(
+    scroll_offset: usize,
+    viewport_height: usize,
+    line_count: usize,
+) -> String {
+    if line_count == 0 || viewport_height == 0 {
+        return "↕0/0".to_string();
+    }
+    let first = scroll_offset.min(line_count.saturating_sub(1));
+    let last = first
+        .saturating_add(viewport_height)
+        .min(line_count)
+        .max(first.saturating_add(1));
+    format!("↕{}–{last}/{line_count}", first.saturating_add(1))
+}
+
+fn draw_management_review_summary(
+    f: &mut Frame,
+    groups: &PendingManagementReviewGroups,
+    regions: ManagementReviewRegions,
+    ctx: &ThemeContext,
+) {
+    if regions.summary.height == 0 {
+        return;
+    }
+
+    let summary_content = if regions.summary.height > 1 {
+        let summary_block = Block::default()
+            .borders(Borders::BOTTOM)
+            .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)));
+        let content = summary_block.inner(regions.summary);
+        f.render_widget(summary_block, regions.summary);
+        content
+    } else {
+        regions.summary
+    };
+    if summary_content.height == 0 {
+        return;
+    }
+
+    let total = pending_management_review_total(groups);
+    if regions.compact || summary_content.height == 1 {
+        let mut label = format!("{total} queued");
+        if !groups.purge.is_empty() {
+            label.push_str(&format!(" • Purge {}", groups.purge.len()));
+        } else if !groups.delete.is_empty() {
+            label.push_str(&format!(" • Remove {}", groups.delete.len()));
+        }
+        let label = truncate_middle_with_ellipsis(&label, summary_content.width as usize);
+        let tone = if groups.purge.is_empty() {
+            ctx.state_selected()
+        } else {
+            ctx.state_error()
+        };
+        let count_area = Rect::new(
+            summary_content.x,
+            summary_content.y,
+            summary_content.width,
+            1,
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                label,
+                ctx.apply(Style::default().fg(tone).bold()),
+            ))),
+            count_area,
+        );
+        draw_management_review_safety_detail(f, groups, summary_content, ctx);
+        return;
+    }
+
+    let count_area = Rect::new(
+        summary_content.x,
+        summary_content.y,
+        summary_content.width,
+        1,
+    );
+    let mut spans = Vec::new();
+    let mut used_width = 0usize;
+    push_management_review_summary_item(
+        &mut spans,
+        &mut used_width,
+        count_area.width as usize,
+        &format!("{total} queued"),
+        ctx.state_selected(),
+        ctx,
+    );
+    for (label, count, color) in [
+        ("Purge", groups.purge.len(), ctx.state_error()),
+        ("Remove", groups.delete.len(), ctx.state_warning()),
+        ("Pause", groups.pause.len(), ctx.theme.semantic.surface2),
+        ("Resume", groups.resume.len(), ctx.state_success()),
+    ] {
+        if count > 0 {
+            push_management_review_summary_item(
+                &mut spans,
+                &mut used_width,
+                count_area.width as usize,
+                &format!("{label} {count}"),
+                color,
+                ctx,
+            );
+        }
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), count_area);
+
+    draw_management_review_safety_detail(f, groups, summary_content, ctx);
+}
+
+fn draw_management_review_safety_detail(
+    f: &mut Frame,
+    groups: &PendingManagementReviewGroups,
+    summary_content: Rect,
+    ctx: &ThemeContext,
+) {
+    if summary_content.height < 2 {
+        return;
+    }
+
+    let detail_area = Rect::new(
+        summary_content.x,
+        summary_content.y.saturating_add(1),
+        summary_content.width,
+        1,
+    );
+    let (detail, color) = if !groups.purge.is_empty() {
+        (
+            if detail_area.width >= 52 {
+                format!(
+                    "Purge permanently removes downloaded files • {}",
+                    format_gb(groups.purge_total_bytes)
+                )
+            } else {
+                format!(
+                    "PURGE {} • files • {}",
+                    groups.purge.len(),
+                    format_gb(groups.purge_total_bytes)
+                )
+            },
+            ctx.state_error(),
+        )
+    } else if !groups.delete.is_empty() {
+        (
+            "Remove changes the client only • downloaded files stay".to_string(),
+            ctx.state_warning(),
+        )
+    } else {
+        (
+            "No downloaded files will be deleted".to_string(),
+            ctx.state_success(),
+        )
+    };
+    let detail = truncate_middle_with_ellipsis(&detail, detail_area.width as usize);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            detail,
+            ctx.apply(Style::default().fg(color)),
+        ))),
+        detail_area,
+    );
+}
+
+fn push_management_review_summary_item(
+    spans: &mut Vec<Span<'static>>,
+    used_width: &mut usize,
+    max_width: usize,
+    label: &str,
+    color: Color,
+    ctx: &ThemeContext,
+) {
+    let separator = if *used_width == 0 { "" } else { "  " };
+    let item_width = terminal_text_width(separator).saturating_add(terminal_text_width(label));
+    if used_width.saturating_add(item_width) > max_width {
+        return;
+    }
+    if !separator.is_empty() {
+        spans.push(Span::styled(
+            separator.to_string(),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        ));
+    }
+    spans.push(Span::styled(
+        label.to_string(),
+        ctx.apply(Style::default().fg(color).bold()),
+    ));
+    *used_width = used_width.saturating_add(item_width);
 }
 
 fn draw_management_review_footer(
     f: &mut Frame,
-    app_state: &AppState,
+    groups: &PendingManagementReviewGroups,
+    regions: ManagementReviewRegions,
+    scroll_offset: usize,
+    line_count: usize,
+    ctx: &ThemeContext,
+) {
+    let footer_area = regions.footer;
+    if footer_area.height == 0 {
+        return;
+    }
+
+    let total = pending_management_review_total(groups);
+    let overflow = line_count > regions.body.height as usize;
+    if footer_area.height > 1 {
+        let rows =
+            Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(footer_area);
+        let navigation = if regions.compact && overflow {
+            format!(
+                "{}  [j/k] scroll",
+                management_review_compact_visible_range(
+                    scroll_offset,
+                    regions.body.height as usize,
+                    line_count,
+                )
+            )
+        } else if regions.compact {
+            format!("All {total} changes visible")
+        } else if overflow {
+            let range = management_review_visible_range(
+                scroll_offset,
+                regions.body.height as usize,
+                line_count,
+            );
+            format!("{range}  [j/k] Scroll  [PgUp/PgDn] Page  [Home/End] Jump")
+        } else {
+            format!("All {total} queued changes visible")
+        };
+        let navigation = truncate_middle_with_ellipsis(&navigation, rows[0].width as usize);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                navigation,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            )))
+            .alignment(Alignment::Center),
+            rows[0],
+        );
+        draw_management_review_action_footer(f, rows[1], total, regions.compact, None, ctx);
+        return;
+    }
+
+    let range = overflow.then(|| {
+        management_review_compact_visible_range(
+            scroll_offset,
+            regions.body.height as usize,
+            line_count,
+        )
+    });
+    draw_management_review_action_footer(f, footer_area, total, true, range.as_deref(), ctx);
+}
+
+fn draw_management_review_action_footer(
+    f: &mut Frame,
     footer_area: Rect,
-    max_scroll: usize,
+    total: usize,
+    compact: bool,
+    trailing_label: Option<&str>,
     ctx: &ThemeContext,
 ) {
     let mut spans = Vec::new();
     let mut used_width = 0usize;
     let max_width = footer_area.width as usize;
-    let mut push_action = |key: &str, label: &str, tone: ActionTone| {
-        if !try_push_management_footer_action(
+    let _ = try_push_management_footer_action(
+        &mut spans,
+        &mut used_width,
+        max_width,
+        "Esc",
+        if compact { "" } else { "cancel" },
+        ActionTone::Cancel,
+        ctx,
+    );
+
+    if !compact {
+        let _ = try_push_management_footer_action(
             &mut spans,
             &mut used_width,
             max_width,
-            key,
-            label,
-            tone,
+            "u",
+            "clear",
+            ActionTone::Clear,
             ctx,
-        ) {
-            let _ = try_push_management_footer_action(
-                &mut spans,
-                &mut used_width,
-                max_width,
-                key,
-                "",
-                tone,
-                ctx,
-            );
-        }
-    };
-
-    let compact_mandatory_actions = max_width < 40;
-    push_action(
-        "Esc",
-        if compact_mandatory_actions {
-            ""
-        } else {
-            "cancel"
-        },
-        ActionTone::Cancel,
-    );
-    push_action(
-        "Enter",
-        if compact_mandatory_actions {
-            ""
-        } else {
-            "finalize"
-        },
-        ActionTone::Confirm,
-    );
-    push_action(
-        "u",
-        if compact_mandatory_actions {
-            ""
-        } else {
-            "clear"
-        },
-        ActionTone::Clear,
-    );
-    if max_scroll > 0 {
-        let offset = app_state
-            .ui
-            .torrent_management
-            .review_scroll_offset
-            .min(max_scroll);
-        let label = format!(
-            "scroll {}/{}",
-            offset.saturating_add(1),
-            max_scroll.saturating_add(1)
         );
-        push_action("j/k", &label, ActionTone::Navigate);
+    }
+    let finalize_label = if compact {
+        String::new()
+    } else {
+        format!("finalize {total}")
+    };
+    if !try_push_management_footer_action(
+        &mut spans,
+        &mut used_width,
+        max_width,
+        "Enter",
+        &finalize_label,
+        ActionTone::Confirm,
+        ctx,
+    ) {
+        let _ = try_push_management_footer_action(
+            &mut spans,
+            &mut used_width,
+            max_width,
+            "↵",
+            "",
+            ActionTone::Confirm,
+            ctx,
+        );
+    }
+    if compact {
+        let _ = try_push_management_footer_action(
+            &mut spans,
+            &mut used_width,
+            max_width,
+            "u",
+            "",
+            ActionTone::Clear,
+            ctx,
+        );
+    }
+
+    if let Some(trailing_label) = trailing_label {
+        let separator_width = usize::from(used_width > 0);
+        let available_width = max_width
+            .saturating_sub(used_width)
+            .saturating_sub(separator_width);
+        if available_width > 0 {
+            let trailing_label = truncate_middle_with_ellipsis(trailing_label, available_width);
+            if separator_width > 0 {
+                spans.push(Span::raw(" "));
+            }
+            spans.push(Span::styled(
+                trailing_label,
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
+            ));
+        }
     }
 
     let footer = Paragraph::new(Line::from(spans))
-        .alignment(Alignment::Center)
+        .alignment(if compact {
+            Alignment::Left
+        } else {
+            Alignment::Center
+        })
         .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
     f.render_widget(footer, footer_area);
 }
 
-fn push_pending_review_section(
-    body: &mut Vec<Line<'static>>,
-    title: &str,
-    names: &[String],
-    detail: Option<String>,
+fn pending_review_section_header_line(
+    section: &ManagementReviewSection<'_>,
     max_line_width: usize,
-    color: Color,
     ctx: &ThemeContext,
-) {
-    let (header_title, header_suffix) =
-        management_review_header_parts(title, names.len(), detail.as_deref(), max_line_width);
-    body.push(Line::from(vec![
+) -> Line<'static> {
+    let title = section.action.title();
+    let color = section.action.color(ctx);
+    let (header_title, header_suffix) = management_review_header_parts(
+        title,
+        section.names.len(),
+        section.detail.as_deref(),
+        max_line_width,
+    );
+    Line::from(vec![
         Span::styled(header_title, ctx.apply(Style::default().fg(color).bold())),
         Span::styled(
             header_suffix,
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ),
-    ]));
+    ])
+}
 
-    if names.is_empty() {
-        body.push(Line::from(Span::styled(
-            "  None",
+fn pending_review_name_line(
+    name: &str,
+    max_line_width: usize,
+    ctx: &ThemeContext,
+) -> Line<'static> {
+    let available_name_width = max_line_width.saturating_sub(2);
+    let name = truncate_middle_with_ellipsis(name, available_name_width);
+    Line::from(vec![
+        Span::styled(
+            "• ",
             ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
-        )));
-    } else {
-        for name in names {
-            let available_name_width = max_line_width.saturating_sub(2);
-            let name = truncate_middle_with_ellipsis(name, available_name_width);
-            body.push(Line::from(format!("  {name}")));
+        ),
+        Span::styled(
+            name,
+            ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+        ),
+    ])
+}
+
+impl ManagementReviewAction {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Pause => "PAUSE",
+            Self::Resume => "RESUME",
+            Self::Remove => "REMOVE",
+            Self::Purge => "PURGE",
         }
     }
-    body.push(Line::from(""));
+
+    fn color(self, ctx: &ThemeContext) -> Color {
+        match self {
+            Self::Pause => ctx.theme.semantic.surface2,
+            Self::Resume => ctx.state_success(),
+            Self::Remove => ctx.state_warning(),
+            Self::Purge => ctx.state_error(),
+        }
+    }
 }
 
 fn management_review_header_parts(
@@ -1485,11 +1893,7 @@ fn management_review_header_parts(
         return (title.to_string(), full_suffix);
     }
 
-    let compact_title = match title {
-        "Remove from client" => "Remove",
-        "Purge torrent and files" => "Purge",
-        other => other,
-    };
+    let compact_title = title;
     let compact_suffix = match detail {
         Some(detail) => format!(": {count} ({detail})"),
         None => format!(": {count}"),
@@ -1526,10 +1930,6 @@ fn truncate_middle_with_ellipsis(input: &str, max_width: usize) -> String {
     let (head, _) = input.unicode_truncate(head_width);
     let (tail, _) = input.unicode_truncate_start(tail_width);
     format!("{head}…{tail}")
-}
-
-fn section_header_text(title: &str, count: usize, detail: Option<&str>) -> String {
-    format!("{title}{}", section_header_suffix(count, detail))
 }
 
 fn section_header_suffix(count: usize, detail: Option<&str>) -> String {
@@ -2441,6 +2841,19 @@ mod tests {
             },
             state: TorrentControlState::Paused,
             delete_files: false,
+        }
+    }
+
+    fn delete_command(byte: u8, delete_files: bool) -> TorrentManagementPendingCommand {
+        let info_hash = hash(byte);
+        TorrentManagementPendingCommand {
+            info_hash: info_hash.clone(),
+            request: ControlRequest::Delete {
+                info_hash_hex: hex::encode(&info_hash),
+                delete_files,
+            },
+            state: TorrentControlState::Deleting,
+            delete_files,
         }
     }
 
@@ -4303,7 +4716,7 @@ mod tests {
         assert!(rendered.contains("[Esc]"));
         assert!(rendered.contains("[Enter]"));
         assert!(rendered.contains("[u]"));
-        assert!(rendered.contains("[j/k]"));
+        assert!(rendered.contains("1 queued"));
     }
 
     #[test]
@@ -4346,7 +4759,7 @@ mod tests {
 
         let rendered = render_management_screen(&mut app_state, 40, 20);
 
-        assert!(rendered.contains("Purge: 1 (2.50 GB)"));
+        assert!(rendered.contains("PURGE: 1 Torrent (2.50 GB)"));
     }
 
     #[test]
@@ -4366,16 +4779,76 @@ mod tests {
     }
 
     #[test]
-    fn review_scroll_range_excludes_the_trailing_section_gap() {
+    fn review_omits_empty_groups_from_the_scroll_range() {
         let mut app_state = app_state_with_torrents(vec![(hash(1), "Sample Packet", 100, 10, 2)]);
         app_state.ui.torrent_management.pending_commands = vec![pause_command(1)];
         app_state.ui.torrent_management.confirm_submit = true;
         app_state.screen_area = Rect::new(0, 0, 45, 18);
 
         let groups = pending_management_review_groups(&app_state);
+        let sections = pending_management_review_sections(&groups);
 
-        assert_eq!(pending_management_review_plain_lines(&groups).len(), 8);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(pending_management_review_line_count(&sections), 2);
         assert_eq!(max_management_review_scroll_offset(&app_state), 0);
+    }
+
+    #[test]
+    fn review_geometry_grows_monotonically_across_responsive_breakpoints() {
+        let groups = PendingManagementReviewGroups {
+            pause: vec!["Geometry Packet".to_string()],
+            ..Default::default()
+        };
+
+        let mut previous_popup_width = 0;
+        let mut previous_body_width = 0;
+        for width in 1..=120 {
+            let popup = management_review_popup_area(Rect::new(0, 0, width, 30), &groups);
+            let body = management_review_regions(popup).body;
+            assert!(popup.width >= previous_popup_width, "frame width {width}");
+            assert!(body.width >= previous_body_width, "frame width {width}");
+            previous_popup_width = popup.width;
+            previous_body_width = body.width;
+        }
+
+        let mut previous_popup_height = 0;
+        let mut previous_body_height = 0;
+        for height in 1..=40 {
+            let popup = management_review_popup_area(Rect::new(0, 0, 80, height), &groups);
+            let body = management_review_regions(popup).body;
+            assert!(
+                popup.height >= previous_popup_height,
+                "frame height {height}"
+            );
+            assert!(body.height >= previous_body_height, "frame height {height}");
+            previous_popup_height = popup.height;
+            previous_body_height = body.height;
+        }
+    }
+
+    #[test]
+    fn pause_only_review_avoids_early_overflow() {
+        let names = (0..13)
+            .map(|index| format!("Quiet Packet {index:02}"))
+            .collect::<Vec<_>>();
+        let torrents = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (hash(index as u8 + 1), name.as_str(), 100, 10, 2))
+            .collect::<Vec<_>>();
+        let mut app_state = app_state_with_torrents(torrents);
+        app_state.ui.torrent_management.pending_commands = (1..=13).map(pause_command).collect();
+        app_state.ui.torrent_management.confirm_submit = true;
+
+        let rendered = render_management_screen(&mut app_state, 100, 30);
+
+        assert_eq!(max_management_review_scroll_offset(&app_state), 0);
+        assert!(rendered.contains("13 queued"));
+        assert!(rendered.contains("PAUSE: 13 Torrents"));
+        assert!(!rendered.contains("RESUME:"));
+        assert!(!rendered.contains("REMOVE:"));
+        assert!(!rendered.contains("PURGE:"));
+        assert!(rendered.contains("All 13 queued changes visible"));
     }
 
     #[test]
@@ -4408,6 +4881,135 @@ mod tests {
     }
 
     #[test]
+    fn mixed_large_review_keeps_summary_and_last_destructive_item_visible() {
+        let names = (0..40)
+            .map(|index| format!("Review Packet {index:02}"))
+            .collect::<Vec<_>>();
+        let torrents = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (hash(index as u8 + 1), name.as_str(), 100, 10, 2))
+            .collect::<Vec<_>>();
+        let mut app_state = app_state_with_torrents(torrents);
+        for byte in 31..=40 {
+            app_state
+                .torrents
+                .get_mut(&hash(byte))
+                .expect("purge torrent")
+                .latest_state
+                .total_size = 250_000_000;
+        }
+        app_state.ui.torrent_management.pending_commands = (1..=20)
+            .map(pause_command)
+            .chain((21..=30).map(|byte| delete_command(byte, false)))
+            .chain((31..=40).map(|byte| delete_command(byte, true)))
+            .collect();
+        app_state.ui.torrent_management.confirm_submit = true;
+
+        let first_page = render_management_screen(&mut app_state, 80, 24);
+        assert!(first_page.contains("40 queued"));
+        assert!(first_page.contains("Purge 10"));
+        assert!(first_page.contains("Review Packet 00"));
+        assert!(!first_page.contains("Review Packet 39"));
+
+        let compact_first_page = render_management_screen(&mut app_state, 32, 16);
+        assert!(compact_first_page.contains("PURGE 10"));
+        assert!(compact_first_page.contains("files"));
+        assert!(compact_first_page.contains("2.50 GB"));
+        assert!(compact_first_page.contains("[Enter]"));
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::ReviewLast);
+        let last_page = render_management_screen(&mut app_state, 80, 24);
+        assert!(last_page.contains("Review Packet 39"));
+        assert!(last_page.contains("PURGE: 10 Torrents"));
+        assert!(last_page.contains("[Enter]"));
+        assert!(last_page.contains("[Esc]"));
+    }
+
+    #[test]
+    fn narrow_review_keeps_confirmation_and_scroll_position_visible() {
+        let names = (0..200)
+            .map(|index| format!("Narrow Packet {index:02}"))
+            .collect::<Vec<_>>();
+        let torrents = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (hash(index as u8 + 1), name.as_str(), 100, 10, 2))
+            .collect::<Vec<_>>();
+        let mut app_state = app_state_with_torrents(torrents);
+        app_state.ui.torrent_management.pending_commands = (1..=200).map(pause_command).collect();
+        app_state.ui.torrent_management.confirm_submit = true;
+
+        let rendered = render_management_screen(&mut app_state, 32, 16);
+
+        assert!(rendered.contains("200 queued"));
+        assert!(rendered.contains("[Esc]"));
+        assert!(rendered.contains("[u]"));
+        assert!(rendered.contains("[Enter]"));
+        assert!(rendered.contains('↕'));
+    }
+
+    #[test]
+    fn short_review_reserves_at_least_one_body_row() {
+        let names = (0..20)
+            .map(|index| format!("Short Packet {index:02}"))
+            .collect::<Vec<_>>();
+        let torrents = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (hash(index as u8 + 1), name.as_str(), 100, 10, 2))
+            .collect::<Vec<_>>();
+        let mut app_state = app_state_with_torrents(torrents);
+        app_state.ui.torrent_management.pending_commands = (1..=20).map(pause_command).collect();
+        app_state.ui.torrent_management.confirm_submit = true;
+        let groups = pending_management_review_groups(&app_state);
+
+        assert!(management_review_body_area(Rect::new(0, 0, 80, 7), &groups).height >= 1);
+        let rendered = render_management_screen(&mut app_state, 80, 7);
+        assert!(rendered.contains("20 queued"));
+        assert!(rendered.contains("PAUSE: 20 Torrents"));
+        assert!(rendered.contains("[Enter]"));
+    }
+
+    #[test]
+    fn very_narrow_review_truncates_unicode_without_losing_the_suffix() {
+        let wide_name = format!("{}final.part", "界".repeat(24));
+        let mut app_state =
+            app_state_with_torrents(vec![(hash(1), wide_name.as_str(), 100, 10, 2)]);
+        app_state.ui.torrent_management.pending_commands = vec![pause_command(1)];
+        app_state.ui.torrent_management.confirm_submit = true;
+
+        let rendered = render_management_screen(&mut app_state, 32, 16);
+
+        assert!(rendered.contains("final.part"));
+        assert!(rendered.contains('…'));
+        assert!(rendered.contains("[Enter]"));
+    }
+
+    #[test]
+    fn review_viewport_supports_offsets_beyond_u16() {
+        let names = (0..65_540)
+            .map(|index| format!("Deep Queue Packet {index:05}"))
+            .collect::<Vec<_>>();
+        let groups = PendingManagementReviewGroups {
+            pause: names,
+            ..Default::default()
+        };
+        let sections = pending_management_review_sections(&groups);
+        let ctx = ThemeContext::new(Default::default(), 0.0);
+
+        let visible = pending_management_review_visible_lines(&sections, 65_540, 1, 40, &ctx);
+        assert_eq!(visible.len(), 1);
+        let rendered = visible[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("Deep Queue Packet 65539"));
+    }
+
+    #[test]
     fn review_scroll_up_uses_the_resized_viewport_range() {
         let names = (0..20)
             .map(|index| format!("Resize Packet {index:02}"))
@@ -4435,6 +5037,10 @@ mod tests {
             app_state.ui.torrent_management.review_scroll_offset,
             resized_max - 1
         );
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::ReviewLast);
+        let resized_last_page = render_management_screen(&mut app_state, 100, 24);
+        assert!(resized_last_page.contains("Resize Packet 19"));
     }
 
     #[test]
