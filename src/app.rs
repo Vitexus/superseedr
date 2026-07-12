@@ -2058,6 +2058,7 @@ pub struct AppState {
     pub pending_magnet_preview_info_hash: Option<Vec<u8>>,
     pub(crate) pending_manual_ingest: Option<PendingManualIngest>,
     pub torrents: HashMap<Vec<u8>, TorrentDisplayState>,
+    pub peer_policy: Arc<PeerPolicy>,
 
     pub torrent_list_order: Vec<Vec<u8>>,
 
@@ -2158,6 +2159,17 @@ pub struct AppState {
     pub pending_watch_commands: VecDeque<AppCommand>,
     pub cluster_role_label: Option<String>,
     pub cluster_runtime_label: Option<String>,
+}
+
+fn sync_peer_policy_to_app_state(
+    app_state: &mut AppState,
+    peer_policy_rx: &mut watch::Receiver<Arc<PeerPolicy>>,
+) -> usize {
+    let policy = peer_policy_rx.borrow_and_update().clone();
+    let blocked_ips = policy.restrictions.len();
+    app_state.peer_policy = policy;
+    app_state.ui.needs_redraw = true;
+    blocked_ips
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -3125,6 +3137,7 @@ impl App {
             data_availability_fault_log_cooldowns: HashMap::new(),
             probe_available_log_cooldowns: HashMap::new(),
         };
+        sync_peer_policy_to_app_state(&mut app.app_state, &mut app.peer_policy_rx);
         app.sync_cluster_role_label();
         app.refresh_system_warning();
 
@@ -4554,9 +4567,12 @@ impl App {
                 }
                 policy_changed = self.peer_policy_rx.changed(), if self.peer_policy_open => {
                     if policy_changed.is_ok() {
-                        let policy = self.peer_policy_rx.borrow_and_update();
+                        let blocked_ips = sync_peer_policy_to_app_state(
+                            &mut self.app_state,
+                            &mut self.peer_policy_rx,
+                        );
                         tracing::debug!(
-                            blocked_ips = policy.restrictions.len(),
+                            blocked_ips,
                             "App received peer policy"
                         );
                     } else {
@@ -11647,6 +11663,39 @@ mod tests {
         handshake[1..(1 + BITTORRENT_PROTOCOL_STR.len())].copy_from_slice(b"NotTorrent protocol");
 
         assert!(!is_valid_incoming_bittorrent_handshake(&handshake));
+    }
+
+    #[test]
+    fn peer_policy_sync_makes_initial_and_updated_policy_tui_visible() {
+        let first_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let second_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
+        let blocked_until = SystemTime::now() + Duration::from_secs(3_600);
+        let initial_policy = Arc::new(crate::peer_manager::PeerPolicy::from_blocked_until(
+            HashMap::from([(first_ip, blocked_until)]),
+        ));
+        let (policy_tx, mut policy_rx) = watch::channel(Arc::clone(&initial_policy));
+        let mut app_state = AppState::default();
+        app_state.ui.needs_redraw = false;
+
+        assert_eq!(
+            super::sync_peer_policy_to_app_state(&mut app_state, &mut policy_rx),
+            1
+        );
+        assert!(Arc::ptr_eq(&app_state.peer_policy, &initial_policy));
+        assert!(app_state.ui.needs_redraw);
+
+        let updated_policy = Arc::new(crate::peer_manager::PeerPolicy::from_blocked_until(
+            HashMap::from([(first_ip, blocked_until), (second_ip, blocked_until)]),
+        ));
+        policy_tx.send_replace(Arc::clone(&updated_policy));
+        app_state.ui.needs_redraw = false;
+
+        assert_eq!(
+            super::sync_peer_policy_to_app_state(&mut app_state, &mut policy_rx),
+            2
+        );
+        assert!(Arc::ptr_eq(&app_state.peer_policy, &updated_policy));
+        assert!(app_state.ui.needs_redraw);
     }
 
     #[tokio::test]
