@@ -278,6 +278,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::General,
         "Global Routes",
+        "P",
+        "Open peer management",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::General,
+        "Global Routes",
         "z",
         "Toggle Zen / Power Saving mode",
         ActionTone::Toggle
@@ -552,6 +559,48 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
         "u",
         "Clear draft commands for the current target set",
         ActionTone::Clear
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "Up / Down / k / j",
+        "Move selection through tracked and restricted peers",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "Tab / Shift+Tab",
+        "Cycle All, Active, Recent, and Restricted filters",
+        ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "h / l / Left / Right",
+        "Move between table columns; s sorts the focused column",
+        ActionTone::Sort
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "/",
+        "Search peer addresses, endpoints, torrents, states, and restriction reasons",
+        ActionTone::Search
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "Enter",
+        "Open or close full peer details on compact layouts",
+        ActionTone::Open
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Peer Management",
+        "x",
+        "Toggle privacy masking for peer and torrent identities",
+        ActionTone::Toggle
     );
     action_item!(
         HelpSection::Screens,
@@ -1485,6 +1534,27 @@ mod tests {
             .find(|item| item.subsection == "Disk Metrics" && item.key == "Read")
             .expect("read disk metric help item");
         assert_eq!(read_metric.key_style, HelpKeyStyle::DiskRead);
+    }
+
+    #[test]
+    fn help_includes_peer_management_route_and_screen_controls() {
+        let items = build_help_items(&Settings::default(), &AppState::default());
+
+        assert!(items.iter().any(|item| {
+            item.subsection == "Global Routes"
+                && item.key == "P"
+                && item.action == "Open peer management"
+        }));
+        assert!(items.iter().any(|item| {
+            item.subsection == "Peer Management"
+                && item.key == "Tab / Shift+Tab"
+                && item.action.contains("Restricted")
+        }));
+        assert!(items.iter().any(|item| {
+            item.subsection == "Peer Management"
+                && item.key == "Enter"
+                && item.action.contains("details")
+        }));
     }
 
     #[test]

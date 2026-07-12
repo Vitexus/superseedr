@@ -4,3 +4,4 @@
 pub mod browser;
 pub mod common;
 pub mod normal;
+pub mod peers;

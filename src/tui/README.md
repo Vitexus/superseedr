@@ -9,6 +9,7 @@
 - `src/tui/screens/*.rs`: per-screen draw + event handling.
 - `src/tui/layout.rs`: layout module root.
 - `src/tui/layout/normal.rs`: normal screen layout planner (`calculate_layout`).
+- `src/tui/layout/peers.rs`: responsive peer-management layout planner.
 - `src/tui/layout/browser.rs`: browser screen layout planner (`calculate_file_browser_layout`).
 - `src/tui/layout/common.rs`: shared table/column layout helpers.
 - `src/tui/tree.rs`: tree navigation/filtering helpers.
@@ -34,6 +35,7 @@
     - `config`
     - `delete_confirm`
     - `file_browser`
+    - `peer_management`
 - `AppMode`:
   - now acts as high-level route/screen id (`Normal`, `Config`, `FileBrowser`, etc.)
   - payload data has been migrated into `AppState.ui` substates.
@@ -47,6 +49,7 @@
   - `a` -> `FileBrowser` (add torrent flow).
   - `d`/`D` -> `DeleteConfirm`.
   - `M` -> `TorrentManagement`.
+  - `P` -> `PeerManagement`.
   - `Q` sets quit flag.
   - `Esc` clears `system_error` (stays in `Normal`).
 - `TorrentManagement`:
@@ -58,6 +61,12 @@
   - `p`, `d`, and `D` queue pause/resume, remove, and purge actions for selected torrents.
   - `Y` opens the draft-command confirmation when commands are queued; `Y` again submits confirmed draft commands.
   - `u` clears draft commands for the current target set.
+  - `Esc`/`q` returns to `Normal`.
+- `PeerManagement`:
+  - `Tab`/`Shift+Tab` cycles `All`, `Active`, `Recent`, and `Restricted` peers.
+  - `/` searches peer addresses, endpoints, torrents, states, and restriction reasons; `Tab` toggles fuzzy/regex while search is active.
+  - `h`/`l` or `←`/`→` moves between visible columns; `s` sorts by the focused column.
+  - `Enter` toggles full peer details on compact layouts; `x` toggles privacy masking.
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
@@ -84,6 +93,8 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `Config` | `Esc` or `Q` | `Normal` | Save + exit |
 | `Normal` | `M` | `TorrentManagement` | Batch torrent management |
 | `TorrentManagement` | `Esc` or `q` | `Normal` | Close management |
+| `Normal` | `P` | `PeerManagement` | Inspect tracked peers and restrictions |
+| `PeerManagement` | `Esc` or `q` | `Normal` | Close peer management |
 | `Normal` | `d`/`D` | `DeleteConfirm` | Selected torrent only |
 | `DeleteConfirm` | `Y` or `Esc` | `Normal` | Confirm/cancel dialog |
 | `Normal` | `a` | `FileBrowser` | Add torrent path flow |

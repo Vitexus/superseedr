@@ -1021,6 +1021,7 @@ pub enum AppMode {
     Normal,
     Help,
     Journal,
+    PeerManagement,
     TorrentManagement,
     PowerSaving,
     DeleteConfirm,
@@ -1586,6 +1587,7 @@ pub struct UiState {
     pub file_browser: FileBrowserUiState,
     pub help: HelpUiState,
     pub journal: JournalUiState,
+    pub peer_management: PeerManagementUiState,
     pub torrent_management: TorrentManagementUiState,
     pub normal_paste_burst: PasteBurst,
     #[allow(dead_code)]
@@ -1949,6 +1951,74 @@ pub enum SearchMode {
     #[default]
     Fuzzy,
     Regex,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PeerManagementFilter {
+    #[default]
+    All,
+    Active,
+    Recent,
+    Restricted,
+}
+
+impl PeerManagementFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Active,
+            Self::Active => Self::Recent,
+            Self::Recent => Self::Restricted,
+            Self::Restricted => Self::All,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::All => Self::Restricted,
+            Self::Active => Self::All,
+            Self::Recent => Self::Active,
+            Self::Restricted => Self::Recent,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "ALL",
+            Self::Active => "ACTIVE",
+            Self::Recent => "RECENT",
+            Self::Restricted => "RESTRICTED",
+        }
+    }
+}
+
+pub struct PeerManagementUiState {
+    pub selected_index: usize,
+    pub filter: PeerManagementFilter,
+    pub is_searching: bool,
+    pub search_query: String,
+    pub search_mode: SearchMode,
+    pub selected_column_index: usize,
+    pub sort_column_index: Option<usize>,
+    pub sort_direction: SortDirection,
+    pub show_details: bool,
+    pub status_message: Option<String>,
+}
+
+impl Default for PeerManagementUiState {
+    fn default() -> Self {
+        Self {
+            selected_index: 0,
+            filter: PeerManagementFilter::All,
+            is_searching: false,
+            search_query: String::new(),
+            search_mode: SearchMode::Regex,
+            selected_column_index: 2,
+            sort_column_index: Some(2),
+            sort_direction: SortDirection::Descending,
+            show_details: false,
+            status_message: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4782,7 +4852,7 @@ impl App {
         normal_animation_active: bool,
     ) -> bool {
         match mode {
-            AppMode::PowerSaving => ui_needs_redraw,
+            AppMode::PowerSaving | AppMode::PeerManagement => ui_needs_redraw,
             AppMode::Normal => ui_needs_redraw || normal_animation_active,
             _ => true,
         }
@@ -10460,6 +10530,20 @@ mod tests {
         ));
         assert!(App::should_draw_this_frame(
             &AppMode::PowerSaving,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_only_draw_dirty_in_peer_management_mode() {
+        assert!(!App::should_draw_this_frame(
+            &AppMode::PeerManagement,
+            false,
+            true
+        ));
+        assert!(App::should_draw_this_frame(
+            &AppMode::PeerManagement,
             true,
             false
         ));
