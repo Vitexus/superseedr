@@ -570,8 +570,22 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Config",
-        "Space / h / l",
-        "Shift or open a control; move through choices with h / l",
+        "Tab / Shift+Tab",
+        "Switch between the settings and details panes",
+        ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config",
+        "Space / Enter / e",
+        "Shift or open a control; Enter and e also open paths",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config",
+        "h / l",
+        "Move backward or forward through choices",
         ActionTone::Navigate
     );
     action_item!(

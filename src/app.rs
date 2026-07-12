@@ -8311,9 +8311,7 @@ impl App {
                     .and_then(ListenerSet::local_port)
                     .unwrap_or(new_port);
                 self.client_configs.client_port = bound_port;
-                if previous_bound_port != Some(bound_port) {
-                    self.app_state.inbound_peer_transports = InboundPeerTransportStatus::default();
-                }
+                let bound_port_changed = previous_bound_port != Some(bound_port);
 
                 tracing_event!(
                     Level::INFO,
@@ -8334,6 +8332,14 @@ impl App {
                 {
                     let info_hashes = self.active_running_torrents_for_dht_announce();
                     self.announce_torrents_to_dht(info_hashes);
+                }
+
+                if bound_port_changed {
+                    self.app_state.externally_accessable_port_v4 = false;
+                    self.app_state.externally_accessable_port_v6 = false;
+                    self.app_state.externally_accessable_port_v4_highlight_until = None;
+                    self.app_state.externally_accessable_port_v6_highlight_until = None;
+                    self.app_state.inbound_peer_transports = InboundPeerTransportStatus::default();
                 }
 
                 true
@@ -11747,6 +11753,12 @@ mod tests {
         let (manager_tx, mut manager_rx) = mpsc::channel(4);
         app.torrent_manager_command_txs
             .insert(b"port-update-test".to_vec(), manager_tx);
+        app.app_state.externally_accessable_port_v4 = true;
+        app.app_state.externally_accessable_port_v6 = true;
+        app.app_state.externally_accessable_port_v4_highlight_until =
+            Some(Instant::now() + Duration::from_secs(1));
+        app.app_state.externally_accessable_port_v6_highlight_until =
+            Some(Instant::now() + Duration::from_secs(1));
         app.app_state.inbound_peer_transports.tcp_ipv4_seen = true;
         app.app_state.inbound_peer_transports.utp_ipv6_seen = true;
 
@@ -11767,6 +11779,16 @@ mod tests {
             app.app_state.inbound_peer_transports,
             InboundPeerTransportStatus::default()
         );
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
+        assert!(app
+            .app_state
+            .externally_accessable_port_v4_highlight_until
+            .is_none());
+        assert!(app
+            .app_state
+            .externally_accessable_port_v6_highlight_until
+            .is_none());
 
         let _ = app.shutdown_tx.send(());
     }
@@ -11819,6 +11841,8 @@ mod tests {
             recorder.recorded_announces(),
             vec![(running_hash, Some(bound_port))]
         );
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
 
         let _ = app.shutdown_tx.send(());
     }

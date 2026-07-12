@@ -11,7 +11,6 @@ use crate::storage::{FileInfo, MultiFileInfo};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_identity::{decode_info_hash, info_hash_from_torrent_source};
 use crate::torrent_manager::state::calculate_deletion_lists;
-use crate::watch_inbox::is_cross_device_link_error;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -421,14 +420,13 @@ fn resolve_torrent_roots(
             )
         })?;
 
-    let effective_root = if is_multi_file {
-        match &torrent_settings.container_name {
-            Some(name) if !name.is_empty() => download_root.join(name),
-            Some(_) => download_root.clone(),
-            None => download_root.join(format!("{} [{}]", torrent_name, info_hash_hex)),
+    let effective_root = match &torrent_settings.container_name {
+        Some(name) if !name.is_empty() => download_root.join(name),
+        Some(_) => download_root.clone(),
+        None if is_multi_file => {
+            download_root.join(format!("{} [{}]", torrent_name, info_hash_hex))
         }
-    } else {
-        download_root.clone()
+        None => download_root.clone(),
     };
 
     Ok((download_root, effective_root))
@@ -683,12 +681,56 @@ pub fn build_move_payload_plan(
     })
 }
 
+#[cfg(any(windows, test))]
+fn normalize_windows_mount_match_path(path: &str) -> String {
+    let normalized = path.replace('/', "\\");
+    let normalized = if normalized
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("\\\\?\\UNC\\"))
+    {
+        format!("\\\\{}", &normalized[8..])
+    } else if normalized
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("\\\\?\\"))
+    {
+        normalized[4..].to_string()
+    } else {
+        normalized
+    };
+    normalized.to_lowercase()
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_matches_mount(path: &str, mount_point: &str) -> bool {
+    let path = normalize_windows_mount_match_path(path);
+    let mount_point = normalize_windows_mount_match_path(mount_point);
+    if path == mount_point {
+        return true;
+    }
+    if mount_point.ends_with('\\') {
+        path.starts_with(&mount_point)
+    } else {
+        path.strip_prefix(&mount_point)
+            .is_some_and(|suffix| suffix.starts_with('\\'))
+    }
+}
+
+#[cfg(windows)]
+fn path_matches_disk_mount(path: &Path, mount_point: &Path) -> bool {
+    windows_path_matches_mount(&path.to_string_lossy(), &mount_point.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn path_matches_disk_mount(path: &Path, mount_point: &Path) -> bool {
+    path.starts_with(mount_point)
+}
+
 fn disk_mount_for_path(path: &Path) -> Option<PathBuf> {
     let disks = Disks::new_with_refreshed_list();
     disks
         .list()
         .iter()
-        .filter(|disk| path.starts_with(disk.mount_point()))
+        .filter(|disk| path_matches_disk_mount(path, disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().as_os_str().len())
         .map(|disk| disk.mount_point().to_path_buf())
 }
@@ -705,7 +747,7 @@ fn available_space_for_path(path: &Path) -> Option<u64> {
     disks
         .list()
         .iter()
-        .filter(|disk| path.starts_with(disk.mount_point()))
+        .filter(|disk| path_matches_disk_mount(path, disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().as_os_str().len())
         .map(|disk| disk.available_space())
 }
@@ -871,144 +913,185 @@ fn preflight_move_payload_files(plan: &MovePayloadPlan) -> Result<(), String> {
     Ok(())
 }
 
-fn rollback_completed_renames(renamed_files: &[(PathBuf, PathBuf)]) -> Result<(), String> {
-    for (source, destination) in renamed_files.iter().rev() {
-        if source.exists() {
-            return Err(format!(
-                "Cannot roll back '{}' because source already exists: {}",
+#[derive(Debug)]
+pub struct OfflineMoveTransaction {
+    next_settings: Settings,
+    success_message: String,
+    staged_files: Vec<(PathBuf, PathBuf)>,
+    source_directories: Vec<PathBuf>,
+}
+
+impl OfflineMoveTransaction {
+    pub fn next_settings(&self) -> &Settings {
+        &self.next_settings
+    }
+
+    pub fn commit(self) -> String {
+        let cleanup_errors = finalize_staged_move_files(&self.staged_files);
+        for error in &cleanup_errors {
+            tracing::warn!("{}", error);
+        }
+        for dir_path in &self.source_directories {
+            if let Err(error) = fs::remove_dir(dir_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::info!("Skipped dir deletion {:?}: {}", dir_path, error);
+                }
+            }
+        }
+
+        if cleanup_errors.is_empty() {
+            self.success_message
+        } else {
+            format!(
+                "{}. The destination is active, but {} source file(s) could not be removed.",
+                self.success_message,
+                cleanup_errors.len()
+            )
+        }
+    }
+}
+
+fn ensure_copy_space(destination: &Path, required_space: u64) -> Result<(), String> {
+    let check_path = destination.parent().unwrap_or(destination);
+    let Some(available_space) = available_space_for_path(check_path) else {
+        return Err(format!(
+            "Could not determine available space at '{}' for move",
+            check_path.display()
+        ));
+    };
+    ensure_destination_space_for_move_with_available(check_path, required_space, available_space)
+}
+
+fn stage_move_file(source: &Path, destination: &Path, source_len: u64) -> Result<(), String> {
+    if paths_share_disk_mount(source, destination) {
+        match fs::hard_link(source, destination) {
+            Ok(()) => return verify_moved_destination(source, destination, source_len),
+            Err(error) if destination.exists() => {
+                return Err(format!(
+                    "Move destination appeared while staging '{}': {}",
+                    destination.display(),
+                    error
+                ));
+            }
+            Err(_) => ensure_copy_space(destination, source_len)?,
+        }
+    }
+
+    copy_for_cross_device_move(source, destination, source_len)
+}
+
+fn rollback_staged_move_files(files: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (source, destination) in files.iter().rev() {
+        if !source.exists() {
+            errors.push(format!(
+                "Cannot remove staged destination '{}' because source is missing: {}",
                 destination.display(),
                 source.display()
             ));
-        }
-        let destination_len = metadata_len(destination)?;
-        fs::rename(destination, source).map_err(|error| {
-            format!(
-                "Failed to roll back '{}' to '{}': {}",
-                destination.display(),
-                source.display(),
-                error
-            )
-        })?;
-        verify_moved_destination(destination, source, destination_len)?;
-    }
-    Ok(())
-}
-
-fn cleanup_cross_device_copies(copied_files: &[(PathBuf, PathBuf)]) -> Result<(), String> {
-    for (source, destination) in copied_files.iter().rev() {
-        if !source.exists() || !destination.exists() {
             continue;
         }
-        fs::remove_file(destination).map_err(|error| {
-            format!(
-                "Failed to remove copied destination '{}' during rollback: {}",
-                destination.display(),
-                error
-            )
-        })?;
+        if let Err(error) = fs::remove_file(destination) {
+            if error.kind() != io::ErrorKind::NotFound {
+                errors.push(format!(
+                    "Failed to remove staged destination '{}': {}",
+                    destination.display(),
+                    error
+                ));
+            }
+        }
     }
-    Ok(())
-}
 
-fn move_torrent_payload_files_with_rename<F>(
-    plan: &MovePayloadPlan,
-    mut rename_op: F,
-) -> Result<usize, String>
-where
-    F: FnMut(&Path, &Path) -> io::Result<()>,
-{
-    preflight_move_payload_files(plan)?;
-
-    let mut moved_count = 0;
-    let mut renamed_files = Vec::new();
-    let mut copied_cross_device_files = Vec::new();
-
-    let move_result = (|| -> Result<(), String> {
-        for (source, destination) in &plan.files {
-            if !source.exists() {
-                continue;
-            }
-            if same_existing_file(source, destination) {
-                continue;
-            }
-            let source_len = metadata_len(source)?;
-            match rename_op(source, destination) {
-                Ok(()) => {
-                    renamed_files.push((source.clone(), destination.clone()));
-                    verify_moved_destination(source, destination, source_len)?;
-                    if source.exists() {
-                        return Err(format!(
-                            "Move metadata check failed because source still exists: {}",
-                            source.display()
-                        ));
-                    }
-                }
-                Err(error) if is_cross_device_link_error(&error) => {
-                    if let Err(copy_error) =
-                        copy_for_cross_device_move(source, destination, source_len)
-                    {
-                        if source.exists() && destination.exists() {
-                            let _ = fs::remove_file(destination);
-                        }
-                        return Err(copy_error);
-                    }
-                    copied_cross_device_files.push((source.clone(), destination.clone()));
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "Failed to move '{}' to '{}': {}",
-                        source.display(),
-                        destination.display(),
-                        error
-                    ));
-                }
-            }
-            moved_count += 1;
-        }
-
-        for (source, destination) in &copied_cross_device_files {
-            verify_moved_destination(source, destination, metadata_len(source)?)?;
-        }
+    if errors.is_empty() {
         Ok(())
-    })();
-
-    if let Err(error) = move_result {
-        let copy_cleanup_error = cleanup_cross_device_copies(&copied_cross_device_files).err();
-        let rename_rollback_error = rollback_completed_renames(&renamed_files).err();
-        let rollback_errors = [copy_cleanup_error, rename_rollback_error]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        return Err(if rollback_errors.is_empty() {
-            error
-        } else {
-            format!("{}. Rollback failed: {}", error, rollback_errors.join("; "))
-        });
+    } else {
+        Err(errors.join("; "))
     }
+}
 
-    for (source, _) in &copied_cross_device_files {
+fn finalize_staged_move_files(files: &[(PathBuf, PathBuf)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (source, _) in files {
         if let Err(error) = fs::remove_file(source) {
-            tracing::warn!(
-                "Move completed but copied cross-volume source could not be removed '{}': {}",
-                source.display(),
-                error
-            );
-        }
-    }
-    for dir_path in &plan.source_directories {
-        if let Err(error) = fs::remove_dir(dir_path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::info!("Skipped dir deletion {:?}: {}", dir_path, error);
+            if error.kind() != io::ErrorKind::NotFound {
+                errors.push(format!(
+                    "Move committed but source could not be removed '{}': {}",
+                    source.display(),
+                    error
+                ));
             }
         }
     }
-
-    Ok(moved_count)
+    errors
 }
 
-pub fn move_torrent_payload_files(plan: &MovePayloadPlan) -> Result<usize, String> {
-    move_torrent_payload_files_with_rename(plan, |source, destination| {
-        fs::rename(source, destination)
+fn stage_move_payload_files(plan: &MovePayloadPlan) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+    preflight_move_payload_files(plan)?;
+    let mut staged_files = Vec::new();
+
+    for (source, destination) in &plan.files {
+        if !source.exists() || same_existing_file(source, destination) {
+            continue;
+        }
+        let source_len = metadata_len(source)?;
+        if let Err(error) = stage_move_file(source, destination, source_len) {
+            if source.exists() && destination.exists() {
+                let _ = fs::remove_file(destination);
+            }
+            let rollback_error = rollback_staged_move_files(&staged_files).err();
+            return Err(match rollback_error {
+                Some(rollback_error) => {
+                    format!("{}. Rollback failed: {}", error, rollback_error)
+                }
+                None => error,
+            });
+        }
+        if !source.exists() {
+            let error = format!(
+                "Move staging unexpectedly removed source: {}",
+                source.display()
+            );
+            let _ = fs::remove_file(destination);
+            let rollback_error = rollback_staged_move_files(&staged_files).err();
+            return Err(match rollback_error {
+                Some(rollback_error) => {
+                    format!("{}. Rollback failed: {}", error, rollback_error)
+                }
+                None => error,
+            });
+        }
+        staged_files.push((source.clone(), destination.clone()));
+    }
+
+    Ok(staged_files)
+}
+
+pub fn prepare_offline_move_transaction(
+    settings: &Settings,
+    info_hash_hex: &str,
+    download_path: &Path,
+) -> Result<OfflineMoveTransaction, String> {
+    let info_hash = decode_info_hash(info_hash_hex)?;
+    let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
+        return Err(format!("Torrent '{}' was not found", info_hash_hex));
+    };
+    let canonical_download_path = validate_move_download_path(download_path)?;
+    let move_plan = build_move_payload_plan(settings, info_hash_hex, &canonical_download_path)?;
+    ensure_destination_space_for_move(&move_plan)?;
+    let staged_files = stage_move_payload_files(&move_plan)?;
+
+    let mut next_settings = settings.clone();
+    next_settings.torrents[index].download_path = Some(canonical_download_path.clone());
+    Ok(OfflineMoveTransaction {
+        next_settings,
+        success_message: format!(
+            "Moved {} file(s) and updated download path for torrent '{}' to '{}'",
+            staged_files.len(),
+            info_hash_hex,
+            canonical_download_path.display()
+        ),
+        staged_files,
+        source_directories: move_plan.source_directories,
     })
 }
 
@@ -1175,31 +1258,16 @@ pub fn plan_control_request(
             let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
                 return Err(format!("Torrent '{}' was not found", info_hash_hex));
             };
-            let moved_file_count =
-                match build_move_payload_plan(settings, info_hash_hex, download_path) {
-                    Ok(move_plan) => {
-                        ensure_destination_space_for_move(&move_plan)?;
-                        move_torrent_payload_files(&move_plan)?
-                    }
-                    Err(error)
-                        if error.contains("does not have persisted file metadata")
-                            || error.contains("does not have a persisted .torrent source")
-                            || error.contains("does not have a resolved download path") =>
-                    {
-                        0
-                    }
-                    Err(error) => return Err(error),
-                };
+            let canonical_download_path = validate_move_download_path(download_path)?;
+            build_move_payload_plan(settings, info_hash_hex, &canonical_download_path)?;
             let mut next_settings = settings.clone();
-            next_settings.torrents[index].download_path =
-                Some(validate_move_download_path(download_path)?);
+            next_settings.torrents[index].download_path = Some(canonical_download_path.clone());
             Ok(ControlExecutionPlan::ApplySettings {
                 next_settings,
                 success_message: format!(
-                    "Moved {} file(s) and updated download path for torrent '{}' to '{}'",
-                    moved_file_count,
+                    "Prepared download path update for torrent '{}' to '{}'",
                     info_hash_hex,
-                    download_path.display()
+                    canonical_download_path.display()
                 ),
             })
         }
@@ -1297,6 +1365,16 @@ pub fn apply_offline_control_request(
     settings: &mut Settings,
     request: &ControlRequest,
 ) -> Result<String, String> {
+    if let ControlRequest::MoveTorrent {
+        info_hash_hex,
+        download_path,
+    } = request
+    {
+        let transaction = prepare_offline_move_transaction(settings, info_hash_hex, download_path)?;
+        *settings = transaction.next_settings().clone();
+        return Ok(transaction.commit());
+    }
+
     match plan_control_request(settings, request)? {
         ControlExecutionPlan::StatusNow
         | ControlExecutionPlan::StatusFollowStart { .. }
@@ -1383,9 +1461,9 @@ mod tests {
     use super::{
         apply_offline_control_request, apply_offline_purge,
         ensure_destination_space_for_move_with_available, find_torrent_settings_index_by_info_hash,
-        list_torrent_files, move_torrent_payload_files_with_rename, plan_control_request,
-        required_destination_space_for_move_with, resolve_purge_target_info_hash,
-        resolve_target_info_hash, ControlExecutionPlan, MovePayloadPlan,
+        list_torrent_files, plan_control_request, required_destination_space_for_move_with,
+        resolve_purge_target_info_hash, resolve_target_info_hash, resolve_torrent_roots,
+        windows_path_matches_mount, ControlExecutionPlan, MovePayloadPlan,
     };
     use crate::config::{set_app_paths_override_for_tests, Settings, TorrentSettings};
     use crate::integrations::control::{
@@ -1558,6 +1636,48 @@ mod tests {
     }
 
     #[test]
+    fn extended_platform_paths_match_drive_and_network_mounts() {
+        assert!(windows_path_matches_mount(
+            r"\\?\C:\Downloads\payload.bin",
+            r"C:\"
+        ));
+        assert!(windows_path_matches_mount(
+            r"\\?\UNC\server\share\payload\item.bin",
+            r"\\server\share"
+        ));
+        assert!(windows_path_matches_mount(
+            r"\\?\c:\DATA\payload.bin",
+            r"C:\data"
+        ));
+        assert!(!windows_path_matches_mount(
+            r"\\?\C:\database\payload.bin",
+            r"C:\data"
+        ));
+    }
+
+    #[test]
+    fn single_file_effective_root_honors_nonempty_container_name() {
+        let download_root = PathBuf::from("/tmp/sample-downloads");
+        let torrent = TorrentSettings {
+            download_path: Some(download_root.clone()),
+            container_name: Some("single-file-container".to_string()),
+            ..TorrentSettings::default()
+        };
+
+        let (resolved_download_root, effective_root) = resolve_torrent_roots(
+            &Settings::default(),
+            &torrent,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            false,
+            "sample-item.bin",
+        )
+        .expect("resolve single-file roots");
+
+        assert_eq!(resolved_download_root, download_root);
+        assert_eq!(effective_root, download_root.join("single-file-container"));
+    }
+
+    #[test]
     fn move_space_check_rejects_when_available_space_is_too_low() {
         let destination_root = PathBuf::from("/tmp/superseedr-low-space-test");
 
@@ -1567,40 +1687,6 @@ mod tests {
         assert!(error.contains("Not enough free space"));
         assert!(error.contains("available=512"));
         assert!(error.contains("required=1024"));
-    }
-
-    #[test]
-    fn move_payload_falls_back_to_copy_verify_delete_for_cross_device_rename() {
-        let source_root = tempfile::tempdir().expect("create source root");
-        let destination_root = tempfile::tempdir().expect("create destination root");
-        let source_dir = source_root.path().join("payload");
-        fs::create_dir_all(&source_dir).expect("create source dir");
-        let source_a = source_dir.join("a.bin");
-        let source_b = source_dir.join("b.bin");
-        fs::write(&source_a, b"alpha").expect("write source a");
-        fs::write(&source_b, b"bravo").expect("write source b");
-        let destination_a = destination_root.path().join("payload").join("a.bin");
-        let destination_b = destination_root.path().join("payload").join("b.bin");
-        let plan = MovePayloadPlan {
-            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            destination_root: destination_root.path().to_path_buf(),
-            files: vec![
-                (source_a.clone(), destination_a.clone()),
-                (source_b.clone(), destination_b.clone()),
-            ],
-            source_directories: vec![source_dir],
-        };
-
-        let moved_count = move_torrent_payload_files_with_rename(&plan, |_source, _destination| {
-            Err(std::io::Error::from_raw_os_error(18))
-        })
-        .expect("cross-device fallback move");
-
-        assert_eq!(moved_count, 2);
-        assert_eq!(fs::read(destination_a).expect("read moved a"), b"alpha");
-        assert_eq!(fs::read(destination_b).expect("read moved b"), b"bravo");
-        assert!(!source_a.exists());
-        assert!(!source_b.exists());
     }
 
     #[test]
@@ -1624,54 +1710,12 @@ mod tests {
             source_directories: Vec::new(),
         };
 
-        let error =
-            super::move_torrent_payload_files(&plan).expect_err("later conflict should fail");
+        let error = super::stage_move_payload_files(&plan).expect_err("later conflict should fail");
 
         assert!(error.contains("already exists"));
         assert_eq!(fs::read(&source_a).expect("source a remains"), b"alpha");
         assert_eq!(fs::read(&source_b).expect("source b remains"), b"bravo");
         assert!(!destination_a.exists());
-    }
-
-    #[test]
-    fn move_payload_rolls_back_completed_renames_when_a_later_rename_fails() {
-        let source_root = tempfile::tempdir().expect("create source root");
-        let destination_root = tempfile::tempdir().expect("create destination root");
-        let source_a = source_root.path().join("a.bin");
-        let source_b = source_root.path().join("b.bin");
-        fs::write(&source_a, b"alpha").expect("write source a");
-        fs::write(&source_b, b"bravo").expect("write source b");
-        let destination_a = destination_root.path().join("a.bin");
-        let destination_b = destination_root.path().join("b.bin");
-        let plan = MovePayloadPlan {
-            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            destination_root: destination_root.path().to_path_buf(),
-            files: vec![
-                (source_a.clone(), destination_a.clone()),
-                (source_b.clone(), destination_b.clone()),
-            ],
-            source_directories: Vec::new(),
-        };
-        let mut rename_attempt = 0;
-
-        let error = move_torrent_payload_files_with_rename(&plan, |source, destination| {
-            rename_attempt += 1;
-            if rename_attempt == 2 {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "injected rename failure",
-                ))
-            } else {
-                fs::rename(source, destination)
-            }
-        })
-        .expect_err("second rename should fail");
-
-        assert!(error.contains("injected rename failure"));
-        assert_eq!(fs::read(&source_a).expect("source a restored"), b"alpha");
-        assert_eq!(fs::read(&source_b).expect("source b remains"), b"bravo");
-        assert!(!destination_a.exists());
-        assert!(!destination_b.exists());
     }
 
     #[test]
