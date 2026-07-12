@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::torrent_file::{Torrent, V2RootInfo};
+use crate::torrent_file::{validate_container_name, Torrent, V2RootInfo};
 use crate::torrent_manager::piece_manager::EffectivePiecePriority;
 use crate::torrent_manager::piece_manager::PieceManager;
 use crate::torrent_manager::piece_manager::PieceStatus;
@@ -266,6 +266,7 @@ pub enum Effect {
 
     ClearAllUploads,
     DeleteFiles {
+        download_root: PathBuf,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
     },
@@ -2217,7 +2218,11 @@ impl TorrentState {
                 if let (Some(path), Some(mfi)) = (&self.torrent_data_path, &self.multi_file_info) {
                     let container = self.container_name.as_deref();
                     let (files, directories) = calculate_deletion_lists(mfi, path, container);
-                    effects.push(Effect::DeleteFiles { files, directories });
+                    effects.push(Effect::DeleteFiles {
+                        download_root: path.clone(),
+                        files,
+                        directories,
+                    });
                 } else {
                     if self.torrent_status != TorrentStatus::AwaitingMetadata
                         && self.torrent_status != TorrentStatus::Validating
@@ -2557,6 +2562,17 @@ impl TorrentState {
             }
         };
 
+        if let Err(error) = torrent.validate_paths() {
+            event!(
+                Level::ERROR,
+                torrent_name = %torrent.info.name,
+                error = %error,
+                "rebuild_multi_file_info: Refusing invalid torrent metadata."
+            );
+            self.multi_file_info = None;
+            return;
+        }
+
         // Guard 2: Handle the Option<PathBuf>
         let path = match &self.torrent_data_path {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -2575,6 +2591,20 @@ impl TorrentState {
                 return;
             }
         };
+
+        if let Some(container_name) = self.container_name.as_deref() {
+            if let Err(error) = validate_container_name(container_name) {
+                event!(
+                    Level::ERROR,
+                    torrent_name = %torrent.info.name,
+                    container_name,
+                    error = %error,
+                    "rebuild_multi_file_info: Refusing unsafe container name."
+                );
+                self.multi_file_info = None;
+                return;
+            }
+        }
 
         let effective_path = match &self.container_name {
             // Case A: User specified a folder
@@ -2597,7 +2627,8 @@ impl TorrentState {
                 }
             }
         };
-        self.multi_file_info = MultiFileInfo::new(
+        self.multi_file_info = MultiFileInfo::new_with_download_root(
+            path,
             &effective_path,
             &torrent.info.name,
             if torrent.info.files.is_empty() { None } else { Some(&torrent.info.files) },
@@ -8253,6 +8284,7 @@ mod tests {
                 is_skipped: false,
             }],
             total_size: 100,
+            download_root: PathBuf::from("."),
         });
 
         assert_eq!(
@@ -8295,6 +8327,7 @@ mod tests {
                 },
             ],
             total_size: 120,
+            download_root: PathBuf::from("."),
         });
 
         assert_eq!(
@@ -8339,6 +8372,7 @@ mod tests {
                 },
             ],
             total_size: 120,
+            download_root: PathBuf::from("."),
         });
 
         let effects = state.update(Action::IncomingBlock {
@@ -8395,6 +8429,7 @@ mod tests {
                 },
             ],
             total_size: 120,
+            download_root: PathBuf::from("."),
         });
 
         state.record_pending_file_activity(0, 0, 10, FileActivityDirection::Download);
@@ -8455,6 +8490,7 @@ mod tests {
                 },
             ],
             total_size: 120,
+            download_root: PathBuf::from("."),
         });
 
         state.record_pending_file_activity(0, 60, 10, FileActivityDirection::Download);
@@ -8509,6 +8545,26 @@ mod tests {
             "Should flatten multi-file torrent when container_name is empty"
         );
     }
+
+    #[test]
+    fn rebuild_multi_file_info_rejects_unsafe_container_name() {
+        let mut state = create_empty_state();
+        let mut torrent = create_dummy_torrent(1);
+        torrent.info.name = "safe-item".to_string();
+        torrent.info.files = vec![crate::torrent_file::InfoFile {
+            length: 1,
+            path: vec!["payload.bin".to_string()],
+            md5sum: None,
+            attr: None,
+        }];
+
+        state.torrent = Some(torrent);
+        state.torrent_data_path = Some(PathBuf::from("/tmp/downloads"));
+        state.container_name = Some("../outside".to_string());
+        state.rebuild_multi_file_info();
+
+        assert!(state.multi_file_info.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -8533,6 +8589,7 @@ mod deletion_tests {
         MultiFileInfo {
             files,
             total_size: 100,
+            download_root: PathBuf::from("/"),
         }
     }
 

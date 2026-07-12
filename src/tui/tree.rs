@@ -84,7 +84,7 @@ impl<T: Clone + Default + std::ops::AddAssign> RawNode<T> {
         };
 
         for (path_parts, payload) in files {
-            internal_root.insert_recursive(&path_parts, payload, Path::new(""));
+            let _ = internal_root.insert_recursive(&path_parts, payload, Path::new(""));
         }
 
         internal_root.sort_recursive();
@@ -103,36 +103,58 @@ impl<T: Clone + Default + std::ops::AddAssign> RawNode<T> {
         }
     }
 
-    fn insert_recursive(&mut self, path_parts: &[String], payload: T, parent_path: &Path) {
-        // This line is the reason we need AddAssign
-        self.payload += payload.clone();
-
+    fn insert_recursive(&mut self, path_parts: &[String], payload: T, parent_path: &Path) -> bool {
         if path_parts.is_empty() {
-            return;
+            return false;
         }
 
         let name = &path_parts[0];
         let is_last = path_parts.len() == 1;
         let current_path = parent_path.join(name);
 
-        let child_idx = if let Some(idx) = self.children.iter().position(|c| &c.name == name) {
-            idx
-        } else {
-            let new_node = RawNode {
-                name: name.clone(),
-                full_path: current_path.clone(),
-                children: Vec::new(),
-                payload: T::default(),
-                is_dir: !is_last,
+        let (child_idx, created) =
+            if let Some(idx) = self.children.iter().position(|child| &child.name == name) {
+                // A valid path list cannot contain an exact duplicate or use the same path as both
+                // a file and a directory. Keep the first structurally valid entry if malformed data
+                // reaches this generic helper instead of overwriting its payload or hiding children.
+                if is_last || !self.children[idx].is_dir {
+                    tracing::warn!(
+                        path = %current_path.display(),
+                        "Ignoring duplicate or prefix-colliding tree entry"
+                    );
+                    return false;
+                }
+                (idx, false)
+            } else {
+                let new_node = RawNode {
+                    name: name.clone(),
+                    full_path: current_path.clone(),
+                    children: Vec::new(),
+                    payload: T::default(),
+                    is_dir: !is_last,
+                };
+                self.children.push(new_node);
+                (self.children.len() - 1, true)
             };
-            self.children.push(new_node);
-            self.children.len() - 1
-        };
 
         if is_last {
-            self.children[child_idx].payload = payload;
+            self.children[child_idx].payload = payload.clone();
+            self.payload += payload;
+            return true;
+        }
+
+        if self.children[child_idx].insert_recursive(
+            &path_parts[1..],
+            payload.clone(),
+            &current_path,
+        ) {
+            self.payload += payload;
+            true
         } else {
-            self.children[child_idx].insert_recursive(&path_parts[1..], payload, &current_path);
+            if created {
+                self.children.remove(child_idx);
+            }
+            false
         }
     }
 }
@@ -848,5 +870,97 @@ mod tests {
         );
         assert!(!state.expanded_paths.contains(&PathBuf::from("Root")));
         assert!(state.selected_paths.contains(&child_path));
+    }
+
+    #[test]
+    fn duplicate_and_prefix_collisions_keep_the_first_valid_tree_entry() {
+        let duplicate_tree = RawNode::from_path_list(
+            Some("root".to_string()),
+            vec![
+                (vec!["entry".to_string()], 5u64),
+                (vec!["entry".to_string()], 9u64),
+            ],
+        );
+        assert_eq!(duplicate_tree[0].payload, 5);
+        assert_eq!(duplicate_tree[0].children.len(), 1);
+        assert_eq!(duplicate_tree[0].children[0].payload, 5);
+
+        let prefix_tree = RawNode::from_path_list(
+            Some("root".to_string()),
+            vec![
+                (vec!["entry".to_string()], 5u64),
+                (vec!["entry".to_string(), "child".to_string()], 9u64),
+            ],
+        );
+        assert_eq!(prefix_tree[0].payload, 5);
+        assert_eq!(prefix_tree[0].children.len(), 1);
+        assert!(!prefix_tree[0].children[0].is_dir);
+        assert!(prefix_tree[0].children[0].children.is_empty());
+    }
+
+    #[test]
+    fn equal_v2_padding_entries_retain_all_file_priorities() {
+        use crate::app::{FilePriority, TorrentPreviewPayload};
+        use crate::torrent_file::{Info, Torrent};
+        use serde_bencode::value::Value;
+        use std::collections::HashMap;
+
+        let mut file_tree = HashMap::new();
+        for (name, root_byte) in [("alpha.bin", 0xAA), ("beta.bin", 0xBB)] {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "pieces root".as_bytes().to_vec(),
+                Value::Bytes(vec![root_byte; 32]),
+            );
+            metadata.insert("length".as_bytes().to_vec(), Value::Int(1));
+
+            let mut leaf = HashMap::new();
+            leaf.insert(vec![], Value::Dict(metadata));
+            file_tree.insert(name.as_bytes().to_vec(), Value::Dict(leaf));
+        }
+
+        let mut torrent = Torrent {
+            info: Info {
+                name: "equal-remainder-sample".to_string(),
+                piece_length: 4,
+                pieces: vec![],
+                length: 0,
+                files: vec![],
+                private: None,
+                md5sum: None,
+                meta_version: Some(2),
+                file_tree: Some(Value::Dict(file_tree)),
+            },
+            ..Torrent::default()
+        };
+        crate::torrent_file::parser::polyfill_v2_files(&mut torrent);
+
+        let payloads = torrent
+            .file_list()
+            .into_iter()
+            .enumerate()
+            .map(|(file_index, (path, size))| {
+                (
+                    path,
+                    TorrentPreviewPayload {
+                        file_index: Some(file_index),
+                        size,
+                        priority: FilePriority::Normal,
+                    },
+                )
+            })
+            .collect();
+        let mut preview_tree = RawNode::from_path_list(None, payloads);
+
+        assert!(crate::tui::screens::browser::apply_priority_cycle_to_all(
+            &mut preview_tree
+        ));
+
+        let mut priorities = HashMap::new();
+        for node in &preview_tree {
+            node.collect_priorities(&mut priorities);
+        }
+        assert_eq!(priorities.len(), 4);
+        assert!((0..4).all(|index| priorities.get(&index) == Some(&FilePriority::Skip)));
     }
 }

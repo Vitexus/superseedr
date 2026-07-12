@@ -40,6 +40,7 @@ use crate::torrent_manager::SyntheticPeerConnectFailure;
 
 use crate::errors::StorageError;
 use crate::storage::create_and_allocate_files;
+use crate::storage::ensure_path_within_root;
 use crate::storage::read_data_from_disk;
 use crate::storage::write_data_to_disk;
 use crate::storage::MultiFileInfo;
@@ -425,6 +426,7 @@ fn log_utp_connect_failure(
 struct PreparedFileProbeEntry {
     relative_path: std::path::PathBuf,
     absolute_path: std::path::PathBuf,
+    download_root: std::path::PathBuf,
     expected_size: u64,
 }
 
@@ -1462,15 +1464,47 @@ impl TorrentManager {
                 }
             }
 
-            Effect::DeleteFiles { files, directories } => {
+            Effect::DeleteFiles {
+                download_root,
+                files,
+                directories,
+            } => {
                 let info_hash = self.state.info_hash.clone();
                 let tx = self.manager_event_tx.clone();
 
                 tokio::spawn(async move {
                     let mut result = Ok(());
+                    let mut containment_failed = false;
+
+                    // Validate every target before deleting anything. This keeps
+                    // a symlinked parent from redirecting a torrent purge outside
+                    // the selected download directory or causing a partial purge.
+                    for path in files.iter().chain(directories.iter()) {
+                        if let Err(error) = ensure_path_within_root(&download_root, path) {
+                            let error_msg = format!(
+                                "Refusing to delete path {:?} outside download root {:?}: {}",
+                                path, download_root, error
+                            );
+                            event!(Level::ERROR, "{}", error_msg);
+                            let _ = tx
+                                .send(ManagerEvent::DeletionComplete(info_hash, Err(error_msg)))
+                                .await;
+                            return;
+                        }
+                    }
 
                     // 1. Delete Files
                     for file_path in files {
+                        if let Err(error) = ensure_path_within_root(&download_root, &file_path) {
+                            let error_msg = format!(
+                                "Refusing to delete path {:?} outside download root {:?}: {}",
+                                file_path, download_root, error
+                            );
+                            event!(Level::ERROR, "{}", error_msg);
+                            result = Err(error_msg);
+                            containment_failed = true;
+                            break;
+                        }
                         if let Err(e) = fs::remove_file(&file_path).await {
                             // If it's already gone, that's fine (success).
                             if e.kind() != std::io::ErrorKind::NotFound {
@@ -1486,13 +1520,29 @@ impl TorrentManager {
                     // We use remove_dir (not remove_dir_all) for safety.
                     // It will simply fail (safely) if the directory is not empty
                     // (e.g., user added their own files to the folder).
-                    for dir_path in directories {
-                        if let Err(e) = fs::remove_dir(&dir_path).await {
-                            if e.kind() != std::io::ErrorKind::NotFound {
-                                event!(Level::INFO, "Skipped dir deletion {:?}: {}", &dir_path, e);
+                    if !containment_failed {
+                        for dir_path in directories {
+                            if let Err(error) = ensure_path_within_root(&download_root, &dir_path) {
+                                let error_msg = format!(
+                                    "Refusing to delete path {:?} outside download root {:?}: {}",
+                                    dir_path, download_root, error
+                                );
+                                event!(Level::ERROR, "{}", error_msg);
+                                result = Err(error_msg);
+                                break;
                             }
-                        } else {
-                            event!(Level::INFO, "Cleaned up directory: {:?}", &dir_path);
+                            if let Err(e) = fs::remove_dir(&dir_path).await {
+                                if e.kind() != std::io::ErrorKind::NotFound {
+                                    event!(
+                                        Level::INFO,
+                                        "Skipped dir deletion {:?}: {}",
+                                        &dir_path,
+                                        e
+                                    );
+                                }
+                            } else {
+                                event!(Level::INFO, "Cleaned up directory: {:?}", &dir_path);
+                            }
                         }
                     }
 
@@ -1928,6 +1978,8 @@ impl TorrentManager {
             if file_info.is_padding {
                 continue;
             }
+
+            ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
 
             let metadata = match fs::metadata(&file_info.path).await {
                 Ok(metadata) => metadata,
@@ -2927,6 +2979,7 @@ impl TorrentManager {
             files.push(PreparedFileProbeEntry {
                 relative_path,
                 absolute_path: file_info.path.clone(),
+                download_root: multi_file_info.download_root.clone(),
                 expected_size: file_info.length,
             });
         }
@@ -2952,26 +3005,32 @@ impl TorrentManager {
         let mut problem_files = Vec::new();
 
         for file in batch.files {
-            let (error, observed_size) = match fs::metadata(&file.absolute_path).await {
-                Ok(metadata) => {
-                    if !metadata.is_file() {
-                        (Some(StorageError::UnexpectedType), None)
-                    } else {
-                        let observed_size = metadata.len();
-                        (
-                            if observed_size == file.expected_size {
-                                None
-                            } else {
-                                Some(StorageError::SizeMismatch {
-                                    expected_size: file.expected_size,
-                                    observed_size,
-                                })
-                            },
-                            Some(observed_size),
-                        )
+            let containment_error =
+                ensure_path_within_root(&file.download_root, &file.absolute_path).err();
+            let (error, observed_size) = if let Some(error) = containment_error {
+                (Some(StorageError::from(error)), None)
+            } else {
+                match fs::metadata(&file.absolute_path).await {
+                    Ok(metadata) => {
+                        if !metadata.is_file() {
+                            (Some(StorageError::UnexpectedType), None)
+                        } else {
+                            let observed_size = metadata.len();
+                            (
+                                if observed_size == file.expected_size {
+                                    None
+                                } else {
+                                    Some(StorageError::SizeMismatch {
+                                        expected_size: file.expected_size,
+                                        observed_size,
+                                    })
+                                },
+                                Some(observed_size),
+                            )
+                        }
                     }
+                    Err(error) => (Some(StorageError::from(error)), None),
                 }
-                Err(error) => (Some(StorageError::from(error)), None),
             };
             let Some(error) = error else {
                 continue;
@@ -5997,7 +6056,7 @@ mod resource_tests {
     #[tokio::test]
     async fn test_v2_multi_file_alignment_bug() {
         let (mut manager, _, _, _, _) = setup_test_harness();
-        let piece_len = 1024;
+        let piece_len = 16_384;
 
         // --- 2. CREATE MULTI-FILE V2 TORRENT ---
         let root_a = vec![0xAA; 32];

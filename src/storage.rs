@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::errors::StorageError;
+use std::ffi::OsString;
+use std::fs as std_fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tokio::fs::{self, try_exists, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
-use crate::torrent_file::InfoFile;
+use crate::torrent_file::{validate_torrent_layout, InfoFile};
 use crate::tui::tree::RawNode;
 
 use crate::app::{FileMetadata, FilePriority};
@@ -28,11 +30,15 @@ pub struct FileInfo {
 pub struct MultiFileInfo {
     pub files: Vec<FileInfo>,
     pub total_size: u64,
+    /// The user-selected download root. All file paths must resolve below this
+    /// boundary, even when existing path components are symbolic links.
+    pub download_root: PathBuf,
 }
 
 impl MultiFileInfo {
     /// Creates a new MultiFileInfo map. This is the central point of unification.
     /// It intelligently handles both single and multi-file torrent metadata.
+    #[cfg(test)]
     pub fn new(
         root_dir: &Path,
         torrent_name: &str,
@@ -40,6 +46,30 @@ impl MultiFileInfo {
         length: Option<u64>,
         file_priorities: &HashMap<usize, FilePriority>, // NEW ARGUMENT
     ) -> std::io::Result<Self> {
+        Self::new_with_download_root(
+            root_dir,
+            root_dir,
+            torrent_name,
+            files,
+            length,
+            file_priorities,
+        )
+    }
+
+    /// Creates a file map while keeping the selected download directory as a
+    /// separate containment boundary from an optional torrent container.
+    pub fn new_with_download_root(
+        download_root: &Path,
+        root_dir: &Path,
+        torrent_name: &str,
+        files: Option<&Vec<InfoFile>>,
+        length: Option<u64>,
+        file_priorities: &HashMap<usize, FilePriority>,
+    ) -> std::io::Result<Self> {
+        validate_torrent_layout(torrent_name, files.map(Vec::as_slice).unwrap_or_default())
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
+        ensure_path_within_root(download_root, root_dir)?;
+
         if let Some(torrent_files) = files {
             let mut files_vec = Vec::new();
             let mut current_offset = 0;
@@ -50,6 +80,7 @@ impl MultiFileInfo {
                 for component in &f.path {
                     full_path.push(component);
                 }
+                ensure_path_within_root(download_root, &full_path)?;
 
                 // BEP 47: Check 'attr' string. If it contains 'p', it is a padding file.
                 let is_padding = f.attr.as_deref().map(|s| s.contains('p')).unwrap_or(false);
@@ -66,15 +97,22 @@ impl MultiFileInfo {
                     is_skipped,
                 });
 
-                current_offset += f.length as u64;
+                current_offset = current_offset.checked_add(f.length as u64).ok_or_else(|| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "torrent aggregate file length exceeds the supported range",
+                    )
+                })?;
             }
             Ok(Self {
                 files: files_vec,
                 total_size: current_offset,
+                download_root: download_root.to_path_buf(),
             })
         } else {
             let total_size = length.unwrap_or(0);
             let file_path = root_dir.join(torrent_name);
+            ensure_path_within_root(download_root, &file_path)?;
 
             // Single file torrents: Index 0
             let priority = file_priorities.get(&0).unwrap_or(&FilePriority::Normal);
@@ -90,9 +128,105 @@ impl MultiFileInfo {
             Ok(Self {
                 files: vec![single_file],
                 total_size,
+                download_root: download_root.to_path_buf(),
             })
         }
     }
+}
+
+/// Rejects a path when its lexical or existing-filesystem resolution escapes
+/// the selected download root. The deepest existing ancestor is canonicalized
+/// so the check also works before a new file or directory has been created.
+pub(crate) fn ensure_path_within_root(download_root: &Path, path: &Path) -> std::io::Result<()> {
+    let absolute_root = absolute_path(download_root)?;
+    let absolute_target = absolute_path(path)?;
+    let lexical_root = lexical_normalize(&absolute_root);
+    let lexical_path = lexical_normalize(&absolute_target);
+    if !lexical_path.starts_with(&lexical_root) {
+        return Err(containment_error(download_root, path));
+    }
+
+    // Resolve the original absolute spellings rather than their lexical forms.
+    // On Unix, `link/..` is interpreted after following `link`, so erasing `..`
+    // first can otherwise check a different location from the one I/O will use.
+    let resolved_root = resolve_existing_ancestor(&absolute_root)?;
+    let resolved_path = resolve_existing_ancestor(&absolute_target)?;
+    if !resolved_path.starts_with(&resolved_root) {
+        return Err(containment_error(download_root, path));
+    }
+
+    Ok(())
+}
+
+fn containment_error(download_root: &Path, path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::PermissionDenied,
+        format!(
+            "storage path '{}' resolves outside download root '{}'",
+            path.display(),
+            download_root.display()
+        ),
+    )
+}
+
+fn absolute_path(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+fn resolve_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
+    let mut existing = path.to_path_buf();
+    let mut missing_parts = Vec::<OsString>::new();
+
+    loop {
+        match std_fs::symlink_metadata(&existing) {
+            Ok(_) => {
+                let mut resolved = std_fs::canonicalize(&existing)?;
+                for part in missing_parts.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(lexical_normalize(&resolved));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let Some(part) = existing.file_name().map(ToOwned::to_owned) else {
+                    return Err(error);
+                };
+                missing_parts.push(part);
+                if !existing.pop() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn ensure_multi_file_paths(multi_file_info: &MultiFileInfo) -> Result<(), StorageError> {
+    for file_info in &multi_file_info.files {
+        ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
+    }
+    Ok(())
 }
 
 /// Creates all necessary directories and pre-allocates all files for a torrent.
@@ -100,6 +234,9 @@ impl MultiFileInfo {
 pub async fn create_and_allocate_files(
     multi_file_info: &MultiFileInfo,
 ) -> Result<bool, StorageError> {
+    // Validate the whole layout before making any filesystem changes so one
+    // unsafe entry cannot leave a partially allocated torrent behind.
+    ensure_multi_file_paths(multi_file_info)?;
     let mut is_fresh_download = true;
 
     for file_info in &multi_file_info.files {
@@ -107,8 +244,10 @@ pub async fn create_and_allocate_files(
             continue;
         }
 
+        ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
         let exists = try_exists(&file_info.path).await?;
         let existing_metadata = if exists {
+            ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
             Some(fs::metadata(&file_info.path).await?)
         } else {
             None
@@ -135,7 +274,9 @@ pub async fn create_and_allocate_files(
 
         // Ensure the parent directory for the file exists.
         if let Some(parent_dir) = file_info.path.parent() {
+            ensure_path_within_root(&multi_file_info.download_root, parent_dir)?;
             if !try_exists(parent_dir).await? {
+                ensure_path_within_root(&multi_file_info.download_root, parent_dir)?;
                 fs::create_dir_all(parent_dir).await?;
             }
         }
@@ -145,8 +286,10 @@ pub async fn create_and_allocate_files(
         // download is known to be partial, however, zero-byte placeholders must
         // be sized before validation/uploads can read their sparse zeroes as
         // real in-span data.
+        ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
         match fs::metadata(&file_info.path).await {
             Ok(metadata) if should_resize(&metadata) => {
+                ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                 let file = OpenOptions::new()
                     .write(true)
                     .truncate(false)
@@ -156,6 +299,7 @@ pub async fn create_and_allocate_files(
             }
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {
+                ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                 let file = OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -201,6 +345,7 @@ pub async fn read_data_from_disk(
                     let zeros = vec![0u8; bytes_to_read_in_this_file];
                     buffer.extend_from_slice(&zeros);
                 } else {
+                    ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                     // NEW: Fast Validation for Skipped Files
                     // If the file is skipped and MISSING, return zeros immediately.
                     // This simulates "Missing Data" without raising an IO error.
@@ -218,6 +363,7 @@ pub async fn read_data_from_disk(
                         // Fresh downloads use zero-length placeholders instead of
                         // preallocating, so in-span reads past the physical EOF are
                         // treated as sparse zeroes.
+                        ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                         let mut file = File::open(&file_info.path).await?;
                         let physical_len = file.metadata().await?.len();
                         let readable_bytes = physical_len
@@ -277,16 +423,19 @@ pub async fn write_data_to_disk(
 
             if bytes_to_write_in_this_file > 0 {
                 if !file_info.is_padding {
+                    ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                     // Note: We ALLOW writing to skipped files if necessary (e.g. boundary pieces).
                     // This will create them lazily if they were skipped during allocation.
 
                     // Ensure directory exists (lazy creation for skipped boundary files)
                     if file_info.is_skipped {
                         if let Some(parent) = file_info.path.parent() {
+                            ensure_path_within_root(&multi_file_info.download_root, parent)?;
                             fs::create_dir_all(parent).await?;
                         }
                     }
 
+                    ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                     let mut file = OpenOptions::new()
                         .write(true)
                         .create(true)
@@ -352,10 +501,7 @@ pub async fn build_fs_tree(
     depth: usize,
 ) -> Result<Vec<RawNode<FileMetadata>>, std::io::Error> {
     let mut nodes = Vec::new();
-    let mut entries = match fs::read_dir(path).await {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
+    let mut entries = fs::read_dir(path).await?;
 
     while let Some(entry) = entries.next_entry().await? {
         let meta = entry.metadata().await?;
@@ -368,9 +514,7 @@ pub async fn build_fs_tree(
 
         let children = if is_dir {
             if depth > 0 {
-                Box::pin(build_fs_tree(&entry.path(), depth - 1))
-                    .await
-                    .unwrap_or_default()
+                Box::pin(build_fs_tree(&entry.path(), depth - 1)).await?
             } else {
                 Vec::new()
             }
@@ -459,7 +603,7 @@ mod tests {
                 attr: None,
             },
             InfoFile {
-                path: vec![".pad/10".to_string()], // Typical padding name
+                path: vec![".pad".to_string(), "10".to_string()],
                 length: 5,
                 md5sum: None,
                 attr: Some("p".to_string()), // Attribute marking padding
@@ -475,6 +619,158 @@ mod tests {
         let mfi =
             MultiFileInfo::new(root, torrent_name, Some(&files), None, &HashMap::new()).unwrap();
         (dir, mfi)
+    }
+
+    #[test]
+    fn multi_file_info_rejects_unsafe_paths_before_allocation() {
+        let dir = tempdir().unwrap();
+        let unsafe_files = vec![InfoFile {
+            path: vec!["..".to_string(), "outside.bin".to_string()],
+            length: 1,
+            md5sum: None,
+            attr: None,
+        }];
+
+        let error = MultiFileInfo::new(
+            dir.path(),
+            "safe-item",
+            Some(&unsafe_files),
+            None,
+            &HashMap::new(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+
+        let error = MultiFileInfo::new(dir.path(), "/outside.bin", None, Some(1), &HashMap::new())
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn storage_io_rejects_existing_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let download_root = dir.path().join("downloads");
+        let outside_root = dir.path().join("outside");
+        std::fs::create_dir_all(&download_root).unwrap();
+        std::fs::create_dir_all(&outside_root).unwrap();
+
+        let files = vec![InfoFile {
+            path: vec!["nested".to_string(), "payload.bin".to_string()],
+            length: 4,
+            md5sum: None,
+            attr: None,
+        }];
+        let mfi = MultiFileInfo::new_with_download_root(
+            &download_root,
+            &download_root,
+            "sample-data",
+            Some(&files),
+            None,
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        symlink(&outside_root, download_root.join("nested")).unwrap();
+
+        let allocation_error = create_and_allocate_files(&mfi).await.unwrap_err();
+        assert!(matches!(
+            allocation_error,
+            StorageError::Io {
+                kind: ErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        assert!(!outside_root.join("payload.bin").exists());
+
+        std::fs::write(outside_root.join("payload.bin"), b"safe").unwrap();
+        let read_error = read_data_from_disk(&mfi, 0, 4).await.unwrap_err();
+        assert!(matches!(
+            read_error,
+            StorageError::Io {
+                kind: ErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+
+        let write_error = write_data_to_disk(&mfi, 0, b"risk").await.unwrap_err();
+        assert!(matches!(
+            write_error,
+            StorageError::Io {
+                kind: ErrorKind::PermissionDenied,
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read(outside_root.join("payload.bin")).unwrap(),
+            b"safe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_file_info_rejects_symlinked_container_outside_download_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let download_root = dir.path().join("downloads");
+        let outside_root = dir.path().join("outside");
+        std::fs::create_dir_all(&download_root).unwrap();
+        std::fs::create_dir_all(&outside_root).unwrap();
+        let container = download_root.join("renamed-container");
+        symlink(&outside_root, &container).unwrap();
+
+        let files = vec![InfoFile {
+            path: vec!["payload.bin".to_string()],
+            length: 1,
+            md5sum: None,
+            attr: None,
+        }];
+        let error = MultiFileInfo::new_with_download_root(
+            &download_root,
+            &container,
+            "sample-data",
+            Some(&files),
+            None,
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_download_root_may_itself_be_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let physical_root = dir.path().join("physical");
+        let selected_root = dir.path().join("selected");
+        std::fs::create_dir_all(&physical_root).unwrap();
+        symlink(&physical_root, &selected_root).unwrap();
+
+        let mfi = MultiFileInfo::new(
+            &selected_root,
+            "payload.bin",
+            None,
+            Some(1),
+            &HashMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(mfi.download_root, selected_root);
+    }
+
+    #[tokio::test]
+    async fn build_fs_tree_propagates_missing_root_error() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        let error = build_fs_tree(&missing, 1).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
     }
 
     // --- STANDARD TESTS (Existing logic preserved) ---

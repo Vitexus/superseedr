@@ -129,6 +129,7 @@ async fn apply_event(event: CrosstermEvent, app: &mut App) {
 
     if matches!(app.app_state.mode, AppMode::FileBrowser) {
         browser::handle_event(event, app).await;
+        app.sync_torrent_file_preview();
         app.app_state.ui.needs_redraw = true;
         return;
     }
