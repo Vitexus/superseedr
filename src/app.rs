@@ -31,7 +31,7 @@ use crate::control_service::{
     ControlExecutionPlan,
 };
 use crate::dht_service::{DhtService, DhtServiceConfig, DhtStatus, DhtWaveTelemetry};
-use crate::peer_manager::{PeerManagerService, PeerPolicy};
+use crate::peer_manager::{PeerManagerService, PeerManagerView, PeerPolicy};
 use crate::persistence::activity_history::{
     load_activity_history_state, save_activity_history_state, ActivityHistoryPersistedState,
     ActivityHistoryRollupState,
@@ -2059,6 +2059,7 @@ pub struct AppState {
     pub(crate) pending_manual_ingest: Option<PendingManualIngest>,
     pub torrents: HashMap<Vec<u8>, TorrentDisplayState>,
     pub peer_policy: Arc<PeerPolicy>,
+    pub peer_manager_view: Arc<PeerManagerView>,
 
     pub torrent_list_order: Vec<Vec<u8>>,
 
@@ -2170,6 +2171,17 @@ fn sync_peer_policy_to_app_state(
     app_state.peer_policy = policy;
     app_state.ui.needs_redraw = true;
     blocked_ips
+}
+
+fn sync_peer_manager_view_to_app_state(
+    app_state: &mut AppState,
+    peer_manager_view_rx: &mut watch::Receiver<Arc<PeerManagerView>>,
+) -> usize {
+    let view = peer_manager_view_rx.borrow_and_update().clone();
+    let tracked_peers = view.tracked_peers.len();
+    app_state.peer_manager_view = view;
+    app_state.ui.needs_redraw = true;
+    tracked_peers
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -2509,6 +2521,8 @@ pub struct App {
     pub peer_manager: PeerManagerService,
     pub peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
     peer_policy_open: bool,
+    pub peer_manager_view_rx: watch::Receiver<Arc<PeerManagerView>>,
+    peer_manager_view_open: bool,
     pub resource_manager: ResourceManagerClient,
     wake_lag_peer_throttle: WakeLagPeerThrottle,
     last_applied_resource_limits: Option<CalculatedLimits>,
@@ -2940,6 +2954,7 @@ impl App {
         let (shutdown_tx, _) = broadcast::channel(1);
         let peer_manager = PeerManagerService::new(shutdown_tx.subscribe());
         let peer_policy_rx = peer_manager.handle().subscribe_policy();
+        let peer_manager_view_rx = peer_manager.handle().subscribe_view();
         let shared_mode_enabled = runtime_mode.is_shared();
         let current_cluster_role = initial_cluster_role_for_runtime_mode(runtime_mode);
         let (persistence_tx, persistence_task) = if shared_mode_enabled
@@ -3089,6 +3104,8 @@ impl App {
             peer_manager,
             peer_policy_rx,
             peer_policy_open: true,
+            peer_manager_view_rx,
+            peer_manager_view_open: true,
             resource_manager: resource_manager_client,
             wake_lag_peer_throttle: WakeLagPeerThrottle::default(),
             last_applied_resource_limits: Some(limits.clone()),
@@ -3138,6 +3155,7 @@ impl App {
             probe_available_log_cooldowns: HashMap::new(),
         };
         sync_peer_policy_to_app_state(&mut app.app_state, &mut app.peer_policy_rx);
+        sync_peer_manager_view_to_app_state(&mut app.app_state, &mut app.peer_manager_view_rx);
         app.sync_cluster_role_label();
         app.refresh_system_warning();
 
@@ -4577,6 +4595,20 @@ impl App {
                         );
                     } else {
                         self.peer_policy_open = false;
+                    }
+                }
+                view_changed = self.peer_manager_view_rx.changed(), if self.peer_manager_view_open => {
+                    if view_changed.is_ok() {
+                        let tracked_peers = sync_peer_manager_view_to_app_state(
+                            &mut self.app_state,
+                            &mut self.peer_manager_view_rx,
+                        );
+                        tracing::debug!(
+                            tracked_peers,
+                            "App received peer manager view"
+                        );
+                    } else {
+                        self.peer_manager_view_open = false;
                     }
                 }
 
@@ -11695,6 +11727,54 @@ mod tests {
             2
         );
         assert!(Arc::ptr_eq(&app_state.peer_policy, &updated_policy));
+        assert!(app_state.ui.needs_redraw);
+    }
+
+    #[test]
+    fn peer_manager_view_sync_makes_tracked_peers_tui_visible() {
+        let initial_view = Arc::new(crate::peer_manager::PeerManagerView::default());
+        let (view_tx, mut view_rx) = watch::channel(Arc::clone(&initial_view));
+        let mut app_state = AppState::default();
+        app_state.ui.needs_redraw = false;
+
+        assert_eq!(
+            super::sync_peer_manager_view_to_app_state(&mut app_state, &mut view_rx),
+            0
+        );
+        assert!(Arc::ptr_eq(&app_state.peer_manager_view, &initial_view));
+        assert!(app_state.ui.needs_redraw);
+
+        let updated_view = Arc::new(crate::peer_manager::PeerManagerView {
+            registered_torrents: 1,
+            metrics_updates: 2,
+            tracked_peers: vec![crate::peer_manager::PeerManagerTrackedPeer {
+                torrent_info_hash: vec![0x41; 20],
+                torrent_name: "Silver Current".to_string(),
+                ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 90)),
+                is_active: true,
+                endpoints: Vec::new(),
+                downloaded_evidence_bytes: 1_024,
+                uploaded_evidence_bytes: 2_048,
+                transfer_threshold_bytes: 256 * 1024 * 1024,
+                reconnect_count: 1,
+                reconnect_limit: 6,
+                reconnect_window_secs: 300,
+                last_seen: Some(SystemTime::now()),
+            }],
+        });
+        view_tx.send_replace(Arc::clone(&updated_view));
+        app_state.ui.needs_redraw = false;
+
+        assert_eq!(
+            super::sync_peer_manager_view_to_app_state(&mut app_state, &mut view_rx),
+            1
+        );
+        assert!(Arc::ptr_eq(&app_state.peer_manager_view, &updated_view));
+        assert_eq!(app_state.peer_manager_view.registered_torrents, 1);
+        assert_eq!(
+            app_state.peer_manager_view.tracked_peers[0].torrent_name,
+            "Silver Current"
+        );
         assert!(app_state.ui.needs_redraw);
     }
 

@@ -45,6 +45,12 @@ fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+fn transfer_abuse_limit(total_size: u64) -> u64 {
+    total_size
+        .saturating_mul(TRANSFER_ABUSE_MULTIPLIER)
+        .max(MIN_TRANSFER_ABUSE_BYTES)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PeerRestrictionReason {
@@ -225,6 +231,36 @@ struct PeerTorrentHistory {
     last_seen: Option<SystemTime>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerManagerEndpointView {
+    pub address: String,
+    pub total_downloaded: u64,
+    pub total_uploaded: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerManagerTrackedPeer {
+    pub torrent_info_hash: Vec<u8>,
+    pub torrent_name: String,
+    pub ip: IpAddr,
+    pub is_active: bool,
+    pub endpoints: Vec<PeerManagerEndpointView>,
+    pub downloaded_evidence_bytes: u64,
+    pub uploaded_evidence_bytes: u64,
+    pub transfer_threshold_bytes: u64,
+    pub reconnect_count: u32,
+    pub reconnect_limit: u32,
+    pub reconnect_window_secs: u64,
+    pub last_seen: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PeerManagerView {
+    pub registered_torrents: usize,
+    pub metrics_updates: u64,
+    pub tracked_peers: Vec<PeerManagerTrackedPeer>,
+}
+
 impl PeerTorrentHistory {
     fn observe_presence(
         &mut self,
@@ -335,10 +371,7 @@ impl PeerPolicyReducer {
             totals.uploaded = totals.uploaded.max(peer.total_uploaded);
         }
 
-        let transfer_limit = metrics
-            .total_size
-            .saturating_mul(TRANSFER_ABUSE_MULTIPLIER)
-            .max(MIN_TRANSFER_ABUSE_BYTES);
+        let transfer_limit = transfer_abuse_limit(metrics.total_size);
         let mut restrictions = Vec::new();
 
         {
@@ -400,6 +433,63 @@ impl PeerPolicyReducer {
             );
         }
         changed
+    }
+
+    fn build_view(
+        &self,
+        latest_metrics: &HashMap<InfoHash, TorrentMetrics>,
+        registered_torrents: usize,
+        metrics_updates: u64,
+    ) -> PeerManagerView {
+        let mut tracked_peers = Vec::with_capacity(self.history_count());
+        for (info_hash, histories) in &self.histories {
+            let metrics = latest_metrics.get(info_hash);
+            let torrent_name = metrics
+                .map(|metrics| metrics.torrent_name.clone())
+                .unwrap_or_default();
+            let transfer_threshold_bytes = metrics
+                .map(|metrics| transfer_abuse_limit(metrics.total_size))
+                .unwrap_or(MIN_TRANSFER_ABUSE_BYTES);
+
+            for (ip, history) in histories {
+                let mut endpoints = history
+                    .endpoint_transfers
+                    .iter()
+                    .map(|(address, totals)| PeerManagerEndpointView {
+                        address: address.clone(),
+                        total_downloaded: totals.downloaded,
+                        total_uploaded: totals.uploaded,
+                    })
+                    .collect::<Vec<_>>();
+                endpoints.sort_unstable_by(|left, right| left.address.cmp(&right.address));
+
+                tracked_peers.push(PeerManagerTrackedPeer {
+                    torrent_info_hash: info_hash.clone(),
+                    torrent_name: torrent_name.clone(),
+                    ip: *ip,
+                    is_active: history.present,
+                    endpoints,
+                    downloaded_evidence_bytes: history.downloaded_bytes,
+                    uploaded_evidence_bytes: history.uploaded_bytes,
+                    transfer_threshold_bytes,
+                    reconnect_count: history.reconnects.len() as u32,
+                    reconnect_limit: RECONNECT_LIMIT as u32,
+                    reconnect_window_secs: RECONNECT_WINDOW.as_secs(),
+                    last_seen: history.last_seen,
+                });
+            }
+        }
+        tracked_peers.sort_unstable_by(|left, right| {
+            left.torrent_info_hash
+                .cmp(&right.torrent_info_hash)
+                .then_with(|| left.ip.cmp(&right.ip))
+        });
+
+        PeerManagerView {
+            registered_torrents,
+            metrics_updates,
+            tracked_peers,
+        }
     }
 
     #[cfg(test)]
@@ -535,6 +625,7 @@ pub struct PeerManagerSnapshot {
 pub struct PeerManagerHandle {
     command_tx: mpsc::UnboundedSender<PeerManagerCommand>,
     policy_rx: watch::Receiver<Arc<PeerPolicy>>,
+    view_rx: watch::Receiver<Arc<PeerManagerView>>,
 }
 
 impl PeerManagerHandle {
@@ -553,6 +644,10 @@ impl PeerManagerHandle {
 
     pub fn subscribe_policy(&self) -> watch::Receiver<Arc<PeerPolicy>> {
         self.policy_rx.clone()
+    }
+
+    pub fn subscribe_view(&self) -> watch::Receiver<Arc<PeerManagerView>> {
+        self.view_rx.clone()
     }
 
     pub fn unregister_torrent(&self, info_hash: InfoHash) -> bool {
@@ -663,9 +758,11 @@ impl PeerManagerService {
         };
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (policy_tx, policy_rx) = watch::channel(Arc::new(initial_policy));
+        let (view_tx, view_rx) = watch::channel(Arc::new(PeerManagerView::default()));
         let handle = PeerManagerHandle {
             command_tx,
             policy_rx,
+            view_rx,
         };
         let (persistence_tx, persistence_result_rx, persistence_task) = persistence_path
             .map(|path| spawn_policy_writer(path, writer_delay))
@@ -675,6 +772,7 @@ impl PeerManagerService {
         let task = tokio::spawn(run_service(
             command_rx,
             policy_tx,
+            view_tx,
             shutdown_rx,
             reducer,
             PolicyPersistenceRuntime {
@@ -739,6 +837,20 @@ enum PeerManagerCommand {
 
 fn publish_policy(reducer: &PeerPolicyReducer, policy_tx: &watch::Sender<Arc<PeerPolicy>>) {
     policy_tx.send_replace(Arc::new(reducer.policy().clone()));
+}
+
+fn publish_view(
+    reducer: &PeerPolicyReducer,
+    latest_metrics: &HashMap<InfoHash, TorrentMetrics>,
+    registered_torrents: usize,
+    metrics_updates: u64,
+    view_tx: &watch::Sender<Arc<PeerManagerView>>,
+) {
+    view_tx.send_replace(Arc::new(reducer.build_view(
+        latest_metrics,
+        registered_torrents,
+        metrics_updates,
+    )));
 }
 
 #[derive(Clone)]
@@ -856,6 +968,7 @@ struct PolicyPersistenceRuntime {
 async fn run_service(
     mut command_rx: mpsc::UnboundedReceiver<PeerManagerCommand>,
     policy_tx: watch::Sender<Arc<PeerPolicy>>,
+    view_tx: watch::Sender<Arc<PeerManagerView>>,
     mut shutdown_rx: broadcast::Receiver<()>,
     mut reducer: PeerPolicyReducer,
     persistence: PolicyPersistenceRuntime,
@@ -905,11 +1018,25 @@ async fn run_service(
                         }
                         latest_metrics.insert(info_hash.clone(), metrics);
                         metrics_rxs.insert(info_hash, metrics_rx);
+                        publish_view(
+                            &reducer,
+                            &latest_metrics,
+                            metrics_rxs.len(),
+                            metrics_updates,
+                            &view_tx,
+                        );
                     }
                     PeerManagerCommand::UnregisterTorrent { info_hash } => {
                         metrics_rxs.remove(&info_hash);
                         latest_metrics.remove(&info_hash);
                         reducer.remove_torrent(&info_hash);
+                        publish_view(
+                            &reducer,
+                            &latest_metrics,
+                            metrics_rxs.len(),
+                            metrics_updates,
+                            &view_tx,
+                        );
                     }
                     #[cfg(test)]
                     PeerManagerCommand::Snapshot { response_tx } => {
@@ -931,6 +1058,7 @@ async fn run_service(
             _ = metrics_poll.tick() => {
                 let now = SystemTime::now();
                 let mut policy_changed = false;
+                let mut view_changed = false;
                 let mut closed = Vec::new();
                 for (info_hash, metrics_rx) in &mut metrics_rxs {
                     match metrics_rx.has_changed() {
@@ -939,6 +1067,7 @@ async fn run_service(
                             policy_changed |= reducer.reduce_metrics(info_hash, &metrics, now);
                             latest_metrics.insert(info_hash.clone(), metrics);
                             metrics_updates = metrics_updates.saturating_add(1);
+                            view_changed = true;
                         }
                         Ok(false) => {}
                         Err(_) => closed.push(info_hash.clone()),
@@ -948,16 +1077,36 @@ async fn run_service(
                     metrics_rxs.remove(&info_hash);
                     latest_metrics.remove(&info_hash);
                     reducer.remove_torrent(&info_hash);
+                    view_changed = true;
                 }
                 if policy_changed {
                     persistence_state.mark_dirty();
                     publish_policy(&reducer, &policy_tx);
                 }
+                if view_changed {
+                    publish_view(
+                        &reducer,
+                        &latest_metrics,
+                        metrics_rxs.len(),
+                        metrics_updates,
+                        &view_tx,
+                    );
+                }
             }
             _ = policy_checkpoint.tick() => {
+                let history_count = reducer.history_count();
                 if reducer.maintain_to(SystemTime::now(), MAX_PEER_HISTORIES) {
                     persistence_state.mark_dirty();
                     publish_policy(&reducer, &policy_tx);
+                }
+                if reducer.history_count() != history_count {
+                    publish_view(
+                        &reducer,
+                        &latest_metrics,
+                        metrics_rxs.len(),
+                        metrics_updates,
+                        &view_tx,
+                    );
                 }
                 persistence_state.queue_if_dirty(&reducer);
             }
@@ -1344,6 +1493,135 @@ mod tests {
             .expect("policy publisher should remain open");
         let policy = policy_rx.borrow_and_update();
         assert!(policy.restrictions.contains_key(&blocked_ip));
+
+        let _ = shutdown_tx.send(());
+        service.join().await;
+    }
+
+    #[test]
+    fn tracked_peer_view_exposes_active_and_recently_absent_history() {
+        let info_hash = vec![0x31; 20];
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 70));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(20_000);
+        let mut metrics = metrics_with_peer_transfer(
+            &info_hash,
+            100 * MIB,
+            "tcp://[::ffff:203.0.113.70]:6881",
+            64 * MIB,
+            32 * MIB,
+        );
+        metrics.torrent_name = "Nebula Archive".to_string();
+        let mut reducer = PeerPolicyReducer::default();
+
+        assert!(!reducer.reduce_metrics(&info_hash, &metrics, now));
+        let mut latest_metrics = HashMap::from([(info_hash.clone(), metrics)]);
+        let view = reducer.build_view(&latest_metrics, 1, 4);
+
+        assert_eq!(view.registered_torrents, 1);
+        assert_eq!(view.metrics_updates, 4);
+        assert_eq!(view.tracked_peers.len(), 1);
+        let tracked = &view.tracked_peers[0];
+        assert_eq!(tracked.torrent_info_hash, info_hash);
+        assert_eq!(tracked.torrent_name, "Nebula Archive");
+        assert_eq!(tracked.ip, ip);
+        assert!(tracked.is_active);
+        assert_eq!(tracked.downloaded_evidence_bytes, 64 * MIB);
+        assert_eq!(tracked.uploaded_evidence_bytes, 32 * MIB);
+        assert_eq!(tracked.transfer_threshold_bytes, 256 * MIB);
+        assert_eq!(tracked.reconnect_count, 0);
+        assert_eq!(tracked.reconnect_limit, RECONNECT_LIMIT as u32);
+        assert_eq!(tracked.reconnect_window_secs, RECONNECT_WINDOW.as_secs());
+        assert_eq!(tracked.last_seen, Some(now));
+        assert_eq!(
+            tracked.endpoints,
+            vec![PeerManagerEndpointView {
+                address: "tcp://[::ffff:203.0.113.70]:6881".to_string(),
+                total_downloaded: 64 * MIB,
+                total_uploaded: 32 * MIB,
+            }]
+        );
+
+        let mut absent_metrics = metrics_without_peers(&info_hash, 100 * MIB);
+        absent_metrics.torrent_name = "Nebula Archive".to_string();
+        assert!(!reducer.reduce_metrics(&info_hash, &absent_metrics, now + Duration::from_secs(1),));
+        latest_metrics.insert(info_hash, absent_metrics);
+        let view = reducer.build_view(&latest_metrics, 1, 5);
+        let tracked = &view.tracked_peers[0];
+        assert!(!tracked.is_active);
+        assert!(tracked.endpoints.is_empty());
+        assert_eq!(tracked.last_seen, Some(now));
+        assert_eq!(tracked.downloaded_evidence_bytes, 64 * MIB);
+        assert_eq!(tracked.uploaded_evidence_bytes, 32 * MIB);
+    }
+
+    #[tokio::test]
+    async fn service_publishes_tracked_peer_view_updates() {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = PeerManagerService::new(shutdown_tx.subscribe());
+        let handle = service.handle();
+        let info_hash = vec![0x32; 20];
+        let (metrics_tx, metrics_rx) = watch::channel(TorrentMetrics::default());
+        let mut view_rx = handle.subscribe_view();
+
+        assert!(handle.register_torrent(info_hash.clone(), metrics_rx));
+        let mut metrics = metrics_with_peer_transfer(
+            &info_hash,
+            100 * MIB,
+            "utp://198.51.100.80:6881",
+            8 * MIB,
+            4 * MIB,
+        );
+        metrics.torrent_name = "Quiet Comet".to_string();
+        metrics_tx
+            .send(metrics)
+            .expect("view subscriber should keep metrics receiver open");
+
+        let active_view = timeout(Duration::from_secs(1), async {
+            loop {
+                view_rx
+                    .changed()
+                    .await
+                    .expect("view publisher remains open");
+                let view = view_rx.borrow_and_update().clone();
+                if view
+                    .tracked_peers
+                    .first()
+                    .is_some_and(|peer| peer.is_active)
+                {
+                    break view;
+                }
+            }
+        })
+        .await
+        .expect("active tracked peer view");
+        assert_eq!(active_view.registered_torrents, 1);
+        assert_eq!(active_view.tracked_peers[0].torrent_name, "Quiet Comet");
+
+        let mut absent_metrics = metrics_without_peers(&info_hash, 100 * MIB);
+        absent_metrics.torrent_name = "Quiet Comet".to_string();
+        metrics_tx
+            .send(absent_metrics)
+            .expect("view subscriber should keep metrics receiver open");
+        let absent_view = timeout(Duration::from_secs(1), async {
+            loop {
+                view_rx
+                    .changed()
+                    .await
+                    .expect("view publisher remains open");
+                let view = view_rx.borrow_and_update().clone();
+                if view
+                    .tracked_peers
+                    .first()
+                    .is_some_and(|peer| !peer.is_active)
+                {
+                    break view;
+                }
+            }
+        })
+        .await
+        .expect("recently absent tracked peer view");
+        assert_eq!(absent_view.tracked_peers.len(), 1);
+        assert!(absent_view.tracked_peers[0].endpoints.is_empty());
 
         let _ = shutdown_tx.send(());
         service.join().await;
