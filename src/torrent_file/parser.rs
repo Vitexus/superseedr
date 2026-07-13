@@ -5,8 +5,38 @@ use crate::torrent_file::{path_casefold_key, PathValidationError, Torrent};
 use serde_bencode::de;
 use serde_bencode::value::Value;
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::fmt;
+
+struct PathCollisionIndex {
+    paths: BTreeSet<Vec<String>>,
+}
+
+impl PathCollisionIndex {
+    fn new(paths: impl IntoIterator<Item = Vec<String>>) -> Self {
+        Self {
+            paths: paths.into_iter().collect(),
+        }
+    }
+
+    fn conflicts(&self, candidate: &[String]) -> bool {
+        // An existing file is an ancestor of the candidate.
+        if (1..=candidate.len()).any(|length| self.paths.contains(&candidate[..length])) {
+            return true;
+        }
+
+        // Or the candidate is an ancestor of an existing file. Ordered range
+        // lookup makes this O(log N) instead of scanning every torrent path.
+        self.paths
+            .range(candidate.to_vec()..)
+            .next()
+            .is_some_and(|existing| existing.starts_with(candidate))
+    }
+
+    fn insert(&mut self, path: Vec<String>) {
+        self.paths.insert(path);
+    }
+}
 
 #[derive(Debug)]
 pub enum ParseError {
@@ -41,20 +71,17 @@ impl From<PathValidationError> for ParseError {
 
 pub fn polyfill_v2_files(torrent: &mut Torrent) {
     if torrent.info.files.is_empty() && torrent.info.file_tree.is_some() {
-        let mut v2_files = torrent.get_v2_files();
-
-        // Critical: Sort to match PieceManager's deterministic order
-        v2_files.sort_by(|(path_a, _, _), (path_b, _, _)| path_a.cmp(path_b));
+        // get_v2_files preserves the raw bencoded byte-key order required for
+        // v2 piece mapping, even when a host path had to be sanitized.
+        let v2_files = torrent.get_v2_files();
 
         let mut new_files = Vec::new();
-        let mut used_paths: HashSet<Vec<String>> = v2_files
-            .iter()
-            .map(|(path, _, _)| {
-                let components: Vec<String> = path.split('/').map(str::to_owned).collect();
-                path_casefold_key(&components)
-            })
-            .collect();
+        let mut used_paths = PathCollisionIndex::new(v2_files.iter().map(|(path, _, _)| {
+            let components: Vec<String> = path.split('/').map(str::to_owned).collect();
+            path_casefold_key(&components)
+        }));
         let piece_len = torrent.info.piece_length as u64;
+        let mut padding_disambiguator = 0usize;
 
         for (path_str, length, _root) in v2_files {
             let path_components: Vec<String> = path_str.split('/').map(|s| s.to_string()).collect();
@@ -75,7 +102,7 @@ pub fn polyfill_v2_files(torrent: &mut Torrent) {
                     // unique. Including the eventual file index keeps equal-length padding
                     // entries stable without collapsing them in the preview tree.
                     let padding_index = new_files.len();
-                    let mut disambiguator = 0usize;
+                    let mut disambiguator = padding_disambiguator;
                     let padding_path = loop {
                         let directory = if disambiguator == 0 {
                             ".pad".to_string()
@@ -84,12 +111,9 @@ pub fn polyfill_v2_files(torrent: &mut Torrent) {
                         };
                         let candidate = vec![directory, format!("{padding_len}.{padding_index}")];
                         let candidate_key = path_casefold_key(&candidate);
-                        let conflicts = used_paths.iter().any(|existing| {
-                            existing.starts_with(&candidate_key)
-                                || candidate_key.starts_with(existing)
-                        });
-                        if !conflicts {
+                        if !used_paths.conflicts(&candidate_key) {
                             used_paths.insert(candidate_key);
+                            padding_disambiguator = disambiguator;
                             break candidate;
                         }
                         disambiguator += 1;
@@ -181,7 +205,7 @@ mod tests {
     use super::*;
     use crate::torrent_file::{Info, InfoFile, PathValidationError};
     use serde_bencode::value::Value;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn test_parse_bittorrent_v2_hybrid_structure() {
@@ -603,7 +627,7 @@ mod tests {
         let mut tree = HashMap::new();
         tree.insert(b"empty.bin".to_vec(), Value::Dict(zero_leaf));
 
-        for invalid_piece_length in [1_000, 32 * 1024 * 1024, i64::from(u32::MAX) + 1] {
+        for invalid_piece_length in [1_000, i64::from(u32::MAX) + 1] {
             let info = Info {
                 name: "invalid-v2-piece-size".to_string(),
                 piece_length: invalid_piece_length,
@@ -618,6 +642,28 @@ mod tests {
                 ))
             ));
         }
+    }
+
+    #[test]
+    fn parser_accepts_large_representable_v2_piece_length() {
+        let mut zero_metadata = HashMap::new();
+        zero_metadata.insert("length".as_bytes().to_vec(), Value::Int(0));
+        let mut zero_leaf = HashMap::new();
+        zero_leaf.insert(vec![], Value::Dict(zero_metadata));
+        let mut tree = HashMap::new();
+        tree.insert(b"empty.bin".to_vec(), Value::Dict(zero_leaf));
+
+        let info = Info {
+            name: "large-piece-sample".to_string(),
+            piece_length: 32 * 1024 * 1024,
+            meta_version: Some(2),
+            file_tree: Some(Value::Dict(tree)),
+            ..Info::default()
+        };
+
+        let parsed = from_info_bytes(&serde_bencode::to_bytes(&info).unwrap())
+            .expect("32 MiB is a valid v2 piece length");
+        assert_eq!(parsed.info.piece_length, 32 * 1024 * 1024);
     }
 
     #[test]

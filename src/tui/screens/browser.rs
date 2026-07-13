@@ -51,15 +51,13 @@ pub fn draw(
     let app_state = screen.ui;
     let ctx = screen.theme;
 
-    let selected_filesystem_file = state.cursor_path.as_ref().filter(|path| {
-        data.iter()
-            .any(|node| !node.is_dir && node.full_path.as_path() == path.as_path())
-    });
-    let has_preview_content = has_preview_content(
+    let selected_filesystem_file = selected_filesystem_file_path(state, data);
+    let has_preview_content = preview_content_for_selection(
         browser_mode,
         app_state.pending_torrent_path.is_some(),
         !app_state.pending_torrent_link.is_empty(),
-        selected_filesystem_file,
+        state,
+        data,
     );
     let existing_priority_only = existing_torrent_priority_only(browser_mode);
 
@@ -292,7 +290,12 @@ pub fn draw(
     let visible_items = TreeMathHelper::get_visible_slice(data, state, filter, inner_height);
     let mut list_items = Vec::new();
 
-    if data.is_empty() {
+    if let Some(error) = app_state.ui.file_browser.fetch_error.as_deref() {
+        list_items.push(ListItem::new(Line::from(vec![Span::styled(
+            file_browser_fetch_error_message(error),
+            ctx.apply(Style::default().fg(ctx.state_error())).bold(),
+        )])));
+    } else if data.is_empty() {
         list_items.push(ListItem::new(Line::from(vec![Span::styled(
             "   (Directory is empty)",
             ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
@@ -845,11 +848,12 @@ fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
     let pending_torrent_link = !app.app_state.pending_torrent_link.is_empty();
     let screen_area = app.app_state.screen_area;
     let file_browser = &mut app.app_state.ui.file_browser;
-    let has_preview = has_preview_content(
+    let has_preview = preview_content_for_selection(
         &file_browser.browser_mode,
         pending_torrent_path,
         pending_torrent_link,
-        file_browser.state.cursor_path.as_ref(),
+        &file_browser.state,
+        &file_browser.data,
     );
     if matches!(key.code, KeyCode::Tab) && browser_search_panel_active(file_browser.search_state) {
         toggle_browser_search_mode(&mut file_browser.search_mode);
@@ -925,11 +929,12 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
             &mut file_browser.search_query,
             &mut file_browser.search_mode,
         );
-        let has_preview = has_preview_content(
+        let has_preview = preview_content_for_selection(
             &file_browser.browser_mode,
             pending_torrent_path,
             pending_torrent_link,
-            file_browser.state.cursor_path.as_ref(),
+            &file_browser.state,
+            &file_browser.data,
         );
         reset_active_browser_search_view(BrowserSearchViewContext {
             browser_mode: &mut file_browser.browser_mode,
@@ -1145,11 +1150,12 @@ fn reset_active_browser_search_view(ctx: BrowserSearchViewContext<'_>) {
 async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
     let list_height = {
         let file_browser = &app.app_state.ui.file_browser;
-        let has_preview = has_preview_content(
+        let has_preview = preview_content_for_selection(
             &file_browser.browser_mode,
             app.app_state.pending_torrent_path.is_some(),
             !app.app_state.pending_torrent_link.is_empty(),
-            file_browser.state.cursor_path.as_ref(),
+            &file_browser.state,
+            &file_browser.data,
         );
         let pane = focused_pane(&file_browser.browser_mode);
         let search_panel_active = browser_search_panel_active(file_browser.search_state);
@@ -1790,6 +1796,35 @@ pub fn has_preview_content(
         }),
         _ => false,
     }
+}
+
+pub fn selected_filesystem_file_path<'a>(
+    state: &TreeViewState,
+    data: &'a [RawNode<FileMetadata>],
+) -> Option<&'a PathBuf> {
+    let cursor_path = state.cursor_path.as_ref()?;
+    data.iter()
+        .find(|node| !node.is_dir && &node.full_path == cursor_path)
+        .map(|node| &node.full_path)
+}
+
+pub fn preview_content_for_selection(
+    browser_mode: &FileBrowserMode,
+    pending_torrent_path: bool,
+    pending_torrent_link: bool,
+    state: &TreeViewState,
+    data: &[RawNode<FileMetadata>],
+) -> bool {
+    has_preview_content(
+        browser_mode,
+        pending_torrent_path,
+        pending_torrent_link,
+        selected_filesystem_file_path(state, data),
+    )
+}
+
+fn file_browser_fetch_error_message(error: &str) -> String {
+    format!("   Error: {}", sanitize_text(error))
 }
 
 pub fn focused_pane(browser_mode: &FileBrowserMode) -> BrowserPane {
@@ -2565,6 +2600,7 @@ mod tests {
     use crate::config::Settings;
     use crate::tui::tree::{RawNode, TreeViewState};
     use ratatui::crossterm::event::KeyModifiers;
+    use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 
     async fn app_with_existing_torrent(mode: AppMode) -> App {
@@ -3319,6 +3355,91 @@ mod tests {
         std::fs::write(&path, []).expect("create selected file");
         let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
         assert!(has_preview_content(&mode, false, false, Some(&path)));
+    }
+
+    #[test]
+    fn preview_selection_ignores_directory_with_torrent_suffix() {
+        let path = PathBuf::from("folder.torrent");
+        let state = TreeViewState {
+            cursor_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let data = vec![filesystem_node("folder.torrent", path, true)];
+        let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
+
+        assert!(selected_filesystem_file_path(&state, &data).is_none());
+        assert!(!preview_content_for_selection(
+            &mode, false, false, &state, &data
+        ));
+    }
+
+    #[test]
+    fn preview_selection_accepts_non_directory_data_node() {
+        let path = PathBuf::from("sample.TORRENT");
+        let state = TreeViewState {
+            cursor_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let data = vec![filesystem_node("sample.TORRENT", path.clone(), false)];
+        let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
+
+        assert_eq!(selected_filesystem_file_path(&state, &data), Some(&path));
+        assert!(preview_content_for_selection(
+            &mode, false, false, &state, &data
+        ));
+    }
+
+    #[test]
+    fn browser_fetch_error_message_is_visible_and_single_line() {
+        assert_eq!(
+            file_browser_fetch_error_message("Directory unavailable\ntry another path"),
+            "   Error: Directory unavailable?try another path"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_draw_renders_fetch_error_in_filesystem_panel() {
+        let mut app = app_with_existing_torrent(AppMode::FileBrowser).await;
+        app.app_state.ui.file_browser.browser_mode = FileBrowserMode::Directory;
+        app.app_state.ui.file_browser.data.clear();
+        app.app_state.ui.file_browser.fetch_error =
+            Some("Directory unavailable for this location".to_string());
+
+        let dht_status = crate::dht_service::DhtStatus::default();
+        let dht_wave_telemetry = crate::dht_service::DhtWaveTelemetry::default();
+        let theme = ThemeContext::new(app.app_state.theme, app.app_state.ui.effects_phase_time);
+        let screen = ScreenContext::new(
+            &app.app_state,
+            &dht_status,
+            &dht_wave_telemetry,
+            &app.client_configs,
+            &theme,
+        );
+        let browser = &app.app_state.ui.file_browser;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &screen,
+                    &browser.state,
+                    &browser.data,
+                    &browser.browser_mode,
+                );
+            })
+            .expect("draw browser");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Error: Directory unavailable for this location"));
+        let _ = app.shutdown_tx.send(());
     }
 
     #[test]

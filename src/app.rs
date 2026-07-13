@@ -53,7 +53,7 @@ use crate::tui::events;
 use crate::tui::layout::common::{ColumnId, PeerColumnId};
 use crate::tui::paste_burst::PasteBurst;
 use crate::tui::screens::browser::{
-    build_filesystem_filter, calculate_list_height, focused_pane, has_preview_content,
+    build_filesystem_filter, calculate_list_height, focused_pane, preview_content_for_selection,
 };
 use crate::tui::tree;
 use crate::tui::tree::RawNode;
@@ -1723,6 +1723,7 @@ pub struct FileBrowserUiState {
     pub search_mode: SearchMode,
     pub fetch_request_id: u64,
     pub fetch_pending: bool,
+    pub fetch_error: Option<String>,
     pub browser_generation: u64,
     pub torrent_preview_request_id: u64,
     pub torrent_file_preview: TorrentFilePreviewState,
@@ -1740,6 +1741,7 @@ impl Default for FileBrowserUiState {
             search_mode: SearchMode::Regex,
             fetch_request_id: 0,
             fetch_pending: false,
+            fetch_error: None,
             browser_generation: 0,
             torrent_preview_request_id: 0,
             torrent_file_preview: TorrentFilePreviewState::Idle,
@@ -1758,6 +1760,7 @@ impl FileBrowserUiState {
         let _ = self.next_browser_generation();
         self.fetch_request_id = self.fetch_request_id.wrapping_add(1);
         self.fetch_pending = false;
+        self.fetch_error = None;
         self.torrent_preview_request_id = self.torrent_preview_request_id.wrapping_add(1);
         self.torrent_file_preview = TorrentFilePreviewState::Idle;
     }
@@ -1802,17 +1805,12 @@ fn reconcile_file_browser_cursor_after_fetch(
         .or_else(|| visible_paths.first().cloned());
     file_browser.state.cursor_path = cursor_path.clone();
 
-    let selected_filesystem_file = cursor_path.as_ref().filter(|path| {
-        file_browser
-            .data
-            .iter()
-            .any(|node| !node.is_dir && node.full_path.as_path() == path.as_path())
-    });
-    let has_preview = has_preview_content(
+    let has_preview = preview_content_for_selection(
         &file_browser.browser_mode,
         pending_torrent_path,
         pending_torrent_link,
-        selected_filesystem_file,
+        &file_browser.state,
+        &file_browser.data,
     );
     let pane = focused_pane(&file_browser.browser_mode);
     let list_height = calculate_list_height(
@@ -5936,6 +5934,7 @@ impl App {
                     let pending_torrent_link = !self.app_state.pending_torrent_link.is_empty();
                     let file_browser = &mut self.app_state.ui.file_browser;
                     file_browser.fetch_pending = false;
+                    file_browser.fetch_error = None;
                     // --- 1. Apply Dynamic Sorting ---
                     if let FileBrowserMode::File(extensions) = &file_browser.browser_mode {
                         let target_exts: Vec<String> =
@@ -6005,7 +6004,7 @@ impl App {
                     file_browser.state.cursor_path = None;
                     file_browser.state.top_most_offset = 0;
                     file_browser.torrent_file_preview = TorrentFilePreviewState::Idle;
-                    self.app_state.system_error = Some(message);
+                    file_browser.fetch_error = Some(message);
                     self.app_state.ui.needs_redraw = true;
                 }
             }
@@ -6578,6 +6577,7 @@ impl App {
             let file_browser = &mut self.app_state.ui.file_browser;
             file_browser.fetch_request_id = request_id;
             file_browser.fetch_pending = true;
+            file_browser.fetch_error = None;
             file_browser.torrent_preview_request_id =
                 file_browser.torrent_preview_request_id.wrapping_add(1);
             file_browser.torrent_file_preview = TorrentFilePreviewState::Idle;
@@ -15355,6 +15355,8 @@ mod tests {
         app.app_state.ui.file_browser.state.current_path = current_dir.path().to_path_buf();
         app.app_state.ui.file_browser.search_state = BrowserSearchState::Applied;
         app.app_state.ui.file_browser.search_query = "old pending".to_string();
+        app.app_state.ui.file_browser.fetch_error = Some("old browser failure".to_string());
+        app.app_state.system_error = Some("unrelated application failure".to_string());
         app.app_state.ui.file_browser.browser_mode = FileBrowserMode::DownloadLocSelection {
             target: DownloadSelectionTarget::PendingAdd,
             torrent_files: vec![],
@@ -15430,6 +15432,11 @@ mod tests {
             BrowserSearchState::Closed
         );
         assert!(app.app_state.ui.file_browser.search_query.is_empty());
+        assert!(app.app_state.ui.file_browser.fetch_error.is_none());
+        assert_eq!(
+            app.app_state.system_error.as_deref(),
+            Some("unrelated application failure")
+        );
 
         let _ = app.shutdown_tx.send(());
     }
@@ -15503,6 +15510,7 @@ mod tests {
         let retained_path = current_dir.path().join("retained.bin");
         app.app_state.mode = AppMode::FileBrowser;
         app.app_state.ui.file_browser.fetch_request_id = 7;
+        app.app_state.ui.file_browser.fetch_error = Some("retained crawl failure".to_string());
         app.app_state.ui.file_browser.state.current_path = current_dir.path().to_path_buf();
         app.app_state.ui.file_browser.data = vec![RawNode {
             name: "retained.bin".to_string(),
@@ -15549,6 +15557,7 @@ mod tests {
             app.app_state.ui.file_browser.data[0].full_path,
             retained_path
         );
+        assert!(app.app_state.ui.file_browser.fetch_error.is_none());
         assert!(app.app_state.system_error.is_none());
         let _ = app.shutdown_tx.send(());
     }
@@ -15700,8 +15709,41 @@ mod tests {
         assert!(app.app_state.ui.file_browser.data.is_empty());
         assert!(app.app_state.ui.file_browser.state.cursor_path.is_none());
         assert_eq!(
-            app.app_state.system_error.as_deref(),
+            app.app_state.ui.file_browser.fetch_error.as_deref(),
             Some("Directory could not be read")
+        );
+        assert!(app.app_state.system_error.is_none());
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn matching_file_browser_success_clears_only_browser_fetch_error() {
+        let current_dir = tempfile::tempdir().expect("create current dir");
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        app.app_state.mode = AppMode::FileBrowser;
+        app.app_state.ui.file_browser.fetch_request_id = 8;
+        app.app_state.ui.file_browser.fetch_error = Some("old browser failure".to_string());
+        app.app_state.ui.file_browser.state.current_path = current_dir.path().to_path_buf();
+        app.app_state.system_error = Some("unrelated application failure".to_string());
+
+        app.handle_app_command(AppCommand::UpdateFileBrowserData {
+            request_id: 8,
+            path: current_dir.path().to_path_buf(),
+            data: Vec::new(),
+            highlight_path: None,
+        })
+        .await;
+
+        assert!(app.app_state.ui.file_browser.fetch_error.is_none());
+        assert_eq!(
+            app.app_state.system_error.as_deref(),
+            Some("unrelated application failure")
         );
         let _ = app.shutdown_tx.send(());
     }

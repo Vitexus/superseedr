@@ -7,11 +7,12 @@ use crate::tracker::normalize_tracker_urls;
 use serde::de::{self};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_bencode::value::Value;
+use sha2::{Digest, Sha256};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-const MAX_V2_PIECE_LENGTH: u32 = 16 * 1024 * 1024;
+type V2FileEntry = (String, u64, Option<Vec<u8>>);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PathValidationError {
@@ -23,7 +24,6 @@ pub enum PathValidationError {
     EmptyFilePath,
     DuplicateFilePath(String),
     FileDirectoryCollision { file: String, descendant: String },
-    InvalidUtf8,
     NonPositivePieceLength(i64),
     NegativeFileLength(String),
     WindowsInvalidComponent,
@@ -60,7 +60,6 @@ impl fmt::Display for PathValidationError {
                 f,
                 "torrent path '{file}' is both a file and a parent of '{descendant}'"
             ),
-            Self::InvalidUtf8 => write!(f, "torrent path components must be valid UTF-8"),
             Self::NonPositivePieceLength(length) => {
                 write!(f, "torrent piece length must be positive, got {length}")
             }
@@ -79,8 +78,7 @@ impl fmt::Display for PathValidationError {
             }
             Self::InvalidV2PieceLength(length) => write!(
                 f,
-                "v2 piece length must be a power of two between 16384 and {}, got {length}",
-                MAX_V2_PIECE_LENGTH
+                "v2 piece length must be a supported power of two of at least 16384 bytes, got {length}"
             ),
             Self::MalformedV2Tree { path, reason } => {
                 write!(f, "malformed v2 file tree at '{path}': {reason}")
@@ -272,11 +270,13 @@ impl Torrent {
             ));
         }
         if self.info.meta_version == Some(2) {
+            // PieceManager and the peer-wire request geometry store piece
+            // lengths as u32. This still permits every power of two through
+            // 2 GiB; do not impose a smaller policy limit than the actual
+            // representation requires.
             let piece_length = u32::try_from(self.info.piece_length)
                 .map_err(|_| PathValidationError::InvalidV2PieceLength(self.info.piece_length))?;
-            if !(16_384..=MAX_V2_PIECE_LENGTH).contains(&piece_length)
-                || !piece_length.is_power_of_two()
-            {
+            if piece_length < 16_384 || !piece_length.is_power_of_two() {
                 return Err(PathValidationError::InvalidV2PieceLength(
                     self.info.piece_length,
                 ));
@@ -291,7 +291,7 @@ impl Torrent {
         if let Some(file_tree) = &self.info.file_tree {
             validate_v2_file_tree(file_tree, &mut Vec::new())?;
             let mut v2_files = Vec::new();
-            for (path, length, _) in self.get_v2_files() {
+            for (path, length, _) in self.try_get_v2_files()? {
                 let length =
                     i64::try_from(length).map_err(|_| PathValidationError::TotalLengthOverflow)?;
                 v2_files.push(InfoFile {
@@ -330,12 +330,19 @@ impl Torrent {
 
     /// Returns every v2 file leaf, including valid zero-length leaves that do
     /// not carry a `pieces root` field.
-    pub fn get_v2_files(&self) -> Vec<(String, u64, Option<Vec<u8>>)> {
+    pub fn get_v2_files(&self) -> Vec<V2FileEntry> {
+        self.try_get_v2_files().unwrap_or_default()
+    }
+
+    /// Collects v2 files in their raw bencoded byte-key order while exposing
+    /// sanitized host paths. The raw order is the protocol ordering; sorting
+    /// the sanitized names could assign piece roots to the wrong file.
+    fn try_get_v2_files(&self) -> Result<Vec<V2FileEntry>, PathValidationError> {
         let mut results = Vec::new();
         if let Some(ref tree) = self.info.file_tree {
-            traverse_file_tree(tree, String::new(), &mut results);
+            traverse_file_tree(tree, &mut Vec::new(), &mut results)?;
         }
-        results
+        Ok(results)
     }
 
     pub fn get_layer_hashes(&self, root_hash: &[u8]) -> Option<Vec<u8>> {
@@ -353,10 +360,9 @@ impl Torrent {
         let mut current_piece_index = 0;
 
         if self.info.meta_version == Some(2) && piece_len > 0 {
-            let mut v2_files = self.get_v2_files();
-            v2_files.sort_by(|(path_a, _, _), (path_b, _, _)| path_a.cmp(path_b));
-
-            for (file_index, (_path, length, root_hash)) in v2_files.into_iter().enumerate() {
+            for (file_index, (_path, length, root_hash)) in
+                self.get_v2_files().into_iter().enumerate()
+            {
                 if let Some(root_hash) = root_hash.filter(|_| length > 0) {
                     let file_pieces = length.div_ceil(piece_len);
                     let file_start_offset = current_piece_index * piece_len;
@@ -397,13 +403,13 @@ impl Torrent {
         }
 
         // Calculate where the file starts in piece-space and the request's relative bounds
-        let file_start_piece = (file_start_offset as u32) / (piece_len as u32);
-        if piece_index < file_start_piece {
+        let file_start_piece = file_start_offset / piece_len;
+        if u64::from(piece_index) < file_start_piece {
             return None;
         }
 
-        let relative_start_idx = (piece_index - file_start_piece) as usize;
-        let relative_end_idx = relative_start_idx + requested_length as usize;
+        let relative_start_idx = usize::try_from(u64::from(piece_index) - file_start_piece).ok()?;
+        let relative_end_idx = relative_start_idx.checked_add(requested_length as usize)?;
 
         // 1. Try to retrieve explicit layers first.
         // This handles Multi-piece files AND test mocks that inject layers for single files.
@@ -455,6 +461,100 @@ fn v2_path_label(current_path: &[String]) -> String {
     } else {
         current_path.join("/")
     }
+}
+
+/// Rejects raw names that can express traversal on a host filesystem before
+/// any lossy decoding or sanitization takes place.
+fn validate_raw_v2_component(raw_name: &[u8]) -> Result<(), PathValidationError> {
+    if raw_name == b"." || raw_name == b".." {
+        return Err(PathValidationError::CurrentOrParentComponent);
+    }
+    if raw_name.starts_with(b"/") || raw_name.starts_with(b"\\") {
+        return Err(PathValidationError::AbsoluteOrPrefixed);
+    }
+    if raw_name.contains(&b'/') || raw_name.contains(&b'\\') {
+        return Err(PathValidationError::PathSeparator);
+    }
+    if raw_name.len() >= 2 && raw_name[0].is_ascii_alphabetic() && raw_name[1] == b':' {
+        return Err(PathValidationError::AbsoluteOrPrefixed);
+    }
+    Ok(())
+}
+
+fn encoded_v2_component(raw_name: &[u8]) -> String {
+    // Keep ordinary invalid byte strings inspectable while bounding the host
+    // component below common 255-byte filename limits.
+    if raw_name.len() <= 80 {
+        format!("_bep52_{}", hex::encode(raw_name))
+    } else {
+        format!("_bep52_sha256_{}", hex::encode(Sha256::digest(raw_name)))
+    }
+}
+
+fn v2_component_base(raw_name: &[u8]) -> Result<(String, bool), PathValidationError> {
+    validate_raw_v2_component(raw_name)?;
+
+    if let Ok(name) = std::str::from_utf8(raw_name) {
+        match validate_path_component(name) {
+            Ok(()) => return Ok((name.to_string(), false)),
+            // These variants describe traversal rather than a host naming
+            // incompatibility and must never be silently rewritten.
+            Err(
+                error @ (PathValidationError::CurrentOrParentComponent
+                | PathValidationError::PathSeparator
+                | PathValidationError::AbsoluteOrPrefixed),
+            ) => return Err(error),
+            Err(_) => {}
+        }
+    }
+
+    Ok((encoded_v2_component(raw_name), true))
+}
+
+/// Returns non-metadata children in raw bencoded key order, paired with a
+/// deterministic host-safe component. Valid names retain their spelling;
+/// sanitized names are disambiguated from both valid siblings and one another
+/// using case-folded host keys.
+fn sanitized_v2_children(
+    entries: &HashMap<Vec<u8>, Value>,
+) -> Result<Vec<(&Value, String)>, PathValidationError> {
+    let mut children: Vec<_> = entries
+        .iter()
+        .filter(|(raw_name, _)| !raw_name.is_empty())
+        .collect();
+    children.sort_unstable_by_key(|(left, _)| *left);
+
+    let mut prepared = Vec::with_capacity(children.len());
+    let mut used_host_keys = HashSet::with_capacity(children.len());
+    for (raw_name, child) in &children {
+        let (base, sanitized) = v2_component_base(raw_name)?;
+        if !sanitized {
+            used_host_keys.insert(base.to_lowercase());
+        }
+        prepared.push((*child, base, sanitized));
+    }
+
+    let mut results = Vec::with_capacity(prepared.len());
+    for (child, base, sanitized) in prepared {
+        let name = if sanitized {
+            let mut suffix = 0usize;
+            loop {
+                let candidate = if suffix == 0 {
+                    base.clone()
+                } else {
+                    format!("{base}~{suffix}")
+                };
+                if used_host_keys.insert(candidate.to_lowercase()) {
+                    break candidate;
+                }
+                suffix = suffix.saturating_add(1);
+            }
+        } else {
+            base
+        };
+        results.push((child, name));
+    }
+    Ok(results)
 }
 
 fn validate_v2_file_tree(
@@ -533,9 +633,10 @@ fn validate_v2_file_tree(
         }
 
         has_child_paths = true;
-        let name = std::str::from_utf8(raw_name).map_err(|_| PathValidationError::InvalidUtf8)?;
-        validate_path_component(name)?;
-        current_path.push(name.to_string());
+    }
+
+    for (child, name) in sanitized_v2_children(entries)? {
+        current_path.push(name);
         validate_v2_file_tree(child, current_path)?;
         current_path.pop();
     }
@@ -552,39 +653,36 @@ fn validate_v2_file_tree(
 
 fn traverse_file_tree(
     node: &Value,
-    current_path: String,
-    results: &mut Vec<(String, u64, Option<Vec<u8>>)>,
-) {
-    if let Value::Dict(map) = node {
-        for (key, value) in map {
-            let name = String::from_utf8_lossy(key).to_string();
+    current_path: &mut Vec<String>,
+    results: &mut Vec<V2FileEntry>,
+) -> Result<(), PathValidationError> {
+    let Value::Dict(map) = node else {
+        return Err(PathValidationError::MalformedV2Tree {
+            path: v2_path_label(current_path),
+            reason: "file-tree nodes must be dictionaries".to_string(),
+        });
+    };
 
-            if name.is_empty() {
-                // This is a file metadata node (Leaf)
-                if let Value::Dict(file_metadata) = value {
-                    let root = match file_metadata.get("pieces root".as_bytes()) {
-                        Some(Value::Bytes(root)) => Some(root.clone()),
-                        _ => None,
-                    };
-                    let explicit_length = match file_metadata.get("length".as_bytes()) {
-                        Some(Value::Int(length)) => Some(u64::try_from(*length).unwrap_or(0)),
-                        _ => None,
-                    };
-                    if root.is_some() || explicit_length.is_some() {
-                        results.push((current_path.clone(), explicit_length.unwrap_or(0), root));
-                    }
-                }
-            } else {
-                // Directory node
-                let new_path = if current_path.is_empty() {
-                    name
-                } else {
-                    format!("{}/{}", current_path, name)
-                };
-                traverse_file_tree(value, new_path, results);
-            }
+    if let Some(Value::Dict(file_metadata)) = map.get(&Vec::new()) {
+        let root = match file_metadata.get("pieces root".as_bytes()) {
+            Some(Value::Bytes(root)) => Some(root.clone()),
+            _ => None,
+        };
+        let explicit_length = match file_metadata.get("length".as_bytes()) {
+            Some(Value::Int(length)) => u64::try_from(*length).ok(),
+            _ => None,
+        };
+        if root.is_some() || explicit_length.is_some() {
+            results.push((current_path.join("/"), explicit_length.unwrap_or(0), root));
         }
     }
+
+    for (value, name) in sanitized_v2_children(map)? {
+        current_path.push(name);
+        traverse_file_tree(value, current_path, results)?;
+        current_path.pop();
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -1086,8 +1184,13 @@ mod tests {
     }
 
     #[test]
-    fn v2_tree_rejects_unsafe_raw_component() {
-        for raw_name in [b"nested/child".to_vec(), vec![0xff]] {
+    fn v2_tree_rejects_traversal_raw_component() {
+        for raw_name in [
+            b"nested/child".to_vec(),
+            b"nested\\child".to_vec(),
+            b"..".to_vec(),
+            b"C:escape".to_vec(),
+        ] {
             let mut tree = HashMap::new();
             tree.insert(raw_name, build_v2_file_node(1, vec![0x11; 32]));
             let mut torrent = Torrent {
@@ -1097,6 +1200,53 @@ mod tests {
             torrent.info.file_tree = Some(Value::Dict(tree));
             assert!(torrent.validate_paths().is_err());
         }
+    }
+
+    #[test]
+    fn v2_tree_sanitizes_invalid_and_host_reserved_components() {
+        let mut tree = HashMap::new();
+        tree.insert(vec![0xff], build_v2_file_node(1, vec![0x11; 32]));
+        tree.insert(b"NUL.bin".to_vec(), build_v2_file_node(1, vec![0x22; 32]));
+        // A valid sibling deliberately occupies the invalid-byte component's
+        // default encoded name to exercise deterministic disambiguation.
+        tree.insert(b"_bep52_ff".to_vec(), build_v2_file_node(1, vec![0x33; 32]));
+        let mut torrent = Torrent {
+            info: create_test_info(Some(2)),
+            ..Torrent::default()
+        };
+        torrent.info.file_tree = Some(Value::Dict(tree));
+
+        torrent.validate_paths().expect("sanitized v2 paths");
+        let files = torrent.get_v2_files();
+        let paths: Vec<_> = files.iter().map(|(path, _, _)| path.as_str()).collect();
+        assert!(paths.contains(&"_bep52_ff"));
+        assert!(paths.contains(&"_bep52_ff~1"));
+        assert!(paths.contains(&"_bep52_4e554c2e62696e"));
+    }
+
+    #[test]
+    fn v2_piece_mapping_keeps_raw_order_after_path_sanitization() {
+        let safe_root = vec![0x11; 32];
+        let sanitized_root = vec![0x22; 32];
+        let mut tree = HashMap::new();
+        // Raw byte ordering is "z.bin" then 0xff, while the sanitized names
+        // sort in the opposite order ("_bep52_ff" before "z.bin").
+        tree.insert(b"z.bin".to_vec(), build_v2_file_node(1, safe_root.clone()));
+        tree.insert(vec![0xff], build_v2_file_node(1, sanitized_root.clone()));
+        let mut torrent = Torrent {
+            info: create_test_info(Some(2)),
+            ..Torrent::default()
+        };
+        torrent.info.file_tree = Some(Value::Dict(tree));
+
+        torrent.validate_paths().expect("sanitized v2 paths");
+        let files = torrent.get_v2_files();
+        assert_eq!(files[0].0, "z.bin");
+        assert_eq!(files[1].0, "_bep52_ff");
+
+        let mapping = torrent.calculate_v2_mapping();
+        assert_eq!(mapping.piece_to_roots[&0][0].root_hash, safe_root);
+        assert_eq!(mapping.piece_to_roots[&1][0].root_hash, sanitized_root);
     }
 
     #[test]

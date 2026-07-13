@@ -561,11 +561,8 @@ pub fn build_offline_purge_plan(
             ),
         });
     }
-    let multi_file_info = MultiFileInfo {
-        files: planned_files,
-        total_size: current_offset,
-        download_root: download_root.clone(),
-    };
+    let multi_file_info =
+        MultiFileInfo::from_parts(planned_files, current_offset, download_root.clone());
 
     let (files, directories) = calculate_deletion_lists(
         &multi_file_info,

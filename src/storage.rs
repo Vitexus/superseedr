@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fs as std_fs;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use tokio::fs::{self, try_exists, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 
@@ -33,9 +34,45 @@ pub struct MultiFileInfo {
     /// The user-selected download root. All file paths must resolve below this
     /// boundary, even when existing path components are symbolic links.
     pub download_root: PathBuf,
+    /// Result of the first complete filesystem containment check performed by
+    /// block I/O. Clones share this result so validating a torrent's immutable
+    /// file map does not add synchronous canonicalization to every block.
+    containment_validation: Arc<OnceLock<Result<(), CachedContainmentError>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedContainmentError {
+    kind: ErrorKind,
+    message: String,
+}
+
+impl CachedContainmentError {
+    fn from_io(error: std::io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn to_io(&self) -> std::io::Error {
+        std::io::Error::new(self.kind, self.message.clone())
+    }
 }
 
 impl MultiFileInfo {
+    pub(crate) fn from_parts(
+        files: Vec<FileInfo>,
+        total_size: u64,
+        download_root: PathBuf,
+    ) -> Self {
+        Self {
+            files,
+            total_size,
+            download_root,
+            containment_validation: Arc::new(OnceLock::new()),
+        }
+    }
+
     /// Creates a new MultiFileInfo map. This is the central point of unification.
     /// It intelligently handles both single and multi-file torrent metadata.
     #[cfg(test)]
@@ -104,11 +141,11 @@ impl MultiFileInfo {
                     )
                 })?;
             }
-            Ok(Self {
-                files: files_vec,
-                total_size: current_offset,
-                download_root: download_root.to_path_buf(),
-            })
+            Ok(Self::from_parts(
+                files_vec,
+                current_offset,
+                download_root.to_path_buf(),
+            ))
         } else {
             let total_size = length.unwrap_or(0);
             let file_path = root_dir.join(torrent_name);
@@ -125,12 +162,31 @@ impl MultiFileInfo {
                 is_padding: false,
                 is_skipped,
             };
-            Ok(Self {
-                files: vec![single_file],
+            Ok(Self::from_parts(
+                vec![single_file],
                 total_size,
-                download_root: download_root.to_path_buf(),
-            })
+                download_root.to_path_buf(),
+            ))
         }
+    }
+
+    fn ensure_cached_containment(&self) -> std::io::Result<()> {
+        // This preserves the construction/allocation-time symlink checks while
+        // keeping canonicalization out of the per-block hot path. Like the old
+        // check-before-open sequence, it cannot eliminate a concurrent symlink
+        // swap; doing that requires descriptor-relative, no-follow filesystem
+        // operations on each supported platform.
+        let validation = self.containment_validation.get_or_init(|| {
+            self.files
+                .iter()
+                .try_for_each(|file_info| {
+                    ensure_path_within_root(&self.download_root, &file_info.path)
+                })
+                .map_err(CachedContainmentError::from_io)
+        });
+
+        validation.as_ref().map_err(CachedContainmentError::to_io)?;
+        Ok(())
     }
 }
 
@@ -223,9 +279,7 @@ fn resolve_existing_ancestor(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn ensure_multi_file_paths(multi_file_info: &MultiFileInfo) -> Result<(), StorageError> {
-    for file_info in &multi_file_info.files {
-        ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
-    }
+    multi_file_info.ensure_cached_containment()?;
     Ok(())
 }
 
@@ -323,6 +377,7 @@ pub async fn read_data_from_disk(
     bytes_to_read: usize,
 ) -> Result<Vec<u8>, StorageError> {
     validate_io_span(multi_file_info, global_offset, bytes_to_read as u64, "read")?;
+    multi_file_info.ensure_cached_containment()?;
 
     let mut buffer = Vec::with_capacity(bytes_to_read);
     let mut bytes_read = 0;
@@ -345,7 +400,6 @@ pub async fn read_data_from_disk(
                     let zeros = vec![0u8; bytes_to_read_in_this_file];
                     buffer.extend_from_slice(&zeros);
                 } else {
-                    ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                     // NEW: Fast Validation for Skipped Files
                     // If the file is skipped and MISSING, return zeros immediately.
                     // This simulates "Missing Data" without raising an IO error.
@@ -363,7 +417,6 @@ pub async fn read_data_from_disk(
                         // Fresh downloads use zero-length placeholders instead of
                         // preallocating, so in-span reads past the physical EOF are
                         // treated as sparse zeroes.
-                        ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                         let mut file = File::open(&file_info.path).await?;
                         let physical_len = file.metadata().await?.len();
                         let readable_bytes = physical_len
@@ -405,6 +458,7 @@ pub async fn write_data_to_disk(
         data_to_write.len() as u64,
         "write",
     )?;
+    multi_file_info.ensure_cached_containment()?;
 
     let mut bytes_written = 0;
     let data_len = data_to_write.len();
@@ -423,19 +477,16 @@ pub async fn write_data_to_disk(
 
             if bytes_to_write_in_this_file > 0 {
                 if !file_info.is_padding {
-                    ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                     // Note: We ALLOW writing to skipped files if necessary (e.g. boundary pieces).
                     // This will create them lazily if they were skipped during allocation.
 
                     // Ensure directory exists (lazy creation for skipped boundary files)
                     if file_info.is_skipped {
                         if let Some(parent) = file_info.path.parent() {
-                            ensure_path_within_root(&multi_file_info.download_root, parent)?;
                             fs::create_dir_all(parent).await?;
                         }
                     }
 
-                    ensure_path_within_root(&multi_file_info.download_root, &file_info.path)?;
                     let mut file = OpenOptions::new()
                         .write(true)
                         .create(true)
@@ -707,6 +758,22 @@ mod tests {
             std::fs::read(outside_root.join("payload.bin")).unwrap(),
             b"safe"
         );
+    }
+
+    #[tokio::test]
+    async fn block_io_reuses_cached_containment_validation() {
+        let (_dir, mfi) = setup_single_file();
+        assert!(mfi.containment_validation.get().is_none());
+
+        create_and_allocate_files(&mfi).await.unwrap();
+        assert!(mfi.containment_validation.get().is_some());
+
+        let cloned = mfi.clone();
+        assert!(Arc::ptr_eq(
+            &mfi.containment_validation,
+            &cloned.containment_validation
+        ));
+        read_data_from_disk(&cloned, 0, 16).await.unwrap();
     }
 
     #[cfg(unix)]

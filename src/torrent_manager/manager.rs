@@ -3477,8 +3477,7 @@ impl TorrentManager {
                         TorrentCommand::MerkleHashData { peer_id, root, piece_index, proof, .. } => {
                             if let Some(torrent) = &self.state.torrent {
                                 let piece_len = torrent.info.piece_length as u64;
-                                let mut v2_roots = torrent.get_v2_roots();
-                                v2_roots.sort_by(|(path_a, _, _), (path_b, _, _)| path_a.cmp(path_b));
+                                let v2_roots = torrent.get_v2_roots();
 
                                 let mut current_file_start = 0;
 
