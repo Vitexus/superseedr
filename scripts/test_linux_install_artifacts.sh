@@ -14,10 +14,10 @@ for the variant being tested.
 
 Checks:
   - artifact SHA256SUMS, when present
+  - tarball extracts to a runnable ./superseedr binary before package installation
   - apt installs the .deb
   - dpkg registers package superseedr
   - /usr/bin/superseedr exists and starts with --help
-  - tarball extracts to a runnable ./superseedr binary
 
 Examples:
   scripts/test_linux_install_artifacts.sh --artifact-dir staging --platform linux/arm64
@@ -123,9 +123,19 @@ docker run --rm \
     dpkg-deb --info "$deb"
     dpkg-deb --contents "$deb"
 
-    echo "== install deb =="
+    echo "== smoke-test tarball before installing deb =="
     apt-get update
     apt-get install -y file ca-certificates
+    mkdir -p /tmp/superseedr-tarball
+    tar -xzf "$tarball" -C /tmp/superseedr-tarball
+    tarball_bin=$(find /tmp/superseedr-tarball -type f -name superseedr -perm /111 -print -quit)
+    test -n "$tarball_bin"
+    file "$tarball_bin"
+    ldd "$tarball_bin"
+    "$tarball_bin" --help >/tmp/superseedr-tarball-help.txt
+    sed -n "1,40p" /tmp/superseedr-tarball-help.txt
+
+    echo "== install deb =="
     apt-get install -y "$deb"
 
     echo "== installed package =="
@@ -136,16 +146,6 @@ docker run --rm \
     ldd /usr/bin/superseedr
     superseedr --help >/tmp/superseedr-help.txt
     sed -n "1,40p" /tmp/superseedr-help.txt
-
-    echo "== tarball smoke =="
-    mkdir -p /tmp/superseedr-tarball
-    tar -xzf "$tarball" -C /tmp/superseedr-tarball
-    tarball_bin=$(find /tmp/superseedr-tarball -type f -name superseedr -perm /111 -print -quit)
-    test -n "$tarball_bin"
-    file "$tarball_bin"
-    ldd "$tarball_bin"
-    "$tarball_bin" --help >/tmp/superseedr-tarball-help.txt
-    sed -n "1,40p" /tmp/superseedr-tarball-help.txt
 
     echo "== uninstall =="
     apt-get purge -y superseedr

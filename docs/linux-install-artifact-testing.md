@@ -1,6 +1,6 @@
 # Linux install artifact testing
 
-Superseedr Linux release artifacts can be smoke-tested locally with Docker before they are promoted into a release. The test installs the Debian package in a clean Linux container, verifies the installed binary starts, verifies the tarball binary starts, and purges the package again.
+Superseedr Linux release artifacts can be smoke-tested locally with Docker before they are promoted into a release. The test verifies the tarball binary in a clean Linux container before installing the Debian package, verifies the installed binary starts, and purges the package again.
 
 ## Script
 
@@ -15,11 +15,11 @@ The script checks:
 
 - `SHA256SUMS`, when present
 - `.deb` metadata and contents
+- tarball extraction, dynamic library resolution, and tarball binary `--help` before package installation
 - `apt-get install` of the local `.deb`
 - `dpkg -s superseedr` and `dpkg -L superseedr`
 - `/usr/bin/superseedr` architecture and dynamic library resolution
 - `superseedr --help`
-- tarball extraction and tarball binary `--help`
 - `apt-get purge` removes the package and installed binary
 
 ## Examples
