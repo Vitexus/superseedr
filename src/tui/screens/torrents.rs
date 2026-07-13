@@ -4,6 +4,7 @@
 use crate::app::{
     torrent_completion_percent, App, AppCommand, AppMode, AppState, SearchMode,
     TorrentControlState, TorrentDisplayState, TorrentManagementPendingCommand,
+    TorrentManagementReviewCache,
 };
 use crate::config::SortDirection;
 use crate::integrations::control::ControlRequest;
@@ -140,21 +141,11 @@ struct RowMetrics {
 }
 
 #[derive(Default)]
-#[cfg(test)]
 struct PendingManagementSummary {
     pause_count: usize,
     resume_count: usize,
     remove_count: usize,
     purge_count: usize,
-}
-
-#[derive(Default)]
-struct PendingManagementReviewGroups {
-    pause: Vec<String>,
-    resume: Vec<String>,
-    delete: Vec<String>,
-    purge: Vec<String>,
-    purge_total_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -226,6 +217,7 @@ pub(crate) fn initialize_torrent_management_cursor(app_state: &mut AppState) {
     app_state.ui.torrent_management.selected_index = 0;
     app_state.ui.torrent_management.cursor_hash = None;
     app_state.ui.torrent_management.input_latch = None;
+    app_state.ui.torrent_management.review_cache = None;
     normalize_management_cursor(app_state);
 }
 
@@ -268,12 +260,9 @@ fn management_action_allows_repeat(action: &TorrentManagementAction) -> bool {
 }
 
 fn management_action_needs_input_latch(action: &TorrentManagementAction) -> bool {
-    !management_action_allows_repeat(action)
-        && !matches!(
-            action,
-            TorrentManagementAction::ToNormal
-                | TorrentManagementAction::OpenHighlightedTorrentFiles
-        )
+    // `/` changes from an opener into text input across this boundary. Other shortcuts rely on
+    // KeyEventKind::Repeat so distinct Press events remain usable without key-release reporting.
+    matches!(action, TorrentManagementAction::StartSearch)
 }
 
 fn map_key_to_management_action(
@@ -1157,8 +1146,14 @@ fn try_push_management_footer_action(
 }
 
 fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &ThemeContext) {
-    let groups = pending_management_review_groups(app_state);
-    let area = management_review_popup_area(f.area(), &groups);
+    let fallback_groups;
+    let groups = if let Some(groups) = app_state.ui.torrent_management.review_cache.as_ref() {
+        groups
+    } else {
+        fallback_groups = pending_management_review_groups(app_state);
+        &fallback_groups
+    };
+    let area = management_review_popup_area(f.area(), groups);
     f.render_widget(Clear, area);
 
     let horizontal_padding = management_review_horizontal_padding(area.width);
@@ -1173,7 +1168,7 @@ fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &Theme
     f.render_widget(block, area);
 
     let regions = management_review_regions(area);
-    let sections = pending_management_review_sections(&groups);
+    let sections = pending_management_review_sections(groups);
     let line_count = pending_management_review_line_count(&sections);
     let body_height = regions.body.height as usize;
     let max_scroll = line_count.saturating_sub(body_height);
@@ -1210,18 +1205,18 @@ fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &Theme
             .track_style(ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)))
             .begin_style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)))
             .end_style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)));
-        let mut scrollbar_state = ScrollbarState::new(line_count)
+        let mut scrollbar_state = ScrollbarState::new(max_scroll.saturating_add(1))
             .position(scroll_offset)
             .viewport_content_length(body_height);
         f.render_stateful_widget(scrollbar, regions.body, &mut scrollbar_state);
     }
 
-    draw_management_review_summary(f, &groups, regions, ctx);
-    draw_management_review_footer(f, &groups, regions, scroll_offset, line_count, ctx);
+    draw_management_review_summary(f, groups, regions, ctx);
+    draw_management_review_footer(f, groups, regions, scroll_offset, line_count, ctx);
 }
 
 fn pending_management_review_sections(
-    groups: &PendingManagementReviewGroups,
+    groups: &TorrentManagementReviewCache,
 ) -> Vec<ManagementReviewSection<'_>> {
     let mut sections = Vec::new();
     if !groups.pause.is_empty() {
@@ -1261,6 +1256,26 @@ fn pending_management_review_line_count(sections: &[ManagementReviewSection<'_>]
         .map(|section| 1usize.saturating_add(section.names.len()))
         .sum::<usize>()
         .saturating_add(sections.len().saturating_sub(1))
+}
+
+fn pending_management_review_summary_line_count(summary: &PendingManagementSummary) -> usize {
+    let total = summary
+        .pause_count
+        .saturating_add(summary.resume_count)
+        .saturating_add(summary.remove_count)
+        .saturating_add(summary.purge_count);
+    let section_count = [
+        summary.pause_count,
+        summary.resume_count,
+        summary.remove_count,
+        summary.purge_count,
+    ]
+    .into_iter()
+    .filter(|count| *count > 0)
+    .count();
+    total
+        .saturating_add(section_count)
+        .saturating_add(section_count.saturating_sub(1))
 }
 
 fn pending_management_review_visible_lines(
@@ -1318,27 +1333,29 @@ fn pending_management_review_visible_lines(
     body
 }
 
-fn management_review_popup_area(frame_area: Rect, groups: &PendingManagementReviewGroups) -> Rect {
+fn management_review_popup_area(frame_area: Rect, groups: &TorrentManagementReviewCache) -> Rect {
     let max_width = frame_area
         .width
         .saturating_mul(86)
         .saturating_div(100)
         .max(frame_area.width.min(72))
         .min(frame_area.width);
-    let max_height = frame_area
-        .height
-        .saturating_mul(88)
-        .saturating_div(100)
-        .max(frame_area.height.min(12))
-        .min(frame_area.height);
+    let height = management_review_popup_height(frame_area.height);
     let width = pending_management_review_popup_width(groups, max_width);
-    let height = max_height;
     Rect::new(
         frame_area.x + frame_area.width.saturating_sub(width) / 2,
         frame_area.y + frame_area.height.saturating_sub(height) / 2,
         width,
         height,
     )
+}
+
+fn management_review_popup_height(frame_height: u16) -> u16 {
+    frame_height
+        .saturating_mul(88)
+        .saturating_div(100)
+        .max(frame_height.min(12))
+        .min(frame_height)
 }
 
 fn management_review_horizontal_padding(popup_width: u16) -> u16 {
@@ -1379,15 +1396,25 @@ fn management_review_regions(popup_area: Rect) -> ManagementReviewRegions {
     }
 }
 
-fn management_review_body_area(frame_area: Rect, groups: &PendingManagementReviewGroups) -> Rect {
+#[cfg(test)]
+fn management_review_body_area(frame_area: Rect, groups: &TorrentManagementReviewCache) -> Rect {
     let popup_area = management_review_popup_area(frame_area, groups);
     management_review_regions(popup_area).body
 }
 
+fn management_review_body_height(frame_area: Rect) -> u16 {
+    management_review_regions(Rect::new(
+        0,
+        0,
+        frame_area.width,
+        management_review_popup_height(frame_area.height),
+    ))
+    .body
+    .height
+}
+
 fn management_review_page_lines(app_state: &AppState) -> usize {
-    let groups = pending_management_review_groups(app_state);
-    management_review_body_area(app_state.screen_area, &groups)
-        .height
+    management_review_body_height(app_state.screen_area)
         .saturating_sub(1)
         .max(1) as usize
 }
@@ -1397,10 +1424,9 @@ fn max_management_review_scroll_offset(app_state: &AppState) -> usize {
         return 0;
     }
 
-    let groups = pending_management_review_groups(app_state);
-    let body_area = management_review_body_area(app_state.screen_area, &groups);
-    let sections = pending_management_review_sections(&groups);
-    pending_management_review_line_count(&sections).saturating_sub(body_area.height as usize)
+    let summary = pending_management_summary(app_state);
+    pending_management_review_summary_line_count(&summary)
+        .saturating_sub(management_review_body_height(app_state.screen_area) as usize)
 }
 
 fn clamp_management_review_scroll(app_state: &mut AppState) {
@@ -1421,18 +1447,42 @@ fn normalize_management_review_state(app_state: &mut AppState) {
     if app_state.ui.torrent_management.pending_commands.is_empty() {
         app_state.ui.torrent_management.confirm_submit = false;
         app_state.ui.torrent_management.review_scroll_offset = 0;
-    } else {
+        app_state.ui.torrent_management.review_cache = None;
+    } else if app_state.ui.torrent_management.confirm_submit {
         clamp_management_review_scroll(app_state);
+        if app_state.ui.torrent_management.review_cache.is_none() {
+            refresh_pending_management_review_cache(app_state);
+        }
+    } else {
+        app_state.ui.torrent_management.review_scroll_offset = 0;
+        app_state.ui.torrent_management.review_cache = None;
     }
 }
 
+fn refresh_pending_management_review_cache(app_state: &mut AppState) {
+    app_state.ui.torrent_management.review_cache =
+        Some(pending_management_review_groups(app_state));
+}
+
 fn pending_management_review_popup_width(
-    groups: &PendingManagementReviewGroups,
+    groups: &TorrentManagementReviewCache,
     max_width: u16,
 ) -> u16 {
     if max_width == 0 {
         return 0;
     }
+    let longest = if groups.longest_line_width > 0 {
+        groups.longest_line_width
+    } else {
+        pending_management_review_longest_line_width(groups)
+    };
+
+    let max_width = max_width as usize;
+    let desired = longest.saturating_add(6).min(max_width);
+    desired.max(1).max(72.min(max_width)) as u16
+}
+
+fn pending_management_review_longest_line_width(groups: &TorrentManagementReviewCache) -> usize {
     let sections = pending_management_review_sections(groups);
     let mut longest = terminal_text_width(" Review Queued Changes ");
     for section in sections {
@@ -1445,13 +1495,10 @@ fn pending_management_review_popup_width(
             longest = longest.max(terminal_text_width(&format!("• {name}")));
         }
     }
-
-    let max_width = max_width as usize;
-    let desired = longest.saturating_add(6).min(max_width);
-    desired.max(1).max(72.min(max_width)) as u16
+    longest
 }
 
-fn pending_management_review_total(groups: &PendingManagementReviewGroups) -> usize {
+fn pending_management_review_total(groups: &TorrentManagementReviewCache) -> usize {
     groups
         .pause
         .len()
@@ -1492,9 +1539,26 @@ fn management_review_compact_visible_range(
     format!("↕{}–{last}/{line_count}", first.saturating_add(1))
 }
 
+fn management_review_compact_purge_safety_label(
+    groups: &TorrentManagementReviewCache,
+    max_width: usize,
+) -> String {
+    let size = format_gb(groups.purge_total_bytes);
+    let candidates = [
+        format!("PURGE {} • DELETE FILES • {size}", groups.purge.len()),
+        format!("PURGE {} • FILES • {size}", groups.purge.len()),
+        format!("PURGE {} • FILES", groups.purge.len()),
+    ];
+    candidates
+        .iter()
+        .find(|candidate| terminal_text_width(candidate) <= max_width)
+        .cloned()
+        .unwrap_or_else(|| truncate_middle_with_ellipsis(&candidates[2], max_width))
+}
+
 fn draw_management_review_summary(
     f: &mut Frame,
-    groups: &PendingManagementReviewGroups,
+    groups: &TorrentManagementReviewCache,
     regions: ManagementReviewRegions,
     ctx: &ThemeContext,
 ) {
@@ -1518,11 +1582,17 @@ fn draw_management_review_summary(
 
     let total = pending_management_review_total(groups);
     if regions.compact || summary_content.height == 1 {
-        let mut label = format!("{total} queued");
-        if !groups.purge.is_empty() {
-            label.push_str(&format!(" • Purge {}", groups.purge.len()));
-        } else if !groups.delete.is_empty() {
-            label.push_str(&format!(" • Remove {}", groups.delete.len()));
+        let mut label = if !groups.purge.is_empty() && summary_content.height == 1 {
+            management_review_compact_purge_safety_label(groups, summary_content.width as usize)
+        } else {
+            format!("{total} queued")
+        };
+        if groups.purge.is_empty() || summary_content.height > 1 {
+            if !groups.purge.is_empty() {
+                label.push_str(&format!(" • Purge {}", groups.purge.len()));
+            } else if !groups.delete.is_empty() {
+                label.push_str(&format!(" • Remove {}", groups.delete.len()));
+            }
         }
         let label = truncate_middle_with_ellipsis(&label, summary_content.width as usize);
         let tone = if groups.purge.is_empty() {
@@ -1587,7 +1657,7 @@ fn draw_management_review_summary(
 
 fn draw_management_review_safety_detail(
     f: &mut Frame,
-    groups: &PendingManagementReviewGroups,
+    groups: &TorrentManagementReviewCache,
     summary_content: Rect,
     ctx: &ThemeContext,
 ) {
@@ -1666,7 +1736,7 @@ fn push_management_review_summary_item(
 
 fn draw_management_review_footer(
     f: &mut Frame,
-    groups: &PendingManagementReviewGroups,
+    groups: &TorrentManagementReviewCache,
     regions: ManagementReviewRegions,
     scroll_offset: usize,
     line_count: usize,
@@ -2516,6 +2586,7 @@ fn toggle_pending_management_command(
     app_state: &mut AppState,
     command: TorrentManagementPendingCommand,
 ) {
+    app_state.ui.torrent_management.review_cache = None;
     if app_state
         .ui
         .torrent_management
@@ -2553,7 +2624,11 @@ fn clear_pending_management_commands_for_targets(
         .torrent_management
         .pending_commands
         .retain(|pending| !targets.contains(&pending.info_hash));
-    before.saturating_sub(app_state.ui.torrent_management.pending_commands.len())
+    let cleared = before.saturating_sub(app_state.ui.torrent_management.pending_commands.len());
+    if cleared > 0 {
+        app_state.ui.torrent_management.review_cache = None;
+    }
+    cleared
 }
 
 fn management_clear_status(cleared: usize, deselected: usize) -> String {
@@ -2588,7 +2663,6 @@ fn pending_management_status(app_state: &AppState) -> String {
     format!("{pending_count} draft commands pending")
 }
 
-#[cfg(test)]
 fn pending_management_summary(app_state: &AppState) -> PendingManagementSummary {
     let mut summary = PendingManagementSummary::default();
     for command in &app_state.ui.torrent_management.pending_commands {
@@ -2608,8 +2682,8 @@ fn pending_management_summary(app_state: &AppState) -> PendingManagementSummary 
     summary
 }
 
-fn pending_management_review_groups(app_state: &AppState) -> PendingManagementReviewGroups {
-    let mut groups = PendingManagementReviewGroups::default();
+fn pending_management_review_groups(app_state: &AppState) -> TorrentManagementReviewCache {
+    let mut groups = TorrentManagementReviewCache::default();
     for command in &app_state.ui.torrent_management.pending_commands {
         let name = pending_management_command_display_name(app_state, command);
         match &command.request {
@@ -2634,6 +2708,7 @@ fn pending_management_review_groups(app_state: &AppState) -> PendingManagementRe
     groups.resume.sort();
     groups.delete.sort();
     groups.purge.sort();
+    groups.longest_line_width = pending_management_review_longest_line_width(&groups);
     groups
 }
 
@@ -2737,11 +2812,15 @@ fn prune_selected_hashes(app_state: &mut AppState) {
         .torrent_management
         .selected_hashes
         .retain(|hash| live_hashes.contains(hash));
+    let pending_before = app_state.ui.torrent_management.pending_commands.len();
     app_state
         .ui
         .torrent_management
         .pending_commands
         .retain(|command| live_hashes.contains(&command.info_hash));
+    if app_state.ui.torrent_management.pending_commands.len() != pending_before {
+        app_state.ui.torrent_management.review_cache = None;
+    }
 }
 
 fn management_cursor_index_for_rows(app_state: &AppState, rows: &[ManagementRow]) -> Option<usize> {
@@ -2896,6 +2975,7 @@ mod tests {
 
     fn render_management_screen(app_state: &mut AppState, width: u16, height: u16) -> String {
         app_state.screen_area = Rect::new(0, 0, width, height);
+        normalize_management_review_state(app_state);
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test terminal");
         let dht_status = DhtStatus::default();
@@ -3231,7 +3311,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_repeated_presses_cannot_cross_input_state_boundaries() {
+    fn press_only_terminal_keeps_search_opener_latched_but_allows_escape_reuse() {
         let mut app_state = app_state_with_torrents(vec![(hash(1), "Sample Packet", 50, 5, 1)]);
         let slash = KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE);
 
@@ -3261,14 +3341,6 @@ mod tests {
         assert!(!app_state.ui.torrent_management.is_searching);
         assert_eq!(
             map_key_event_to_management_action_with_latch(escape, &mut app_state),
-            None
-        );
-
-        assert_eq!(
-            map_key_event_to_management_action_with_latch(
-                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
-                &mut app_state,
-            ),
             Some(TorrentManagementAction::ToNormal)
         );
     }
@@ -3300,7 +3372,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_press_does_not_toggle_a_staged_action_back_off() {
+    fn distinct_press_can_toggle_a_staged_action_back_off_without_release_events() {
         let mut app_state = app_state_with_torrents(vec![(hash(1), "Sample Packet", 50, 5, 1)]);
         let pause = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE);
 
@@ -3309,31 +3381,14 @@ mod tests {
         reduce_torrent_management_action(&mut app_state, action);
         assert_eq!(app_state.ui.torrent_management.pending_commands.len(), 1);
 
-        assert_eq!(
-            map_key_event_to_management_action_with_latch(pause, &mut app_state),
-            None
-        );
-        assert_eq!(app_state.ui.torrent_management.pending_commands.len(), 1);
-
-        assert_eq!(
-            map_key_event_to_management_action_with_latch(
-                KeyEvent::new_with_kind(
-                    KeyCode::Char('p'),
-                    KeyModifiers::NONE,
-                    KeyEventKind::Release,
-                ),
-                &mut app_state,
-            ),
-            None
-        );
         let action = map_key_event_to_management_action_with_latch(pause, &mut app_state)
-            .expect("reuse pause after release");
+            .expect("reuse pause without a release event");
         reduce_torrent_management_action(&mut app_state, action);
         assert!(app_state.ui.torrent_management.pending_commands.is_empty());
     }
 
     #[test]
-    fn legacy_repeated_presses_are_suppressed_for_nonrepeat_shortcuts() {
+    fn press_only_terminals_can_reuse_reversible_shortcuts() {
         for (code, modifiers) in [
             (KeyCode::Char('p'), KeyModifiers::NONE),
             (KeyCode::Char('d'), KeyModifiers::NONE),
@@ -3351,10 +3406,9 @@ mod tests {
                 map_key_event_to_management_action_with_latch(key, &mut app_state).is_some(),
                 "first press should map for {code:?}"
             );
-            assert_eq!(
-                map_key_event_to_management_action_with_latch(key, &mut app_state),
-                None,
-                "second Press should be suppressed for {code:?}"
+            assert!(
+                map_key_event_to_management_action_with_latch(key, &mut app_state).is_some(),
+                "second Press should remain usable for {code:?}"
             );
         }
     }
@@ -4418,6 +4472,16 @@ mod tests {
             .selected_hashes
             .contains(&hash(2)));
         assert!(app_state.ui.torrent_management.confirm_submit);
+        assert_eq!(
+            app_state
+                .ui
+                .torrent_management
+                .review_cache
+                .as_ref()
+                .expect("refreshed review cache")
+                .pause,
+            vec!["Meadow Saga S01E01"]
+        );
     }
 
     #[test]
@@ -4795,7 +4859,7 @@ mod tests {
 
     #[test]
     fn review_geometry_grows_monotonically_across_responsive_breakpoints() {
-        let groups = PendingManagementReviewGroups {
+        let groups = TorrentManagementReviewCache {
             pause: vec!["Geometry Packet".to_string()],
             ..Default::default()
         };
@@ -4852,6 +4916,46 @@ mod tests {
     }
 
     #[test]
+    fn review_scrolling_reuses_the_cached_grouped_names() {
+        let names = (0..20)
+            .map(|index| format!("Cached Packet {index:02}"))
+            .collect::<Vec<_>>();
+        let torrents = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (hash(index as u8 + 1), name.as_str(), 100, 10, 2))
+            .collect::<Vec<_>>();
+        let mut app_state = app_state_with_torrents(torrents);
+        app_state.ui.torrent_management.pending_commands = (1..=20).map(pause_command).collect();
+        app_state.screen_area = Rect::new(0, 0, 80, 16);
+
+        reduce_torrent_management_action(
+            &mut app_state,
+            TorrentManagementAction::ShowSubmitConfirmation,
+        );
+        app_state
+            .ui
+            .torrent_management
+            .review_cache
+            .as_mut()
+            .expect("review cache")
+            .longest_line_width = usize::MAX;
+
+        reduce_torrent_management_action(&mut app_state, TorrentManagementAction::ReviewScrollDown);
+
+        assert_eq!(
+            app_state
+                .ui
+                .torrent_management
+                .review_cache
+                .as_ref()
+                .expect("review cache")
+                .longest_line_width,
+            usize::MAX
+        );
+    }
+
+    #[test]
     fn large_review_batches_scroll_to_the_last_item_and_back() {
         let names = (0..20)
             .map(|index| format!("Batch Packet {index:02}"))
@@ -4875,6 +4979,17 @@ mod tests {
         let last_page = render_management_screen(&mut app_state, 100, 30);
         assert!(last_page.contains("Batch Packet 19"));
         assert!(app_state.ui.torrent_management.review_scroll_offset > 0);
+        let groups = pending_management_review_groups(&app_state);
+        let body = management_review_body_area(app_state.screen_area, &groups);
+        let scrollbar_x = body.x.saturating_add(body.width.saturating_sub(1)) as usize;
+        let scrollbar_y = body.y.saturating_add(body.height.saturating_sub(2)) as usize;
+        assert_eq!(
+            last_page
+                .lines()
+                .nth(scrollbar_y)
+                .and_then(|line| line.chars().nth(scrollbar_x)),
+            Some('█')
+        );
 
         reduce_torrent_management_action(&mut app_state, TorrentManagementAction::ReviewFirst);
         assert_eq!(app_state.ui.torrent_management.review_scroll_offset, 0);
@@ -4917,6 +5032,12 @@ mod tests {
         assert!(compact_first_page.contains("files"));
         assert!(compact_first_page.contains("2.50 GB"));
         assert!(compact_first_page.contains("[Enter]"));
+
+        let short_first_page = render_management_screen(&mut app_state, 32, 7);
+        assert!(short_first_page.contains("PURGE 10"));
+        assert!(short_first_page.contains("FILES"));
+        assert!(short_first_page.contains("2.50 GB"));
+        assert!(short_first_page.contains("[Enter]"));
 
         reduce_torrent_management_action(&mut app_state, TorrentManagementAction::ReviewLast);
         let last_page = render_management_screen(&mut app_state, 80, 24);
@@ -4965,6 +5086,10 @@ mod tests {
         let groups = pending_management_review_groups(&app_state);
 
         assert!(management_review_body_area(Rect::new(0, 0, 80, 7), &groups).height >= 1);
+        assert_eq!(
+            management_review_body_area(Rect::new(0, 0, 80, 7), &groups).height,
+            management_review_body_height(Rect::new(0, 0, 80, 7))
+        );
         let rendered = render_management_screen(&mut app_state, 80, 7);
         assert!(rendered.contains("20 queued"));
         assert!(rendered.contains("PAUSE: 20 Torrents"));
@@ -4991,7 +5116,7 @@ mod tests {
         let names = (0..65_540)
             .map(|index| format!("Deep Queue Packet {index:05}"))
             .collect::<Vec<_>>();
-        let groups = PendingManagementReviewGroups {
+        let groups = TorrentManagementReviewCache {
             pause: names,
             ..Default::default()
         };
@@ -5094,5 +5219,11 @@ mod tests {
         assert_eq!(summary.resume_count, 1);
         assert_eq!(summary.remove_count, 1);
         assert_eq!(summary.purge_count, 1);
+        let groups = pending_management_review_groups(&app_state);
+        let sections = pending_management_review_sections(&groups);
+        assert_eq!(
+            pending_management_review_summary_line_count(&summary),
+            pending_management_review_line_count(&sections)
+        );
     }
 }

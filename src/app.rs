@@ -1908,6 +1908,16 @@ pub struct JournalUiState {
     pub status_message: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TorrentManagementReviewCache {
+    pub(crate) pause: Vec<String>,
+    pub(crate) resume: Vec<String>,
+    pub(crate) delete: Vec<String>,
+    pub(crate) purge: Vec<String>,
+    pub(crate) purge_total_bytes: u64,
+    pub(crate) longest_line_width: usize,
+}
+
 pub struct TorrentManagementUiState {
     pub selected_index: usize,
     pub cursor_hash: Option<Vec<u8>>,
@@ -1923,6 +1933,7 @@ pub struct TorrentManagementUiState {
     pub confirm_submit: bool,
     pub review_scroll_offset: usize,
     pub input_latch: Option<ratatui::crossterm::event::KeyCode>,
+    pub(crate) review_cache: Option<TorrentManagementReviewCache>,
 }
 
 impl Default for TorrentManagementUiState {
@@ -1942,6 +1953,7 @@ impl Default for TorrentManagementUiState {
             confirm_submit: false,
             review_scroll_offset: 0,
             input_latch: None,
+            review_cache: None,
         }
     }
 }

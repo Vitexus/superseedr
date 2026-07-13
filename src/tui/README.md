@@ -58,7 +58,7 @@
   - `p`, `d`, and `D` queue pause/resume, remove, and purge actions while preserving the selected target set.
   - `Y` opens the draft-command confirmation when commands are queued; `Enter` submits from review.
   - `u` clears the current selection and any draft commands for that target set.
-  - Non-navigation shortcuts are edge-triggered so held keys cannot toggle actions repeatedly; terminals without key-release reporting require a different key before reusing the same shortcut.
+  - Held shortcuts reported as key repeats cannot toggle actions repeatedly; deliberate Press events remain reusable on terminals without key-release reporting.
   - Review mode supports `j`/`k`, arrows, Page Up/Down, Home, and End for scrolling large batches.
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
