@@ -116,6 +116,8 @@ Keep the current lightweight contract unless one or more of these happen:
 - Help content is sectioned (`General`, `Torrents`, `Graphs`, `Legends`, `Screens`, `Paths`, `Build`) and scrolls with `Up`/`Down` or `k`/`j`.
 - `Tab`/`Shift+Tab` or `h`/`l` moves between sections.
 - `/` opens a prompt-panel search across all help contents, including path and build rows; typed characters filter live, `Tab` toggles fuzzy/regex matching, `Enter` keeps results, and `Esc` clears search.
+- Help keeps the section tabs above the bordered panel and the command footer below it. Wider layouts use the classic full tab strip; narrower layouts tighten the spacing or show neighboring sections while preserving the grouped command index.
+- Help geometry is planned once and shared by rendering and scroll clamping so fixed chrome, search, and warning rows cannot make reachable content diverge from what is visible.
 
 ## Invariants
 - Reducers are deterministic and side-effect free; side effects execute via effect runners.
