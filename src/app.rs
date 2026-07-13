@@ -1894,7 +1894,7 @@ impl JournalFilter {
     pub fn label(self) -> &'static str {
         match self {
             Self::All => "ALL",
-            Self::Queue => "QUEUE",
+            Self::Queue => "INGEST",
             Self::Commands => "COMMANDS",
             Self::Health => "HEALTH",
         }
