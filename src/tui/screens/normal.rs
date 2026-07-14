@@ -6952,6 +6952,7 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             *app.app_state.ui.config.settings_edit = app.client_configs.clone();
             app.app_state.ui.config.selected_index = 0;
             app.app_state.ui.config.items = ConfigItem::iter().collect::<Vec<_>>();
+            app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
             app.app_state.ui.config.editing = None;
             app.app_state.mode = AppMode::Config;
         }

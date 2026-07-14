@@ -200,21 +200,38 @@ async fn dispatch_mode_event(event: CrosstermEvent, app: &mut App) {
         AppMode::Normal => normal::handle_event(event, app).await,
         AppMode::PowerSaving => power::handle_event(event, &mut app.app_state),
         AppMode::Config => {
-            config::handle_event(
+            if app.app_state.ui.config.editing.is_none() {
+                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
+            }
+            let applied_settings = app.client_configs.clone();
+            let shared_follower = app.is_current_shared_follower();
+            let config_layout = crate::tui::layout::config::calculate_config_layout(
+                app.app_state.screen_area,
+                app.app_state.ui.config.settings_edit.ui_layout_mode,
+            );
+            let settings_update = config::handle_event(
                 event,
                 config::ConfigHandleContext {
                     mode: &mut app.app_state.mode,
                     settings_edit: &mut app.app_state.ui.config.settings_edit,
+                    applied_settings: &applied_settings,
                     selected_index: &mut app.app_state.ui.config.selected_index,
                     items: app.app_state.ui.config.items.as_mut_slice(),
+                    active_pane: &mut app.app_state.ui.config.active_pane,
                     editing: &mut app.app_state.ui.config.editing,
+                    reset_confirmation: &mut app.app_state.ui.config.reset_confirmation,
+                    shared_follower,
+                    compact: config_layout.kind
+                        == crate::tui::layout::config::ConfigLayoutKind::Compact,
                     app_command_tx: &app.app_command_tx,
                     shutdown_tx: &app.shutdown_tx,
                     file_browser_generation: &mut app.app_state.ui.file_browser.browser_generation,
-                    global_dl_bucket: &app.global_dl_bucket,
-                    global_ul_bucket: &app.global_ul_bucket,
                 },
             );
+            if let Some(settings) = settings_update {
+                app.apply_config_update_from_ui(settings).await;
+                *app.app_state.ui.config.settings_edit = app.client_configs.clone();
+            }
         }
         AppMode::DeleteConfirm => {
             let _ = delete_confirm::handle_event(event, app);

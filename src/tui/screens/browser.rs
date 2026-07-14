@@ -2032,7 +2032,9 @@ pub fn confirm_config_path_selection(
             settings_edit: new_settings,
             selected_index: *selected_index,
             items: items.clone(),
+            active_pane: crate::app::ConfigPane::Settings,
             editing: None,
+            reset_confirmation: None,
         });
     }
     None
@@ -2050,7 +2052,9 @@ pub fn escape_to_config_mode(browser_mode: &FileBrowserMode) -> Option<ConfigUiS
             settings_edit: current_settings.clone(),
             selected_index: *selected_index,
             items: items.clone(),
+            active_pane: crate::app::ConfigPane::Settings,
             editing: None,
+            reset_confirmation: None,
         });
     }
     None
@@ -2115,8 +2119,20 @@ pub async fn execute_confirm_decision(
     decision: ConfirmDecision,
 ) -> Option<BrowserTransition> {
     match decision {
-        ConfirmDecision::ToConfig(config_ui) => {
+        ConfirmDecision::ToConfig(mut config_ui) => {
             tracing::info!(target: "superseedr", "Confirming Config Path Selection");
+            if let Some(item) = config_ui.items.get(config_ui.selected_index).copied() {
+                let update = crate::tui::screens::config::merge_config_item_into_current(
+                    &config_ui.settings_edit,
+                    &app.client_configs,
+                    item,
+                    app.is_current_shared_follower(),
+                );
+                if update != app.client_configs {
+                    app.apply_config_update_from_ui(update).await;
+                }
+                config_ui.settings_edit = Box::new(app.client_configs.clone());
+            }
             app.app_state.ui.config = config_ui;
             Some(BrowserTransition::ToConfig)
         }

@@ -460,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn torrent_speed_columns_expand_to_current_rate_label() {
+    fn torrent_speed_columns_keep_minimum_width_for_scaled_rate_label() {
         let mut app_state = peer_test_app_state();
         let info_hash = app_state.torrent_list_order[0].clone();
         let speed_bps = 1_000_000_000_000;
@@ -475,10 +475,14 @@ mod tests {
             .position(|&idx| all_columns[idx].id == ColumnId::DownSpeed)
             .expect("download column should be visible");
 
-        assert_eq!(format_speed(speed_bps), "1000.00 Gbps");
+        assert_eq!(format_speed(speed_bps), "1.00 Tbps");
         assert_eq!(
             constraints[dl_pos],
-            Constraint::Length(format_speed(speed_bps).len() as u16)
+            Constraint::Length(
+                all_columns[visible[dl_pos]]
+                    .min_width
+                    .max(format_speed(speed_bps).len() as u16)
+            )
         );
     }
 

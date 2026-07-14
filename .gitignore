@@ -16,6 +16,7 @@ integration_tests/artifacts/
 .DS_Store
 diff.tmp
 .gemini/
+.hermes/
 
 # --- Editor Specific ---
 # Ignore VSCode workspace settings
