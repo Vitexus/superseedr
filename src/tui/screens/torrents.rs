@@ -2552,26 +2552,12 @@ fn management_clear_targets(app_state: &AppState) -> Vec<Vec<u8>> {
         return management_targets(app_state);
     }
 
-    let mut seen = HashSet::new();
-    let selected_pending = app_state
-        .ui
-        .torrent_management
-        .pending_commands
-        .iter()
-        .filter(|command| {
-            app_state
-                .ui
-                .torrent_management
-                .selected_hashes
-                .contains(&command.info_hash)
-                && seen.insert(command.info_hash.clone())
-        })
-        .map(|command| command.info_hash.clone())
-        .collect::<Vec<_>>();
-    if !selected_pending.is_empty() {
-        return selected_pending;
+    let selected_hashes = &app_state.ui.torrent_management.selected_hashes;
+    if !selected_hashes.is_empty() {
+        return selected_hashes.iter().cloned().collect();
     }
 
+    let mut seen = HashSet::new();
     app_state
         .ui
         .torrent_management
@@ -4520,6 +4506,37 @@ mod tests {
 
         assert!(app_state.ui.torrent_management.pending_commands.is_empty());
         assert!(!app_state.ui.torrent_management.confirm_submit);
+    }
+
+    #[test]
+    fn review_u_with_undrafted_selection_preserves_other_drafts() {
+        let mut app_state = app_state_with_torrents(vec![
+            (hash(1), "Sample Packet One", 100, 10, 2),
+            (hash(2), "Sample Packet Two", 300, 20, 3),
+        ]);
+        app_state.ui.torrent_management.pending_commands = vec![pause_command(1)];
+        app_state
+            .ui
+            .torrent_management
+            .selected_hashes
+            .insert(hash(2));
+        app_state.ui.torrent_management.confirm_submit = true;
+
+        reduce_torrent_management_action(
+            &mut app_state,
+            TorrentManagementAction::ClearPendingForTargets,
+        );
+
+        assert_eq!(
+            app_state.ui.torrent_management.pending_commands,
+            vec![pause_command(1)]
+        );
+        assert!(app_state.ui.torrent_management.selected_hashes.is_empty());
+        assert!(app_state.ui.torrent_management.confirm_submit);
+        assert_eq!(
+            app_state.ui.torrent_management.status_message.as_deref(),
+            Some("Cleared 1 selection")
+        );
     }
 
     #[test]
