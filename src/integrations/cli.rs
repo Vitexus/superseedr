@@ -190,6 +190,13 @@ pub enum Commands {
         #[arg(help = "Priority to apply")]
         priority: CliPriority,
     },
+    #[command(about = "Move a torrent while the superseedr client is stopped")]
+    Move {
+        #[arg(value_name = "INFO_HASH_HEX", help = "Torrent info hash")]
+        info_hash_hex: String,
+        #[arg(value_name = "PATH", help = "Existing destination directory")]
+        path: PathBuf,
+    },
     #[cfg(feature = "synthetic-load")]
     #[command(about = "Run adaptive local synthetic benchmarks with bounded disk usage")]
     Benchmark(SyntheticBenchmarkArgs),
@@ -669,7 +676,8 @@ where
         | Commands::Torrents
         | Commands::Info { .. }
         | Commands::Purge { .. }
-        | Commands::Files { .. } => Ok(None),
+        | Commands::Files { .. }
+        | Commands::Move { .. } => Ok(None),
         #[cfg(feature = "synthetic-load")]
         Commands::Benchmark(_) => Ok(None),
         #[cfg(feature = "synthetic-load")]
@@ -978,6 +986,16 @@ mod tests {
             priority: CliPriority::High,
         };
         assert!(command_to_control_request(&command).is_err());
+    }
+
+    #[test]
+    fn move_command_is_not_mapped_to_a_runtime_control_request() {
+        let command = Commands::Move {
+            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            path: PathBuf::from("/tmp/fictional-downloads"),
+        };
+
+        assert_eq!(command_to_control_request(&command), Ok(None));
     }
 
     #[test]

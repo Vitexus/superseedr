@@ -584,15 +584,57 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Config",
-        "Enter",
-        "Start or confirm editing",
-        ActionTone::Edit
+        "Tab / Shift+Tab",
+        "Switch between the settings and details panes",
+        ActionTone::Mode
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config",
+        "Space / Enter / e",
+        "Shift or open a control; Enter and e also open paths",
+        ActionTone::Navigate
     );
     action_item!(
         HelpSection::Screens,
         "Config",
         "h / l",
-        "Decrease or increase the focused value",
+        "Move backward or forward through choices",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config",
+        "r",
+        "Open confirmation before resetting the focused setting",
+        ActionTone::Clear
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config",
+        "Esc / q",
+        "Close Config immediately",
+        ActionTone::Cancel
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config · Editing",
+        "Enter / Esc",
+        "Apply the edited value or cancel the current edit",
+        ActionTone::Edit
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config · Path Picker",
+        "Y",
+        "Apply the confirmed path and return to Config",
+        ActionTone::Confirm
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config · Compact Details",
+        "Esc",
+        "Return to the settings list",
         ActionTone::Navigate
     );
     action_item!(

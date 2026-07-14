@@ -71,10 +71,14 @@ pub fn draw(
             config::draw(
                 f,
                 &screen,
-                &app_state.ui.config.settings_edit,
-                app_state.ui.config.selected_index,
-                &app_state.ui.config.items,
-                &app_state.ui.config.editing,
+                config::ConfigDrawState {
+                    settings: &app_state.ui.config.settings_edit,
+                    selected_index: app_state.ui.config.selected_index,
+                    items: &app_state.ui.config.items,
+                    active_pane: app_state.ui.config.active_pane,
+                    editing: &app_state.ui.config.editing,
+                    reset_confirmation: &app_state.ui.config.reset_confirmation,
+                },
             );
             apply_theme_effects_to_frame(f, &ctx);
             apply_theme_particles_foreground_to_frame(f, &ctx);
