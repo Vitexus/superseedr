@@ -13,7 +13,7 @@ use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_batch_sender;
 use crate::tui::formatters::{
     anonymize_preserving_shape, format_bytes, format_duration, format_speed, sanitize_text,
-    speed_to_style, truncate_with_ellipsis,
+    speed_to_style, terminal_text_width, truncate_middle_with_ellipsis, truncate_with_ellipsis,
 };
 use crate::tui::layout::common::{compute_smart_table_layout, SmartCol};
 use crate::tui::screen_context::ScreenContext;
@@ -33,7 +33,6 @@ use ratatui::widgets::{
 use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::time::{Duration, UNIX_EPOCH};
-use unicode_truncate::UnicodeTruncateStr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TorrentManagementAction {
@@ -1977,29 +1976,6 @@ fn management_review_header_parts(
         truncate_middle_with_ellipsis(&compact, max_width),
         String::new(),
     )
-}
-
-fn terminal_text_width(input: &str) -> usize {
-    Line::from(input).width()
-}
-
-fn truncate_middle_with_ellipsis(input: &str, max_width: usize) -> String {
-    if terminal_text_width(input) <= max_width {
-        return input.to_string();
-    }
-    if max_width == 0 {
-        return String::new();
-    }
-    if max_width == 1 {
-        return "…".to_string();
-    }
-
-    let remaining_width = max_width - 1;
-    let head_width = remaining_width.div_ceil(2);
-    let tail_width = remaining_width / 2;
-    let (head, _) = input.unicode_truncate(head_width);
-    let (tail, _) = input.unicode_truncate_start(tail_width);
-    format!("{head}…{tail}")
 }
 
 fn section_header_suffix(count: usize, detail: Option<&str>) -> String {

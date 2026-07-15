@@ -65,7 +65,6 @@ tokio-stream = { version = "0.1.18", features = ["sync"] }
 thiserror = "2.0.18"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
-unicode-truncate = "2.0.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_bencode = "0.2"
 serde_bytes = "0.11.19"
