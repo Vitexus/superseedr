@@ -584,8 +584,8 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Config",
-        "Space / Enter / e",
-        "Shift or open a control; Enter and e also open paths",
+        "Space",
+        "Shift or open the selected control",
         ActionTone::Navigate
     );
     action_item!(

@@ -22,7 +22,6 @@ const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigAction {
     Exit,
-    StartEditOrBrowse,
     ShiftSelected,
     SetSelectedBool(bool),
     MoveUp,
@@ -365,7 +364,6 @@ fn map_key_to_config_action(
 
     match key_code {
         KeyCode::Esc | KeyCode::Char('q' | 'Q') => Some(ConfigAction::Exit),
-        KeyCode::Enter | KeyCode::Char('e') => Some(ConfigAction::StartEditOrBrowse),
         KeyCode::Char(' ') => Some(ConfigAction::ShiftSelected),
         KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
         KeyCode::Char('f') => Some(ConfigAction::SetSelectedBool(false)),
@@ -430,15 +428,6 @@ pub fn reduce_config_action(
     match action {
         ConfigAction::Exit => {
             result.consumed = true;
-        }
-        ConfigAction::StartEditOrBrowse => {
-            result.consumed = true;
-            let selected_item = items[*selected_index];
-            if let Some(effect) =
-                path_browser_effect(settings_edit, *selected_index, items, selected_item)
-            {
-                result.effects.push(effect);
-            }
         }
         ConfigAction::ShiftSelected => {
             result.consumed = true;
@@ -1778,12 +1767,6 @@ fn render_config_footer(
         actions.push(("Enter", "apply", ActionTone::Confirm));
         actions.push(("Esc", "cancel", ActionTone::Cancel));
         actions.push(("←/→", "cursor", ActionTone::Navigate));
-    } else if render_ctx.layout_kind == ConfigLayoutKind::Compact
-        && active_pane == ConfigPane::Settings
-    {
-        actions.push(("Enter/e", "details", ActionTone::Open));
-        actions.push(("Esc", "close", ActionTone::Cancel));
-        actions.push(("↑/↓", "setting", ActionTone::Navigate));
     } else {
         if !locked {
             match descriptor_for_item(active_item).control {
@@ -1798,7 +1781,7 @@ fn render_config_footer(
                     actions.push(("Space", "edit", ActionTone::Edit));
                 }
                 ConfigControlKind::Path => {
-                    actions.push(("Space/Enter/e", "edit", ActionTone::Edit));
+                    actions.push(("Space", "edit", ActionTone::Edit));
                 }
             }
         }
@@ -1932,8 +1915,7 @@ fn footer_actions_line(
 fn action_mutates_selected_setting(action: &ConfigAction) -> bool {
     matches!(
         action,
-        ConfigAction::StartEditOrBrowse
-            | ConfigAction::ShiftSelected
+        ConfigAction::ShiftSelected
             | ConfigAction::SetSelectedBool(_)
             | ConfigAction::ResetSelected
             | ConfigAction::IncreaseSelected
@@ -1944,7 +1926,6 @@ fn action_mutates_selected_setting(action: &ConfigAction) -> bool {
 fn action_supported_for_item(action: &ConfigAction, item: ConfigItem) -> bool {
     let control = descriptor_for_item(item).control;
     match action {
-        ConfigAction::StartEditOrBrowse => control == ConfigControlKind::Path,
         ConfigAction::ShiftSelected => {
             matches!(
                 control,
@@ -2014,13 +1995,6 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
             }
 
             let active_item = selected_item(ctx.items, *ctx.selected_index);
-            if ctx.compact
-                && *ctx.active_pane == ConfigPane::Settings
-                && action == ConfigAction::StartEditOrBrowse
-            {
-                *ctx.active_pane = ConfigPane::Details;
-                return None;
-            }
             if !action_supported_for_item(&action, active_item) {
                 return None;
             }
@@ -2440,7 +2414,7 @@ mod tests {
             2,
         );
 
-        assert!(rendered.contains("[Space/Enter/e] edit"));
+        assert!(rendered.contains("[Space] edit"));
         assert!(!rendered.contains("[Space] browse"));
     }
 
@@ -2529,7 +2503,7 @@ mod tests {
         assert!(!settings_rendered.contains("Unlimited"));
         assert!(details_rendered.contains("Listen Port · Network"));
         assert!(!details_rendered.contains("Settings ·"));
-        assert!(settings_rendered.contains("[Enter/e] details"));
+        assert!(settings_rendered.contains("[Space] edit"));
         assert!(details_rendered.contains("[Esc] settings"));
     }
 
@@ -2713,46 +2687,6 @@ mod tests {
     }
 
     #[test]
-    fn enter_only_opens_path_controls() {
-        let mut settings = Box::new(Settings::default());
-        let original = settings.clone();
-        let mut items = config_items();
-        let mut editing = None;
-
-        for index in [0usize, 3, 4, 5, 6] {
-            let mut selected_index = index;
-            let out = reduce_config_action(
-                ConfigAction::StartEditOrBrowse,
-                &mut settings,
-                &mut selected_index,
-                items.as_mut_slice(),
-                &mut editing,
-            );
-            assert!(out.effects.is_empty());
-        }
-
-        let mut selected_index = 2;
-        let path_out = reduce_config_action(
-            ConfigAction::StartEditOrBrowse,
-            &mut settings,
-            &mut selected_index,
-            items.as_mut_slice(),
-            &mut editing,
-        );
-        assert!(matches!(
-            path_out.effects.as_slice(),
-            [ConfigEffect::AppCommand(_)]
-        ));
-
-        assert_eq!(settings.ui_layout_mode, original.ui_layout_mode);
-        assert_eq!(
-            settings.always_show_add_location_prompt,
-            original.always_show_add_location_prompt
-        );
-        assert!(editing.is_none());
-    }
-
-    #[test]
     fn space_opens_global_rate_limit_exact_editor() {
         let mut settings = Box::new(Settings::default());
         let mut selected_index = 5usize;
@@ -2917,7 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_enter_opens_details_before_activating_the_control() {
+    fn compact_enter_and_e_do_not_open_details_or_activate_the_control() {
         let applied = Settings::default();
         let mut settings_edit = Box::new(applied.clone());
         let mut mode = AppMode::Config;
@@ -2930,8 +2864,50 @@ mod tests {
         let (app_command_tx, _app_command_rx) = mpsc::channel(1);
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
+        for key_code in [KeyCode::Enter, KeyCode::Char('e')] {
+            let update = handle_event(
+                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
+                ConfigHandleContext {
+                    mode: &mut mode,
+                    settings_edit: &mut settings_edit,
+                    applied_settings: &applied,
+                    selected_index: &mut selected_index,
+                    items: items.as_mut_slice(),
+                    active_pane: &mut active_pane,
+                    editing: &mut editing,
+                    reset_confirmation: &mut reset_confirmation,
+                    shared_follower: false,
+                    compact: true,
+                    app_command_tx: &app_command_tx,
+                    shutdown_tx: &shutdown_tx,
+                    file_browser_generation: &mut file_browser_generation,
+                },
+            );
+
+            assert!(update.is_none());
+            assert_eq!(active_pane, ConfigPane::Settings);
+            assert!(editing.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_space_opens_path_browser_and_details() {
+        let applied = Settings::default();
+        let mut settings_edit = Box::new(applied.clone());
+        let mut mode = AppMode::Config;
+        let mut selected_index = 2usize;
+        let mut items = config_items();
+        let mut active_pane = ConfigPane::Settings;
+        let mut editing = None;
+        let mut reset_confirmation = None;
+        let mut file_browser_generation = 0;
+        let (app_command_tx, mut app_command_rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
+
         let update = handle_event(
-            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Enter)),
+            CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Char(
+                ' ',
+            ))),
             ConfigHandleContext {
                 mode: &mut mode,
                 settings_edit: &mut settings_edit,
@@ -2951,47 +2927,7 @@ mod tests {
 
         assert!(update.is_none());
         assert_eq!(active_pane, ConfigPane::Details);
-        assert!(editing.is_none());
-    }
-
-    #[tokio::test]
-    async fn compact_enter_opens_path_browser_only_after_details_are_visible() {
-        let applied = Settings::default();
-        let mut settings_edit = Box::new(applied.clone());
-        let mut mode = AppMode::Config;
-        let mut selected_index = 2usize;
-        let mut items = config_items();
-        let mut active_pane = ConfigPane::Settings;
-        let mut editing = None;
-        let mut reset_confirmation = None;
-        let mut file_browser_generation = 0;
-        let (app_command_tx, mut app_command_rx) = mpsc::channel(1);
-        let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
-
-        for expected_generation in [0, 1] {
-            let update = handle_event(
-                CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(KeyCode::Enter)),
-                ConfigHandleContext {
-                    mode: &mut mode,
-                    settings_edit: &mut settings_edit,
-                    applied_settings: &applied,
-                    selected_index: &mut selected_index,
-                    items: items.as_mut_slice(),
-                    active_pane: &mut active_pane,
-                    editing: &mut editing,
-                    reset_confirmation: &mut reset_confirmation,
-                    shared_follower: false,
-                    compact: true,
-                    app_command_tx: &app_command_tx,
-                    shutdown_tx: &shutdown_tx,
-                    file_browser_generation: &mut file_browser_generation,
-                },
-            );
-
-            assert!(update.is_none());
-            assert_eq!(active_pane, ConfigPane::Details);
-            assert_eq!(file_browser_generation, expected_generation);
-        }
+        assert_eq!(file_browser_generation, 1);
 
         assert!(matches!(
             app_command_rx.recv().await,
@@ -3160,14 +3096,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_and_e_share_the_same_primary_action() {
+    fn space_is_the_only_primary_control_action() {
+        assert_eq!(map_key_to_config_action(KeyCode::Char('e'), &None), None);
+        assert_eq!(map_key_to_config_action(KeyCode::Enter, &None), None);
         assert_eq!(
-            map_key_to_config_action(KeyCode::Char('e'), &None),
-            Some(ConfigAction::StartEditOrBrowse)
-        );
-        assert_eq!(
-            map_key_to_config_action(KeyCode::Enter, &None),
-            Some(ConfigAction::StartEditOrBrowse)
+            map_key_to_config_action(KeyCode::Char(' '), &None),
+            Some(ConfigAction::ShiftSelected)
         );
         let editing = Some(editor(ConfigItem::ClientPort, "6681"));
         assert_eq!(map_key_to_config_action(KeyCode::Char('e'), &editing), None);
@@ -3205,30 +3139,6 @@ mod tests {
 
     #[test]
     fn control_shortcuts_only_apply_to_compatible_settings() {
-        assert!(!action_supported_for_item(
-            &ConfigAction::StartEditOrBrowse,
-            ConfigItem::AlwaysShowAddLocationPrompt,
-        ));
-        assert!(!action_supported_for_item(
-            &ConfigAction::StartEditOrBrowse,
-            ConfigItem::UiLayoutMode,
-        ));
-        assert!(!action_supported_for_item(
-            &ConfigAction::StartEditOrBrowse,
-            ConfigItem::ClientPort,
-        ));
-        assert!(!action_supported_for_item(
-            &ConfigAction::StartEditOrBrowse,
-            ConfigItem::GlobalDownloadLimit,
-        ));
-        assert!(action_supported_for_item(
-            &ConfigAction::StartEditOrBrowse,
-            ConfigItem::WatchFolder,
-        ));
-        assert!(action_supported_for_item(
-            &ConfigAction::StartEditOrBrowse,
-            ConfigItem::DefaultDownloadFolder,
-        ));
         assert!(action_supported_for_item(
             &ConfigAction::ShiftSelected,
             ConfigItem::AlwaysShowAddLocationPrompt,
