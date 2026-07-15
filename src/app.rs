@@ -81,6 +81,7 @@ use crate::integrity_scheduler::{
     IntegrityScheduler, ProbeBatchOutcome, TorrentIntegritySnapshot,
     INTEGRITY_SCHEDULER_TICK_INTERVAL,
 };
+use crate::networking::transport::PeerTransportKind;
 use crate::networking::{PeerConnection, TcpPeerTransport, UtpListenerSet, UtpPeerTransport};
 use crate::torrent_file::parser::from_bytes;
 use crate::torrent_file::validate_container_name;
@@ -895,7 +896,10 @@ pub enum AppCommand {
     AddTorrentFromFile(PathBuf),
     AddTorrentFromPathFile(PathBuf),
     AddMagnetFromFile(PathBuf),
-    MarkPortOpen(SocketAddr),
+    MarkPortOpen {
+        peer_addr: SocketAddr,
+        transport: PeerTransportKind,
+    },
     ReloadClusterState(PathBuf),
     SubmitControlRequest(ControlRequest),
     SubmitManualAddRequest {
@@ -1059,6 +1063,13 @@ pub enum ConfigItem {
     AlwaysShowAddLocationPrompt,
     GlobalDownloadLimit,
     GlobalUploadLimit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfigPane {
+    #[default]
+    Settings,
+    Details,
 }
 
 #[derive(Default)]
@@ -1705,7 +1716,17 @@ pub struct ConfigUiState {
     pub settings_edit: Box<Settings>,
     pub selected_index: usize,
     pub items: Vec<ConfigItem>,
-    pub editing: Option<(ConfigItem, String)>,
+    pub active_pane: ConfigPane,
+    pub editing: Option<ConfigEditState>,
+    pub reset_confirmation: Option<ConfigItem>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConfigEditState {
+    pub item: ConfigItem,
+    pub buffer: String,
+    pub cursor: usize,
+    pub select_all: bool,
 }
 
 #[derive(Default)]
@@ -2196,6 +2217,7 @@ pub struct AppState {
     pub mode: AppMode,
     pub externally_accessable_port_v4: bool,
     pub externally_accessable_port_v6: bool,
+    pub inbound_peer_transports: InboundPeerTransportStatus,
     pub externally_accessable_port_v4_highlight_until: Option<Instant>,
     pub externally_accessable_port_v6_highlight_until: Option<Instant>,
     pub anonymize_torrent_names: bool,
@@ -2305,6 +2327,26 @@ pub struct AppState {
     pub pending_watch_commands: VecDeque<AppCommand>,
     pub cluster_role_label: Option<String>,
     pub cluster_runtime_label: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InboundPeerTransportStatus {
+    pub tcp_ipv4_seen: bool,
+    pub tcp_ipv6_seen: bool,
+    pub utp_ipv4_seen: bool,
+    pub utp_ipv6_seen: bool,
+}
+
+impl InboundPeerTransportStatus {
+    fn mark_seen(&mut self, transport: PeerTransportKind, ipv4: bool) {
+        match (transport, ipv4) {
+            (PeerTransportKind::Tcp, true) => self.tcp_ipv4_seen = true,
+            (PeerTransportKind::Tcp, false) => self.tcp_ipv6_seen = true,
+            (PeerTransportKind::Utp, true) => self.utp_ipv4_seen = true,
+            (PeerTransportKind::Utp, false) => self.utp_ipv6_seen = true,
+            (PeerTransportKind::Quic, _) => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -5276,6 +5318,7 @@ impl App {
         }
 
         let peer_addr = connection.remote_addr;
+        let transport = connection.endpoint.kind;
         let peer_info_hash = buffer[28..48].to_vec();
         let peer_info_hash_hex = hex::encode(&peer_info_hash);
 
@@ -5294,7 +5337,10 @@ impl App {
             let send_result = torrent_manager_tx.send((connection, buffer, permit)).await;
             match send_result {
                 Ok(()) => {
-                    let _ = app_command_tx.try_send(AppCommand::MarkPortOpen(peer_addr));
+                    let _ = app_command_tx.try_send(AppCommand::MarkPortOpen {
+                        peer_addr,
+                        transport,
+                    });
                 }
                 Err(_) => {
                     tracing::trace!(
@@ -5711,6 +5757,7 @@ impl App {
 
         let port_changed = new_settings.client_port != old_settings.client_port;
         let bootstrap_changed = new_settings.bootstrap_nodes != old_settings.bootstrap_nodes;
+        let mut config_error = None;
 
         if port_changed {
             tracing::info!(
@@ -5718,6 +5765,10 @@ impl App {
                 new_settings.client_port
             );
             if !self.rebind_listener(new_settings.client_port).await {
+                config_error = Some(format!(
+                    "Could not activate listen port {}. Port {} remains active.",
+                    new_settings.client_port, old_settings.client_port
+                ));
                 self.client_configs.client_port = old_settings.client_port;
                 let _ = self.rss_settings_tx.send(self.client_configs.clone());
                 if bootstrap_changed {
@@ -5765,25 +5816,33 @@ impl App {
             self.save_state_to_disk();
         }
 
-        self.app_state.system_error = None;
+        self.app_state.system_error = config_error;
         self.app_state.ui.needs_redraw = true;
     }
 
-    fn mark_peer_port_open(&mut self, peer_addr: SocketAddr) {
+    fn mark_peer_port_open(&mut self, peer_addr: SocketAddr, transport: PeerTransportKind) {
         let highlight_until = Some(Instant::now() + PORT_FAMILY_HIGHLIGHT_DURATION);
-        let open_flag = match peer_addr {
+        let ipv4 = match peer_addr {
             SocketAddr::V4(_) => {
                 self.app_state.externally_accessable_port_v4_highlight_until = highlight_until;
-                &mut self.app_state.externally_accessable_port_v4
+                true
             }
             SocketAddr::V6(addr) if addr.ip().to_ipv4_mapped().is_some() => {
                 self.app_state.externally_accessable_port_v4_highlight_until = highlight_until;
-                &mut self.app_state.externally_accessable_port_v4
+                true
             }
             SocketAddr::V6(_) => {
                 self.app_state.externally_accessable_port_v6_highlight_until = highlight_until;
-                &mut self.app_state.externally_accessable_port_v6
+                false
             }
+        };
+        self.app_state
+            .inbound_peer_transports
+            .mark_seen(transport, ipv4);
+        let open_flag = if ipv4 {
+            &mut self.app_state.externally_accessable_port_v4
+        } else {
+            &mut self.app_state.externally_accessable_port_v6
         };
         let just_opened = !*open_flag;
         if just_opened {
@@ -5825,6 +5884,11 @@ impl App {
         }
     }
 
+    pub(crate) async fn apply_config_update_from_ui(&mut self, settings: Settings) {
+        self.handle_app_command(AppCommand::UpdateConfig(settings))
+            .await;
+    }
+
     async fn handle_app_command(&mut self, command: AppCommand) {
         match command {
             AppCommand::AddTorrentFromFile(path) => {
@@ -5842,8 +5906,11 @@ impl App {
                 self.execute_add_ingress_action(IngestSource::MagnetFile, path, action)
                     .await;
             }
-            AppCommand::MarkPortOpen(peer_addr) => {
-                self.mark_peer_port_open(peer_addr);
+            AppCommand::MarkPortOpen {
+                peer_addr,
+                transport,
+            } => {
+                self.mark_peer_port_open(peer_addr, transport);
             }
             AppCommand::SubmitControlRequest(request) => {
                 self.handle_submit_control_request(request, None).await;
@@ -8343,6 +8410,8 @@ impl App {
         &mut self,
         request: &ControlRequest,
     ) -> Result<(String, Option<CommandIngestResult>), String> {
+        validate_runtime_control_request(request)?;
+
         match plan_control_request(&self.client_configs, request)? {
             ControlExecutionPlan::StatusNow => {
                 self.trigger_status_dump_now();
@@ -8523,6 +8592,7 @@ impl App {
     }
 
     async fn rebind_listener(&mut self, new_port: u16) -> bool {
+        let previous_bound_port = self.listener.as_ref().and_then(ListenerSet::local_port);
         match bind_peer_listener(new_port).await {
             Ok(new_listener) => {
                 self.listener = new_listener;
@@ -8534,6 +8604,7 @@ impl App {
                     .and_then(ListenerSet::local_port)
                     .unwrap_or(new_port);
                 self.client_configs.client_port = bound_port;
+                let bound_port_changed = previous_bound_port != Some(bound_port);
 
                 tracing_event!(
                     Level::INFO,
@@ -8554,6 +8625,14 @@ impl App {
                 {
                     let info_hashes = self.active_running_torrents_for_dht_announce();
                     self.announce_torrents_to_dht(info_hashes);
+                }
+
+                if bound_port_changed {
+                    self.app_state.externally_accessable_port_v4 = false;
+                    self.app_state.externally_accessable_port_v6 = false;
+                    self.app_state.externally_accessable_port_v4_highlight_until = None;
+                    self.app_state.externally_accessable_port_v6_highlight_until = None;
+                    self.app_state.inbound_peer_transports = InboundPeerTransportStatus::default();
                 }
 
                 true
@@ -9064,6 +9143,16 @@ fn compose_system_warning(
         (None, Some(dht)) => Some(dht.to_string()),
         (None, None) => None,
     }
+}
+
+fn validate_runtime_control_request(request: &ControlRequest) -> Result<(), String> {
+    if matches!(request, ControlRequest::MoveTorrent { .. }) {
+        return Err(
+            "The move command is CLI-only and requires the superseedr client to be stopped."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 pub fn parse_hybrid_hashes(magnet_link: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
@@ -9677,16 +9766,16 @@ mod tests {
         AppRuntimeMode, AppState, BrowserPane, BrowserSearchState, ColumnId, CommandIngestResult,
         DataRate, DhtWaveTargets, DhtWaveUiState, DiskBackpressureDecision,
         DiskBackpressureDownloadThrottle, DiskBackpressureSample, DownloadSelectionTarget,
-        FileBrowserMode, FileMetadata, FilePriority, IngestSource, ListenerSet, LogCooldown,
-        PeerInfo, PeerListenerTransportMode, PeerSortColumn, PendingManualIngest, PersistPayload,
-        ResolvedAddPayload, SearchMode, SelectedHeader, SortDirection, SwarmAvailabilityFlashState,
-        TorrentControlState, TorrentDisplayState, TorrentIntegritySnapshot, TorrentMetrics,
-        TorrentPreviewPayload, TorrentSortColumn, UiState, WakeLagPeerThrottle,
-        AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR, DHT_WAVE_PHASE_WRAP_PERIOD,
-        DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC, DISK_WRITE_THROTTLE_START_BYTES_PER_SEC,
-        DISK_WRITE_THROTTLE_STEP_MAX, DISK_WRITE_THROTTLE_STEP_MIN,
-        DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS, DISK_WRITE_THROTTLE_WINDOW_TICKS,
-        SWARM_AVAILABILITY_FLASH_DURATION,
+        FileBrowserMode, FileMetadata, FilePriority, InboundPeerTransportStatus, IngestSource,
+        ListenerSet, LogCooldown, PeerInfo, PeerListenerTransportMode, PeerSortColumn,
+        PendingManualIngest, PersistPayload, ResolvedAddPayload, SearchMode, SelectedHeader,
+        SortDirection, SwarmAvailabilityFlashState, TorrentControlState, TorrentDisplayState,
+        TorrentIntegritySnapshot, TorrentMetrics, TorrentPreviewPayload, TorrentSortColumn,
+        UiState, WakeLagPeerThrottle, AWAITING_MAGNET_METADATA_LABEL, BITTORRENT_PROTOCOL_STR,
+        DHT_WAVE_PHASE_WRAP_PERIOD, DISK_WRITE_THROTTLE_MIN_BYTES_PER_SEC,
+        DISK_WRITE_THROTTLE_START_BYTES_PER_SEC, DISK_WRITE_THROTTLE_STEP_MAX,
+        DISK_WRITE_THROTTLE_STEP_MIN, DISK_WRITE_THROTTLE_TARGET_LATENCY_SECS,
+        DISK_WRITE_THROTTLE_WINDOW_TICKS, SWARM_AVAILABILITY_FLASH_DURATION,
     };
     use crate::config::{
         clear_shared_config_state_for_tests, set_app_paths_override_for_tests, TorrentSettings,
@@ -9696,6 +9785,7 @@ mod tests {
     use crate::errors::StorageError;
     use crate::integrations::control::{read_control_request, ControlRequest};
     use crate::integrations::status::{self, AppOutputState};
+    use crate::networking::transport::PeerTransportKind;
     use crate::persistence::event_journal::{
         ControlOrigin, EventDetails, EventJournalState, EventType, IngestKind, IngestOrigin,
     };
@@ -11869,6 +11959,26 @@ mod tests {
         assert!(!is_valid_incoming_bittorrent_handshake(&handshake));
     }
 
+    #[test]
+    fn inbound_peer_transport_status_tracks_the_full_transport_family_matrix() {
+        let mut status = InboundPeerTransportStatus::default();
+
+        status.mark_seen(PeerTransportKind::Tcp, true);
+        status.mark_seen(PeerTransportKind::Tcp, false);
+        status.mark_seen(PeerTransportKind::Utp, true);
+        status.mark_seen(PeerTransportKind::Utp, false);
+
+        assert_eq!(
+            status,
+            InboundPeerTransportStatus {
+                tcp_ipv4_seen: true,
+                tcp_ipv6_seen: true,
+                utp_ipv4_seen: true,
+                utp_ipv6_seen: true,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn mark_port_open_command_tracks_ipv4_and_ipv6_independently() {
         let settings = crate::config::Settings {
@@ -11882,15 +11992,25 @@ mod tests {
         assert!(!app.app_state.externally_accessable_port_v4);
         assert!(!app.app_state.externally_accessable_port_v6);
 
-        app.mark_peer_port_open(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681));
+        app.mark_peer_port_open(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681),
+            PeerTransportKind::Tcp,
+        );
 
         assert!(app.app_state.externally_accessable_port_v4);
         assert!(!app.app_state.externally_accessable_port_v6);
+        assert!(app.app_state.inbound_peer_transports.tcp_ipv4_seen);
+        assert!(!app.app_state.inbound_peer_transports.utp_ipv4_seen);
 
-        app.mark_peer_port_open(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6681));
+        app.mark_peer_port_open(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6681),
+            PeerTransportKind::Utp,
+        );
 
         assert!(app.app_state.externally_accessable_port_v4);
         assert!(app.app_state.externally_accessable_port_v6);
+        assert!(app.app_state.inbound_peer_transports.utp_ipv6_seen);
+        assert!(!app.app_state.inbound_peer_transports.tcp_ipv6_seen);
     }
 
     #[tokio::test]
@@ -11907,10 +12027,12 @@ mod tests {
         assert!(!app.app_state.externally_accessable_port_v6);
 
         let mapped_addr = SocketAddr::new(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()), 6681);
-        app.mark_peer_port_open(mapped_addr);
+        app.mark_peer_port_open(mapped_addr, PeerTransportKind::Utp);
 
         assert!(app.app_state.externally_accessable_port_v4);
         assert!(!app.app_state.externally_accessable_port_v6);
+        assert!(app.app_state.inbound_peer_transports.utp_ipv4_seen);
+        assert!(!app.app_state.inbound_peer_transports.utp_ipv6_seen);
     }
 
     #[tokio::test]
@@ -11925,6 +12047,14 @@ mod tests {
         let (manager_tx, mut manager_rx) = mpsc::channel(4);
         app.torrent_manager_command_txs
             .insert(b"port-update-test".to_vec(), manager_tx);
+        app.app_state.externally_accessable_port_v4 = true;
+        app.app_state.externally_accessable_port_v6 = true;
+        app.app_state.externally_accessable_port_v4_highlight_until =
+            Some(Instant::now() + Duration::from_secs(1));
+        app.app_state.externally_accessable_port_v6_highlight_until =
+            Some(Instant::now() + Duration::from_secs(1));
+        app.app_state.inbound_peer_transports.tcp_ipv4_seen = true;
+        app.app_state.inbound_peer_transports.utp_ipv6_seen = true;
 
         assert!(app.rebind_listener(0).await);
 
@@ -11939,8 +12069,34 @@ mod tests {
             command,
             ManagerCommand::UpdateListenPort(port) if port == bound_port
         ));
+        assert_eq!(
+            app.app_state.inbound_peer_transports,
+            InboundPeerTransportStatus::default()
+        );
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
+        assert!(app
+            .app_state
+            .externally_accessable_port_v4_highlight_until
+            .is_none());
+        assert!(app
+            .app_state
+            .externally_accessable_port_v6_highlight_until
+            .is_none());
 
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[test]
+    fn running_client_rejects_cli_only_move_requests() {
+        let error = super::validate_runtime_control_request(&ControlRequest::MoveTorrent {
+            info_hash_hex: "1111111111111111111111111111111111111111".to_string(),
+            download_path: PathBuf::from("/fictional-downloads"),
+        })
+        .expect_err("runtime move should be rejected");
+
+        assert!(error.contains("CLI-only"));
+        assert!(error.contains("stopped"));
     }
 
     #[tokio::test]
@@ -11979,6 +12135,8 @@ mod tests {
             recorder.recorded_announces(),
             vec![(running_hash, Some(bound_port))]
         );
+        assert!(!app.app_state.externally_accessable_port_v4);
+        assert!(!app.app_state.externally_accessable_port_v6);
 
         let _ = app.shutdown_tx.send(());
     }
@@ -12023,7 +12181,10 @@ mod tests {
             .torrents
             .insert(paused_hash.clone(), paused_display);
 
-        app.mark_peer_port_open(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681));
+        app.mark_peer_port_open(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681),
+            PeerTransportKind::Tcp,
+        );
         tokio::task::yield_now().await;
 
         assert_eq!(
@@ -12031,7 +12192,10 @@ mod tests {
             vec![(running_hash.clone(), Some(6681))]
         );
 
-        app.mark_peer_port_open(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681));
+        app.mark_peer_port_open(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 6681),
+            PeerTransportKind::Utp,
+        );
         tokio::task::yield_now().await;
 
         assert_eq!(
@@ -12039,7 +12203,10 @@ mod tests {
             vec![(running_hash.clone(), Some(6681))]
         );
 
-        app.mark_peer_port_open(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6681));
+        app.mark_peer_port_open(
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 6681),
+            PeerTransportKind::Tcp,
+        );
         tokio::task::yield_now().await;
 
         assert_eq!(
@@ -12099,6 +12266,11 @@ mod tests {
             .expect("listener should remain bound");
         assert_eq!(app.client_configs.client_port, original_port);
         assert_eq!(rebound_port, original_port);
+        assert!(app
+            .app_state
+            .system_error
+            .as_deref()
+            .is_some_and(|message| message.contains("remains active")));
 
         let _ = app.shutdown_tx.send(());
     }

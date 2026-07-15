@@ -21,8 +21,20 @@ pub fn format_speed(bits_per_second: u64) -> String {
         format!("{:.1} Kbps", bits_per_second as f64 / 1_000.0)
     } else if bits_per_second < 1_000_000_000 {
         format!("{:.2} Mbps", bits_per_second as f64 / 1_000_000.0)
-    } else {
+    } else if bits_per_second < 1_000_000_000_000 {
         format!("{:.2} Gbps", bits_per_second as f64 / 1_000_000_000.0)
+    } else if bits_per_second < 1_000_000_000_000_000 {
+        format!("{:.2} Tbps", bits_per_second as f64 / 1_000_000_000_000.0)
+    } else if bits_per_second < 1_000_000_000_000_000_000 {
+        format!(
+            "{:.2} Pbps",
+            bits_per_second as f64 / 1_000_000_000_000_000.0
+        )
+    } else {
+        format!(
+            "{:.2} Ebps",
+            bits_per_second as f64 / 1_000_000_000_000_000_000.0
+        )
     }
 }
 
@@ -483,5 +495,12 @@ mod tests {
     fn auto_download_limit_applied_keeps_unlimited_and_configured_caps_normal() {
         assert!(!auto_download_limit_applied(0, 0));
         assert!(!auto_download_limit_applied(500_000_000, 500_000_000));
+    }
+
+    #[test]
+    fn format_speed_scales_beyond_gigabits() {
+        assert_eq!(format_speed(1_000_000_000_000), "1.00 Tbps");
+        assert_eq!(format_speed(1_000_000_000_000_000), "1.00 Pbps");
+        assert_eq!(format_speed(1_000_000_000_000_000_000), "1.00 Ebps");
     }
 }
