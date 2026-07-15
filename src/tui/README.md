@@ -64,12 +64,11 @@
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
   - `Space` shifts boolean and choice settings immediately, opens value editing for the listen port and global rate limits, or opens a path browser; `Left`/`Right` (or `h`/`l`) moves backward/forward through choices; `r` opens reset confirmation for the focused setting.
-  - `Enter`/`e` opens the path browser for path settings.
   - In reset confirmation, `Y` restores the default and `Esc` cancels.
   - While editing a value, `Enter` applies it and `Esc` cancels the current edit.
   - Confirming a path in `FileBrowser` applies it and returns to Config.
   - `Esc`/`q` closes Config immediately.
-  - In compact mode, `Enter`/`e` first opens the selected setting's details; controls activate from there, and `Esc` returns to the settings list before closing Config.
+  - In compact mode, `Space` opens the selected setting's details and activates its control; `Esc` returns to the settings list before closing Config.
 - `FileBrowser`:
   - `Y` confirms current action.
   - `Esc` returns to `Normal` or `Config` depending on browser mode.
@@ -95,7 +94,7 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `Normal` | `d`/`D` | `DeleteConfirm` | Selected torrent only |
 | `DeleteConfirm` | `Y` or `Esc` | `Normal` | Confirm/cancel dialog |
 | `Normal` | `a` | `FileBrowser` | Add torrent path flow |
-| `Config` | `Enter` or `e` on path item | `FileBrowser` | Path picker flow; compact mode first opens details |
+| `Config` | `Space` on path item | `FileBrowser` | Path picker flow; compact mode opens details |
 | `FileBrowser` config path picker | `Y` | `Config` | Apply the confirmed path immediately |
 | `FileBrowser` | `Esc` | `Normal` or `Config` | Depends on browser sub-mode |
 

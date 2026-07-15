@@ -4,7 +4,8 @@
 use crate::app::{
     refresh_torrent_preview_directory_priorities, App, AppCommand, AppMode, BrowserPane,
     BrowserSearchState, ConfigItem, ConfigUiState, DownloadSelectionTarget, FileBrowserMode,
-    FileMetadata, FilePriority, SearchMode, TorrentPreviewPayload, AWAITING_MAGNET_METADATA_LABEL,
+    FileMetadata, FilePriority, SearchMode, TorrentFilePreview, TorrentFilePreviewState,
+    TorrentPreviewPayload, AWAITING_MAGNET_METADATA_LABEL,
 };
 use crate::integrations::control::{ControlFilePriorityOverride, ControlRequest};
 use crate::theme::ThemeContext;
@@ -50,17 +51,19 @@ pub fn draw(
     let app_state = screen.ui;
     let ctx = screen.theme;
 
-    let has_preview_content = has_preview_content(
+    let selected_filesystem_file = selected_filesystem_file_path(state, data);
+    let has_preview_content = preview_content_for_selection(
         browser_mode,
         app_state.pending_torrent_path.is_some(),
         !app_state.pending_torrent_link.is_empty(),
-        state.cursor_path.as_ref(),
+        state,
+        data,
     );
     let existing_priority_only = existing_torrent_priority_only(browser_mode);
 
     let preview_file_path = match browser_mode {
         FileBrowserMode::DownloadLocSelection { .. } => app_state.pending_torrent_path.as_ref(),
-        FileBrowserMode::File(_) => state.cursor_path.as_ref(),
+        FileBrowserMode::File(_) => selected_filesystem_file,
         _ => None,
     };
 
@@ -116,6 +119,7 @@ pub fn draw(
                 border_style: preview_border_style,
                 current_fs_path: &state.current_path,
                 preview_filter,
+                torrent_file_preview: &app_state.ui.file_browser.torrent_file_preview,
             },
         );
     }
@@ -131,105 +135,120 @@ pub fn draw(
     }
 
     let mut footer_spans = Vec::new();
-    match browser_mode {
-        FileBrowserMode::ConfigPathSelection { .. } | FileBrowserMode::Directory => {
-            footer_spans.push(Span::styled(
-                "[Arrows/Vim]",
-                footer_key_style(ctx, ActionTone::Navigate),
-            ));
-            footer_spans.push(Span::raw(" Nav | "));
-            footer_spans.push(Span::styled(
-                "[Backspace]",
-                footer_key_style(ctx, ActionTone::Navigate),
-            ));
-            footer_spans.push(Span::raw(" Up | "));
-            footer_spans.push(Span::styled(
-                "[Enter]",
-                footer_key_style(ctx, ActionTone::Navigate),
-            ));
-            footer_spans.push(Span::raw(" Down | "));
-            footer_spans.push(Span::styled(
-                "[Y]",
-                footer_key_style(ctx, ActionTone::Confirm),
-            ));
-            footer_spans.push(Span::raw(" Confirm Selection | "));
-        }
-        FileBrowserMode::DownloadLocSelection {
-            focused_pane,
-            use_container,
-            ..
-        } => {
-            let edit_locked = pending_magnet_metadata_editing_locked(browser_mode);
-            if !existing_priority_only {
+    let editing_container_name = browser_container_name_editing(browser_mode);
+    if editing_container_name {
+        footer_spans.push(Span::styled(
+            "[Enter]",
+            footer_key_style(ctx, ActionTone::Confirm),
+        ));
+        footer_spans.push(Span::raw(" Save Folder Name | "));
+        footer_spans.push(Span::styled(
+            "[Esc]",
+            footer_key_style(ctx, ActionTone::Cancel),
+        ));
+        footer_spans.push(Span::raw(" Discard Changes"));
+    } else {
+        match browser_mode {
+            FileBrowserMode::ConfigPathSelection { .. } | FileBrowserMode::Directory => {
                 footer_spans.push(Span::styled(
-                    "[Tab]",
-                    footer_key_style(ctx, ActionTone::Mode),
-                ));
-                if search_panel_active {
-                    footer_spans.push(Span::raw(" Search Mode | "));
-                } else {
-                    footer_spans.push(Span::raw(" Switch Pane | "));
-                }
-            }
-            footer_spans.push(Span::styled("[/]", footer_key_style(ctx, ActionTone::Edit)));
-            footer_spans.push(Span::raw(" Search | "));
-
-            if existing_priority_only || matches!(focused_pane, BrowserPane::TorrentPreview) {
-                footer_spans.push(Span::styled(
-                    "[Space/p]",
-                    footer_key_style(ctx, ActionTone::Toggle),
-                ));
-                footer_spans.push(Span::raw(" Priority | "));
-                footer_spans.push(Span::styled(
-                    "[P]",
-                    footer_key_style(ctx, ActionTone::Toggle),
-                ));
-                footer_spans.push(Span::raw(" Priority All | "));
-                footer_spans.push(Span::styled(
-                    "[e]",
+                    "[Arrows/Vim]",
                     footer_key_style(ctx, ActionTone::Navigate),
                 ));
-                footer_spans.push(Span::raw(" Expand | "));
+                footer_spans.push(Span::raw(" Nav | "));
                 footer_spans.push(Span::styled(
-                    "[c]",
+                    "[Backspace]",
                     footer_key_style(ctx, ActionTone::Navigate),
                 ));
-                footer_spans.push(Span::raw(" Collapse | "));
-            }
-
-            if !existing_priority_only && !edit_locked {
+                footer_spans.push(Span::raw(" Up | "));
                 footer_spans.push(Span::styled(
-                    "[x]",
-                    footer_key_style(ctx, ActionTone::Toggle),
+                    "[Enter]",
+                    footer_key_style(ctx, ActionTone::Navigate),
                 ));
-                footer_spans.push(Span::raw(" Container Folder | "));
-
-                if *use_container {
-                    footer_spans.push(Span::styled("[r]", footer_key_style(ctx, ActionTone::Edit)));
-                    footer_spans.push(Span::raw(" Rename | "));
-                }
+                footer_spans.push(Span::raw(" Down | "));
+                footer_spans.push(Span::styled(
+                    "[Y]",
+                    footer_key_style(ctx, ActionTone::Confirm),
+                ));
+                footer_spans.push(Span::raw(" Confirm Selection | "));
             }
+            FileBrowserMode::DownloadLocSelection {
+                focused_pane,
+                use_container,
+                ..
+            } => {
+                let edit_locked = pending_magnet_metadata_editing_locked(browser_mode);
+                if !existing_priority_only {
+                    footer_spans.push(Span::styled(
+                        "[Tab]",
+                        footer_key_style(ctx, ActionTone::Mode),
+                    ));
+                    if search_panel_active {
+                        footer_spans.push(Span::raw(" Search Mode | "));
+                    } else {
+                        footer_spans.push(Span::raw(" Switch Pane | "));
+                    }
+                }
+                footer_spans.push(Span::styled("[/]", footer_key_style(ctx, ActionTone::Edit)));
+                footer_spans.push(Span::raw(" Search | "));
 
-            footer_spans.push(Span::styled(
-                "[Y]",
-                footer_key_style(ctx, ActionTone::Confirm),
-            ));
-            footer_spans.push(Span::raw(" Confirm"));
+                if existing_priority_only || matches!(focused_pane, BrowserPane::TorrentPreview) {
+                    footer_spans.push(Span::styled(
+                        "[Space/p]",
+                        footer_key_style(ctx, ActionTone::Toggle),
+                    ));
+                    footer_spans.push(Span::raw(" Priority | "));
+                    footer_spans.push(Span::styled(
+                        "[P]",
+                        footer_key_style(ctx, ActionTone::Toggle),
+                    ));
+                    footer_spans.push(Span::raw(" Priority All | "));
+                    footer_spans.push(Span::styled(
+                        "[e]",
+                        footer_key_style(ctx, ActionTone::Navigate),
+                    ));
+                    footer_spans.push(Span::raw(" Expand | "));
+                    footer_spans.push(Span::styled(
+                        "[c]",
+                        footer_key_style(ctx, ActionTone::Navigate),
+                    ));
+                    footer_spans.push(Span::raw(" Collapse | "));
+                }
+
+                if !existing_priority_only && !edit_locked {
+                    footer_spans.push(Span::styled(
+                        "[x]",
+                        footer_key_style(ctx, ActionTone::Toggle),
+                    ));
+                    footer_spans.push(Span::raw(" Container Folder | "));
+
+                    if *use_container {
+                        footer_spans
+                            .push(Span::styled("[r]", footer_key_style(ctx, ActionTone::Edit)));
+                        footer_spans.push(Span::raw(" Rename | "));
+                    }
+                }
+
+                footer_spans.push(Span::styled(
+                    "[Y]",
+                    footer_key_style(ctx, ActionTone::Confirm),
+                ));
+                footer_spans.push(Span::raw(" Confirm"));
+            }
+            FileBrowserMode::File(_) => {
+                footer_spans.push(Span::styled(
+                    "[Y]",
+                    footer_key_style(ctx, ActionTone::Confirm),
+                ));
+                footer_spans.push(Span::raw(" Confirm File"));
+            }
         }
-        FileBrowserMode::File(_) => {
-            footer_spans.push(Span::styled(
-                "[Y]",
-                footer_key_style(ctx, ActionTone::Confirm),
-            ));
-            footer_spans.push(Span::raw(" Confirm File | "));
-        }
+        footer_spans.push(Span::raw(" | "));
+        footer_spans.push(Span::styled(
+            "[Esc]",
+            footer_key_style(ctx, ActionTone::Cancel),
+        ));
+        footer_spans.push(Span::raw(" Cancel"));
     }
-    footer_spans.push(Span::raw(" | "));
-    footer_spans.push(Span::styled(
-        "[Esc]",
-        footer_key_style(ctx, ActionTone::Cancel),
-    ));
-    footer_spans.push(Span::raw(" Cancel"));
 
     let footer = Paragraph::new(Line::from(footer_spans))
         .alignment(Alignment::Center)
@@ -271,7 +290,12 @@ pub fn draw(
     let visible_items = TreeMathHelper::get_visible_slice(data, state, filter, inner_height);
     let mut list_items = Vec::new();
 
-    if data.is_empty() {
+    if let Some(error) = app_state.ui.file_browser.fetch_error.as_deref() {
+        list_items.push(ListItem::new(Line::from(vec![Span::styled(
+            file_browser_fetch_error_message(error),
+            ctx.apply(Style::default().fg(ctx.state_error())).bold(),
+        )])));
+    } else if data.is_empty() {
         list_items.push(ListItem::new(Line::from(vec![Span::styled(
             "   (Directory is empty)",
             ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0))
@@ -442,6 +466,7 @@ struct TorrentPreviewPanelProps<'a> {
     border_style: Style,
     current_fs_path: &'a Path,
     preview_filter: TreeFilter<TorrentPreviewPayload>,
+    torrent_file_preview: &'a TorrentFilePreviewState,
 }
 
 fn draw_torrent_preview_panel(
@@ -456,6 +481,7 @@ fn draw_torrent_preview_panel(
         border_style,
         current_fs_path,
         preview_filter,
+        torrent_file_preview,
     } = props;
     let is_narrow = area.width < 50;
     let raw_title = "Torrent Preview";
@@ -621,7 +647,7 @@ fn draw_torrent_preview_panel(
                 let mut spans = vec![
                     Span::styled(indent_str, structure_style),
                     Span::styled(icon, structure_style),
-                    Span::styled(&item.node.name, final_content_style),
+                    Span::styled(sanitize_text(&item.node.name), final_content_style),
                 ];
 
                 if !item.node.is_dir {
@@ -644,146 +670,139 @@ fn draw_torrent_preview_panel(
         return;
     }
 
-    if let Some(p) = path {
-        let file_bytes = match std::fs::read(p) {
-            Ok(b) => b,
-            Err(e) => {
-                f.render_widget(
-                    Paragraph::new(format!("Read Error: {}", e))
-                        .style(ctx.apply(Style::default().fg(ctx.state_error()))),
-                    inner_area,
-                );
-                return;
-            }
-        };
-
-        let torrent = match crate::torrent_file::parser::from_bytes(&file_bytes) {
-            Ok(t) => t,
-            Err(e) => {
-                f.render_widget(
-                    Paragraph::new(format!("Invalid Torrent: {}", e))
-                        .style(ctx.apply(Style::default().fg(ctx.state_error()))),
-                    inner_area,
-                );
-                return;
-            }
-        };
-
-        let total_size = torrent.info.total_length();
-        let protocol_version = match torrent.info.meta_version {
-            Some(2) => {
-                if !torrent.info.pieces.is_empty() {
-                    "BitTorrent v2 (Hybrid)"
-                } else {
-                    "BitTorrent v2 (Pure)"
-                }
-            }
-            _ => "BitTorrent v1",
-        };
-        let info_text = vec![
-            Line::from(vec![
-                Span::styled(
-                    "Name: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-                Span::raw(&torrent.info.name),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Protocol: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-                Span::styled(
-                    protocol_version,
-                    Style::default().fg(ctx.state_selected()).bold(),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(
-                    "Size: ",
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-                Span::raw(format_bytes(total_size as u64)),
-            ]),
-        ];
-
-        let layout = Layout::vertical([
-            Constraint::Length(info_text.len() as u16 + 1),
-            Constraint::Min(0),
-        ])
-        .split(inner_area);
-        f.render_widget(
-            Paragraph::new(info_text).block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border))),
-            ),
-            layout[0],
-        );
-
-        let file_list_payloads: Vec<(Vec<String>, TorrentPreviewPayload)> = torrent
-            .file_list()
-            .into_iter()
-            .map(|(path, size)| {
-                (
-                    path,
-                    TorrentPreviewPayload {
-                        file_index: None,
-                        size,
-                        priority: FilePriority::Normal,
-                    },
-                )
-            })
-            .collect();
-
-        let final_nodes = RawNode::from_path_list(None, file_list_payloads);
-        let mut temp_state = TreeViewState::default();
-        for node in &final_nodes {
-            node.expand_all(&mut temp_state);
-        }
-
-        let visible_rows = TreeMathHelper::get_visible_slice(
-            &final_nodes,
-            &temp_state,
-            TreeFilter::default(),
-            layout[1].height as usize,
-        );
-
-        let list_items: Vec<ListItem> = visible_rows
-            .iter()
-            .map(|item| {
-                let indent = if is_narrow {
-                    " ".repeat(item.depth)
-                } else {
-                    "  ".repeat(item.depth)
-                };
-                let icon = if item.node.is_dir {
-                    ASCII_TREE_DIR_ICON
-                } else {
-                    ASCII_TREE_FILE_ICON
-                };
-                let style = if item.node.is_dir {
-                    ctx.apply(Style::default().fg(ctx.state_info()))
-                } else {
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text))
-                };
-                let mut spans = vec![
-                    Span::raw(indent),
-                    Span::styled(icon, style),
-                    Span::styled(&item.node.name, style),
-                ];
-                if !item.node.is_dir && !is_narrow {
-                    spans.push(Span::styled(
-                        format!(" ({})", format_bytes(item.node.payload.size)),
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
-                    ));
-                }
-                ListItem::new(Line::from(spans))
-            })
-            .collect();
-
-        f.render_widget(List::new(list_items), layout[1]);
+    if let Some(path) = path {
+        draw_cached_torrent_file_preview(f, ctx, inner_area, is_narrow, path, torrent_file_preview);
     }
+}
+
+fn draw_cached_torrent_file_preview(
+    f: &mut Frame,
+    ctx: &ThemeContext,
+    area: Rect,
+    is_narrow: bool,
+    selected_path: &Path,
+    state: &TorrentFilePreviewState,
+) {
+    match state {
+        TorrentFilePreviewState::Ready { path, preview } if path == selected_path => {
+            draw_loaded_torrent_file_preview(f, ctx, area, is_narrow, preview);
+        }
+        TorrentFilePreviewState::Error { path, message } if path == selected_path => {
+            f.render_widget(
+                Paragraph::new(format!("Preview Error: {}", sanitize_text(message)))
+                    .style(ctx.apply(Style::default().fg(ctx.state_error()))),
+                area,
+            );
+        }
+        TorrentFilePreviewState::Loading { path, .. } if path == selected_path => {
+            f.render_widget(
+                Paragraph::new("Loading torrent preview...")
+                    .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))),
+                area,
+            );
+        }
+        _ => {
+            f.render_widget(
+                Paragraph::new("Preparing torrent preview...")
+                    .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))),
+                area,
+            );
+        }
+    }
+}
+
+fn draw_loaded_torrent_file_preview(
+    f: &mut Frame,
+    ctx: &ThemeContext,
+    area: Rect,
+    is_narrow: bool,
+    preview: &TorrentFilePreview,
+) {
+    let info_text = vec![
+        Line::from(vec![
+            Span::styled(
+                "Name: ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ),
+            Span::raw(sanitize_text(&preview.name)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Protocol: ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ),
+            Span::styled(
+                preview.protocol_version.as_str(),
+                Style::default().fg(ctx.state_selected()).bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Size: ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+            ),
+            Span::raw(format_bytes(preview.total_size)),
+        ]),
+    ];
+
+    let layout = Layout::vertical([
+        Constraint::Length(info_text.len() as u16 + 1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    f.render_widget(
+        Paragraph::new(info_text).block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border))),
+        ),
+        layout[0],
+    );
+
+    let mut expanded_state = TreeViewState::default();
+    for node in &preview.tree {
+        node.expand_all(&mut expanded_state);
+    }
+    let visible_rows = TreeMathHelper::get_visible_slice(
+        &preview.tree,
+        &expanded_state,
+        TreeFilter::default(),
+        layout[1].height as usize,
+    );
+    let list_items: Vec<ListItem> = visible_rows
+        .iter()
+        .map(|item| {
+            let indent = if is_narrow {
+                " ".repeat(item.depth)
+            } else {
+                "  ".repeat(item.depth)
+            };
+            let icon = if item.node.is_dir {
+                ASCII_TREE_DIR_ICON
+            } else {
+                ASCII_TREE_FILE_ICON
+            };
+            let style = if item.node.is_dir {
+                ctx.apply(Style::default().fg(ctx.state_info()))
+            } else {
+                ctx.apply(Style::default().fg(ctx.theme.semantic.text))
+            };
+            let mut spans = vec![
+                Span::raw(indent),
+                Span::styled(icon, style),
+                Span::styled(sanitize_text(&item.node.name), style),
+            ];
+            if !item.node.is_dir && !is_narrow {
+                spans.push(Span::styled(
+                    format!(" ({})", format_bytes(item.node.payload.size)),
+                    ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    f.render_widget(List::new(list_items), layout[1]);
 }
 
 pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
@@ -793,6 +812,14 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 
     if let CrosstermEvent::Key(key) = event {
         if key.kind == KeyEventKind::Press {
+            // Container-name editing is modal. In particular, Esc must restore the
+            // backup even when an applied search is still visible, and printable
+            // shortcut keys belong to the name until the edit is committed.
+            if browser_container_name_editing(&app.app_state.ui.file_browser.browser_mode) {
+                let _ = handle_browser_download_key(key.code, app).await;
+                return;
+            }
+
             if handle_browser_search_key(key, app) {
                 return;
             }
@@ -807,10 +834,29 @@ pub async fn handle_event(event: CrosstermEvent, app: &mut App) {
 }
 
 fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
+    let pending_torrent_path = app.app_state.pending_torrent_path.is_some();
+    let pending_torrent_link = !app.app_state.pending_torrent_link.is_empty();
+    let screen_area = app.app_state.screen_area;
     let file_browser = &mut app.app_state.ui.file_browser;
+    let has_preview = preview_content_for_selection(
+        &file_browser.browser_mode,
+        pending_torrent_path,
+        pending_torrent_link,
+        &file_browser.state,
+        &file_browser.data,
+    );
     if matches!(key.code, KeyCode::Tab) && browser_search_panel_active(file_browser.search_state) {
         toggle_browser_search_mode(&mut file_browser.search_mode);
-        reset_active_browser_search_view(&mut file_browser.browser_mode, &mut file_browser.state);
+        reset_active_browser_search_view(BrowserSearchViewContext {
+            browser_mode: &mut file_browser.browser_mode,
+            filesystem_state: &mut file_browser.state,
+            filesystem_data: &file_browser.data,
+            search_query: &file_browser.search_query,
+            search_mode: file_browser.search_mode,
+            screen_area,
+            has_preview,
+            search_panel_active: browser_search_panel_active(file_browser.search_state),
+        });
         app.app_state.ui.needs_redraw = true;
         return true;
     }
@@ -824,10 +870,16 @@ fn handle_browser_search_key(key: KeyEvent, app: &mut App) -> bool {
             &mut file_browser.search_mode,
         );
         if reset_view {
-            reset_active_browser_search_view(
-                &mut file_browser.browser_mode,
-                &mut file_browser.state,
-            );
+            reset_active_browser_search_view(BrowserSearchViewContext {
+                browser_mode: &mut file_browser.browser_mode,
+                filesystem_state: &mut file_browser.state,
+                filesystem_data: &file_browser.data,
+                search_query: &file_browser.search_query,
+                search_mode: file_browser.search_mode,
+                screen_area,
+                has_preview,
+                search_panel_active: browser_search_panel_active(file_browser.search_state),
+            });
         }
         if reduced.redraw {
             app.app_state.ui.needs_redraw = true;
@@ -858,15 +910,32 @@ async fn handle_browser_download_key(key_code: KeyCode, app: &mut App) -> bool {
     }
 
     if preview_search_should_start(key_code, &app.app_state.ui.file_browser.browser_mode) {
+        let pending_torrent_path = app.app_state.pending_torrent_path.is_some();
+        let pending_torrent_link = !app.app_state.pending_torrent_link.is_empty();
+        let screen_area = app.app_state.screen_area;
+        let file_browser = &mut app.app_state.ui.file_browser;
         start_browser_search(
-            &mut app.app_state.ui.file_browser.search_state,
-            &mut app.app_state.ui.file_browser.search_query,
-            &mut app.app_state.ui.file_browser.search_mode,
+            &mut file_browser.search_state,
+            &mut file_browser.search_query,
+            &mut file_browser.search_mode,
         );
-        reset_active_browser_search_view(
-            &mut app.app_state.ui.file_browser.browser_mode,
-            &mut app.app_state.ui.file_browser.state,
+        let has_preview = preview_content_for_selection(
+            &file_browser.browser_mode,
+            pending_torrent_path,
+            pending_torrent_link,
+            &file_browser.state,
+            &file_browser.data,
         );
+        reset_active_browser_search_view(BrowserSearchViewContext {
+            browser_mode: &mut file_browser.browser_mode,
+            filesystem_state: &mut file_browser.state,
+            filesystem_data: &file_browser.data,
+            search_query: &file_browser.search_query,
+            search_mode: file_browser.search_mode,
+            screen_area,
+            has_preview,
+            search_panel_active: browser_search_panel_active(file_browser.search_state),
+        });
         app.app_state.ui.needs_redraw = true;
         return true;
     }
@@ -970,36 +1039,113 @@ fn toggle_browser_search_mode(search_mode: &mut SearchMode) {
 fn browser_action_resets_search_view(action: BrowserAction) -> bool {
     matches!(
         action,
-        BrowserAction::Backspace | BrowserAction::ToggleSearchMode | BrowserAction::Char(_)
+        BrowserAction::Esc
+            | BrowserAction::Backspace
+            | BrowserAction::ToggleSearchMode
+            | BrowserAction::Char(_)
     )
 }
 
-fn reset_active_browser_search_view(
-    browser_mode: &mut FileBrowserMode,
-    filesystem_state: &mut TreeViewState,
+fn cursor_is_in_visible_window<T>(
+    projection: &TreeProjection<'_, T>,
+    state: &TreeViewState,
+) -> bool {
+    let Some(cursor_path) = state.cursor_path.as_ref() else {
+        return false;
+    };
+    projection
+        .visible_window()
+        .iter()
+        .any(|item| &item.path == cursor_path)
+}
+
+fn reconcile_tree_cursor_with_visible_window<T>(
+    state: &mut TreeViewState,
+    data: &[RawNode<T>],
+    filter: TreeFilter<T>,
+    list_height: usize,
 ) {
-    match browser_mode {
-        FileBrowserMode::DownloadLocSelection {
-            focused_pane: BrowserPane::TorrentPreview,
-            preview_state,
-            ..
-        } => {
-            preview_state.top_most_offset = 0;
-        }
-        _ => {
-            filesystem_state.top_most_offset = 0;
-        }
+    state.top_most_offset = 0;
+    let projection = TreeProjection::new(data, state, filter, list_height);
+    if !cursor_is_in_visible_window(&projection, state) {
+        state.cursor_path = projection
+            .visible_window()
+            .first()
+            .map(|item| item.path.clone());
     }
+}
+
+struct BrowserSearchViewContext<'a> {
+    browser_mode: &'a mut FileBrowserMode,
+    filesystem_state: &'a mut TreeViewState,
+    filesystem_data: &'a [RawNode<FileMetadata>],
+    search_query: &'a str,
+    search_mode: SearchMode,
+    screen_area: Rect,
+    has_preview: bool,
+    search_panel_active: bool,
+}
+
+fn reset_active_browser_search_view(ctx: BrowserSearchViewContext<'_>) {
+    let BrowserSearchViewContext {
+        browser_mode,
+        filesystem_state,
+        filesystem_data,
+        search_query,
+        search_mode,
+        screen_area,
+        has_preview,
+        search_panel_active,
+    } = ctx;
+    if let FileBrowserMode::DownloadLocSelection {
+        target,
+        use_container,
+        focused_pane: BrowserPane::TorrentPreview,
+        preview_tree,
+        preview_state,
+        ..
+    } = browser_mode
+    {
+        let preview_only = matches!(target, DownloadSelectionTarget::ExistingTorrent { .. });
+        if let Some(list_height) = calculate_preview_list_height(
+            screen_area,
+            search_panel_active,
+            &BrowserPane::TorrentPreview,
+            *use_container,
+            preview_only,
+        ) {
+            reconcile_tree_cursor_with_visible_window(
+                preview_state,
+                preview_tree,
+                build_torrent_preview_filter(search_query, search_mode),
+                list_height,
+            );
+        } else {
+            preview_state.top_most_offset = 0;
+            preview_state.cursor_path = None;
+        }
+        return;
+    }
+
+    let pane = focused_pane(browser_mode);
+    let list_height = calculate_list_height(screen_area, has_preview, search_panel_active, &pane);
+    reconcile_tree_cursor_with_visible_window(
+        filesystem_state,
+        filesystem_data,
+        build_filesystem_filter(browser_mode, search_query, search_mode),
+        list_height,
+    );
 }
 
 async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
     let list_height = {
         let file_browser = &app.app_state.ui.file_browser;
-        let has_preview = has_preview_content(
+        let has_preview = preview_content_for_selection(
             &file_browser.browser_mode,
             app.app_state.pending_torrent_path.is_some(),
             !app.app_state.pending_torrent_link.is_empty(),
-            file_browser.state.cursor_path.as_ref(),
+            &file_browser.state,
+            &file_browser.data,
         );
         let pane = focused_pane(&file_browser.browser_mode);
         let search_panel_active = browser_search_panel_active(file_browser.search_state);
@@ -1044,18 +1190,22 @@ async fn handle_browser_common_key(key_code: KeyCode, app: &mut App) -> bool {
 
     let reduced = {
         let file_browser = &app.app_state.ui.file_browser;
-        if matches!(dialog_action, BrowserDialogAction::ConfirmSelection)
-            && matches!(file_browser.browser_mode, FileBrowserMode::File(_))
-            && !filesystem_cursor_visible(
-                &file_browser.data,
-                &file_browser.state,
-                &file_browser.browser_mode,
-                &file_browser.search_query,
-                file_browser.search_mode,
-                list_height,
-            )
-        {
-            return true;
+        if matches!(dialog_action, BrowserDialogAction::ConfirmSelection) {
+            if file_browser.fetch_pending {
+                return true;
+            }
+            if matches!(file_browser.browser_mode, FileBrowserMode::File(_))
+                && !filesystem_cursor_visible(
+                    &file_browser.data,
+                    &file_browser.state,
+                    &file_browser.browser_mode,
+                    &file_browser.search_query,
+                    file_browser.search_mode,
+                    list_height,
+                )
+            {
+                return true;
+            }
         }
         reduce_browser_dialog_action(
             dialog_action,
@@ -1282,7 +1432,6 @@ pub fn reduce_filesystem_navigation_action(
     action: BrowserFsAction,
     ctx: BrowserFilesystemReduceContext<'_>,
 ) -> BrowserFsReduceResult {
-    let filter = build_filesystem_filter(ctx.browser_mode, ctx.search_query, *ctx.search_mode);
     let mut result = BrowserFsReduceResult {
         consumed: true,
         effects: Vec::new(),
@@ -1291,21 +1440,43 @@ pub fn reduce_filesystem_navigation_action(
     match action {
         BrowserFsAction::StartSearch => {
             start_browser_search(ctx.search_state, ctx.search_query, ctx.search_mode);
-            ctx.state.top_most_offset = 0;
+            reconcile_tree_cursor_with_visible_window(
+                ctx.state,
+                ctx.data,
+                build_filesystem_filter(ctx.browser_mode, ctx.search_query, *ctx.search_mode),
+                ctx.list_height,
+            );
         }
         BrowserFsAction::Move(tree_action) => {
-            TreeMathHelper::apply_action(ctx.state, ctx.data, tree_action, filter, ctx.list_height);
+            TreeMathHelper::apply_action(
+                ctx.state,
+                ctx.data,
+                tree_action,
+                build_filesystem_filter(ctx.browser_mode, ctx.search_query, *ctx.search_mode),
+                ctx.list_height,
+            );
         }
         BrowserFsAction::EnterDir => {
-            if let Some(path) = ctx.state.cursor_path.clone() {
-                if path.is_dir() {
-                    clear_browser_search(ctx.search_state, ctx.search_query);
-                    result.effects.push(BrowserFsEffect::FetchFileTree {
-                        path,
-                        browser_mode: ctx.browser_mode.clone(),
-                        highlight_path: None,
-                    });
-                }
+            let projection = TreeProjection::new(
+                ctx.data,
+                ctx.state,
+                build_filesystem_filter(ctx.browser_mode, ctx.search_query, *ctx.search_mode),
+                ctx.list_height,
+            );
+            let selected_directory = ctx.state.cursor_path.as_ref().and_then(|cursor_path| {
+                projection
+                    .visible_window()
+                    .iter()
+                    .find(|item| &item.path == cursor_path && item.node.is_dir)
+                    .map(|item| item.path.clone())
+            });
+            if let Some(path) = selected_directory {
+                clear_browser_search(ctx.search_state, ctx.search_query);
+                result.effects.push(BrowserFsEffect::FetchFileTree {
+                    path,
+                    browser_mode: ctx.browser_mode.clone(),
+                    highlight_path: None,
+                });
             }
         }
         BrowserFsAction::GoParent => {
@@ -1334,6 +1505,16 @@ fn map_download_name_edit_key_to_action(key_code: KeyCode) -> BrowserDownloadEdi
         KeyCode::Char(c) => BrowserDownloadEditAction::Insert(c),
         _ => BrowserDownloadEditAction::Noop,
     }
+}
+
+fn browser_container_name_editing(browser_mode: &FileBrowserMode) -> bool {
+    matches!(
+        browser_mode,
+        FileBrowserMode::DownloadLocSelection {
+            is_editing_name: true,
+            ..
+        }
+    )
 }
 
 fn pending_magnet_metadata_editing_locked(browser_mode: &FileBrowserMode) -> bool {
@@ -1475,7 +1656,7 @@ fn filesystem_cursor_visible(
 ) -> bool {
     let filter = build_filesystem_filter(browser_mode, search_query, search_mode);
     let projection = TreeProjection::new(data, state, filter, list_height);
-    projection.cursor_index(state).is_some()
+    cursor_is_in_visible_window(&projection, state)
 }
 
 fn map_download_shortcut_key_to_action(
@@ -1592,11 +1773,42 @@ pub fn has_preview_content(
                 || !preview_tree.is_empty()
                 || matches!(target, DownloadSelectionTarget::ExistingTorrent { .. })
         }
-        FileBrowserMode::File(_) => {
-            cursor_path.is_some_and(|p| p.extension().is_some_and(|ext| ext == "torrent"))
-        }
+        FileBrowserMode::File(_) => cursor_path.is_some_and(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("torrent"))
+        }),
         _ => false,
     }
+}
+
+pub fn selected_filesystem_file_path<'a>(
+    state: &TreeViewState,
+    data: &'a [RawNode<FileMetadata>],
+) -> Option<&'a PathBuf> {
+    let cursor_path = state.cursor_path.as_ref()?;
+    data.iter()
+        .find(|node| !node.is_dir && &node.full_path == cursor_path)
+        .map(|node| &node.full_path)
+}
+
+pub fn preview_content_for_selection(
+    browser_mode: &FileBrowserMode,
+    pending_torrent_path: bool,
+    pending_torrent_link: bool,
+    state: &TreeViewState,
+    data: &[RawNode<FileMetadata>],
+) -> bool {
+    has_preview_content(
+        browser_mode,
+        pending_torrent_path,
+        pending_torrent_link,
+        selected_filesystem_file_path(state, data),
+    )
+}
+
+fn file_browser_fetch_error_message(error: &str) -> String {
+    format!("   Error: {}", sanitize_text(error))
 }
 
 pub fn focused_pane(browser_mode: &FileBrowserMode) -> BrowserPane {
@@ -1695,7 +1907,7 @@ pub fn reduce_browser_preview_action(
                 let cursor_visible = {
                     let projection =
                         TreeProjection::new(preview_tree, preview_state, filter, height);
-                    projection.cursor_index(preview_state).is_some()
+                    cursor_is_in_visible_window(&projection, preview_state)
                 };
                 if cursor_visible {
                     if let Some(target) = &preview_state.cursor_path {
@@ -1784,7 +1996,14 @@ fn filesystem_node_allowed_for_mode(
 }
 
 fn filesystem_node_allowed(node: &RawNode<FileMetadata>, extensions: &[String]) -> bool {
-    node.is_dir || extensions.iter().any(|ext| node.name.ends_with(ext))
+    node.is_dir || file_name_matches_extensions(&node.name, extensions)
+}
+
+fn file_name_matches_extensions(name: &str, extensions: &[String]) -> bool {
+    let normalized_name = name.to_lowercase();
+    extensions
+        .iter()
+        .any(|extension| normalized_name.ends_with(&extension.to_lowercase()))
 }
 
 fn filesystem_search_haystack(node: &RawNode<FileMetadata>) -> String {
@@ -2067,7 +2286,7 @@ pub fn selected_torrent_file_for_confirm(
     if let FileBrowserMode::File(extensions) = browser_mode {
         if let Some(path) = state.cursor_path.clone() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if extensions.iter().any(|ext| name.ends_with(ext)) {
+            if path.is_file() && file_name_matches_extensions(name, extensions) {
                 return Some(path);
             }
         }
@@ -2212,17 +2431,14 @@ pub async fn execute_confirm_decision(
             }
         },
         ConfirmDecision::File(path) => {
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|name| name.ends_with(".torrent"))
-            {
-                spawn_app_command_sender(
-                    app.app_command_tx.clone(),
-                    app.shutdown_tx.subscribe(),
-                    AppCommand::AddTorrentFromFile(path),
-                );
-            }
+            // File-mode selection already validates the configured extension and
+            // confirms that the cursor points to an actual file. Keep execution
+            // free of a second, potentially divergent case-sensitive check.
+            spawn_app_command_sender(
+                app.app_command_tx.clone(),
+                app.shutdown_tx.subscribe(),
+                AppCommand::AddTorrentFromFile(path),
+            );
             Some(BrowserTransition::ToNormal)
         }
         ConfirmDecision::None => None,
@@ -2384,6 +2600,7 @@ mod tests {
     use crate::config::Settings;
     use crate::tui::tree::{RawNode, TreeViewState};
     use ratatui::crossterm::event::KeyModifiers;
+    use ratatui::{backend::TestBackend, Terminal};
     use std::path::PathBuf;
 
     async fn app_with_existing_torrent(mode: AppMode) -> App {
@@ -2408,7 +2625,40 @@ mod tests {
             },
         );
         app.open_existing_torrent_file_browser(info_hash);
+        app.app_state.ui.file_browser.fetch_pending = false;
         app
+    }
+
+    fn editable_download_mode(container_name: &str, backup: &str) -> FileBrowserMode {
+        FileBrowserMode::DownloadLocSelection {
+            target: DownloadSelectionTarget::PendingAdd,
+            torrent_files: vec![],
+            container_name: container_name.to_string(),
+            use_container: true,
+            is_editing_name: true,
+            focused_pane: BrowserPane::TorrentPreview,
+            preview_tree: vec![],
+            preview_state: TreeViewState::default(),
+            cursor_pos: container_name.len(),
+            original_name_backup: backup.to_string(),
+        }
+    }
+
+    fn filesystem_node(
+        name: &str,
+        path: impl Into<PathBuf>,
+        is_dir: bool,
+    ) -> RawNode<FileMetadata> {
+        RawNode {
+            name: name.to_string(),
+            full_path: path.into(),
+            children: vec![],
+            payload: FileMetadata {
+                size: 0,
+                modified: std::time::UNIX_EPOCH,
+            },
+            is_dir,
+        }
     }
 
     #[tokio::test]
@@ -2453,6 +2703,21 @@ mod tests {
         let _ = app.shutdown_tx.send(());
     }
 
+    #[tokio::test]
+    async fn confirm_is_ignored_while_filesystem_fetch_is_pending() {
+        let mut app = app_with_existing_torrent(AppMode::TorrentManagement).await;
+        app.app_state.ui.file_browser.fetch_pending = true;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE)),
+            &mut app,
+        )
+        .await;
+
+        assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
+        let _ = app.shutdown_tx.send(());
+    }
+
     #[test]
     fn search_reducer_clears_on_escape() {
         let mut search_state = BrowserSearchState::Editing;
@@ -2488,6 +2753,65 @@ mod tests {
             BrowserSearchState::Closed
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn name_edit_escape_wins_over_applied_search_and_restores_backup() {
+        let mut app = app_with_existing_torrent(AppMode::Normal).await;
+        app.app_state.ui.file_browser.browser_mode =
+            editable_download_mode("changed name", "original name");
+        app.app_state.ui.file_browser.search_state = BrowserSearchState::Applied;
+        app.app_state.ui.file_browser.search_query = "still applied".to_string();
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app,
+        )
+        .await;
+
+        assert_eq!(
+            app.app_state.ui.file_browser.search_state,
+            BrowserSearchState::Applied
+        );
+        assert_eq!(app.app_state.ui.file_browser.search_query, "still applied");
+        assert!(matches!(
+            &app.app_state.ui.file_browser.browser_mode,
+            FileBrowserMode::DownloadLocSelection {
+                container_name,
+                is_editing_name: false,
+                ..
+            } if container_name == "original name"
+        ));
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn name_edit_treats_dialog_and_search_shortcuts_as_text() {
+        let mut app = app_with_existing_torrent(AppMode::Normal).await;
+        app.app_state.ui.file_browser.browser_mode = editable_download_mode("folder", "folder");
+
+        for key_code in [KeyCode::Char('Y'), KeyCode::Char('/')] {
+            handle_event(
+                CrosstermEvent::Key(KeyEvent::new(key_code, KeyModifiers::NONE)),
+                &mut app,
+            )
+            .await;
+        }
+
+        assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
+        assert!(matches!(
+            &app.app_state.ui.file_browser.browser_mode,
+            FileBrowserMode::DownloadLocSelection {
+                container_name,
+                is_editing_name: true,
+                ..
+            } if container_name == "folderY/"
+        ));
+        assert_eq!(
+            app.app_state.ui.file_browser.search_state,
+            BrowserSearchState::Closed
+        );
+        let _ = app.shutdown_tx.send(());
     }
 
     #[test]
@@ -2606,13 +2930,13 @@ mod tests {
     #[test]
     fn reducer_filesystem_enter_dir_emits_fetch_effect() {
         let mut search_state = BrowserSearchState::Editing;
-        let mut query = String::from("abc");
+        let mut query = String::new();
         let mut state = TreeViewState {
             current_path: PathBuf::from("."),
             cursor_path: Some(PathBuf::from(".")),
             ..Default::default()
         };
-        let data: Vec<RawNode<FileMetadata>> = vec![];
+        let data = vec![filesystem_node("current", ".", true)];
         let mode = FileBrowserMode::Directory;
         let mut search_mode = SearchMode::Fuzzy;
 
@@ -2638,6 +2962,43 @@ mod tests {
             BrowserFsEffect::FetchFileTree { ref path, highlight_path: None, .. }
                 if path == &PathBuf::from(".")
         ));
+    }
+
+    #[test]
+    fn reducer_filesystem_enter_does_not_open_filtered_out_cursor() {
+        let alpha_path = PathBuf::from("alpha-folder");
+        let beta_path = PathBuf::from("beta-folder");
+        let data = vec![
+            filesystem_node("alpha-folder", alpha_path.clone(), true),
+            filesystem_node("beta-folder", beta_path, true),
+        ];
+        let mut state = TreeViewState {
+            current_path: PathBuf::from("."),
+            cursor_path: Some(alpha_path),
+            ..Default::default()
+        };
+        let mode = FileBrowserMode::Directory;
+        let mut search_state = BrowserSearchState::Applied;
+        let mut query = "beta".to_string();
+        let mut search_mode = SearchMode::Fuzzy;
+
+        let out = reduce_filesystem_navigation_action(
+            BrowserFsAction::EnterDir,
+            BrowserFilesystemReduceContext {
+                state: &mut state,
+                data: &data,
+                browser_mode: &mode,
+                search_state: &mut search_state,
+                search_query: &mut query,
+                search_mode: &mut search_mode,
+                list_height: 5,
+            },
+        );
+
+        assert!(out.consumed);
+        assert!(out.effects.is_empty());
+        assert_eq!(search_state, BrowserSearchState::Applied);
+        assert_eq!(query, "beta");
     }
 
     #[test]
@@ -2698,6 +3059,24 @@ mod tests {
         assert_eq!(name, "orig");
         assert!(!is_editing_name);
         assert_eq!(cursor_pos, 4);
+    }
+
+    #[test]
+    fn reducer_download_edit_commit_accepts_safe_single_component() {
+        let mut name = String::from("renamed folder");
+        let mut is_editing_name = true;
+        let mut cursor_pos = name.len();
+
+        reduce_download_name_edit_action(
+            BrowserDownloadEditAction::Commit,
+            &mut name,
+            &mut is_editing_name,
+            &mut cursor_pos,
+            "original folder",
+        );
+
+        assert!(!is_editing_name);
+        assert_eq!(name, "renamed folder");
     }
 
     #[test]
@@ -2951,10 +3330,97 @@ mod tests {
     }
 
     #[test]
-    fn has_preview_content_matches_file_mode_torrent_extension() {
+    fn has_preview_content_matches_case_insensitive_torrent_extension() {
+        let directory = tempfile::tempdir().expect("create tempdir");
+        let path = directory.path().join("sample.TORRENT");
+        std::fs::write(&path, []).expect("create selected file");
         let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
-        let path = PathBuf::from("demo.torrent");
         assert!(has_preview_content(&mode, false, false, Some(&path)));
+    }
+
+    #[test]
+    fn preview_selection_ignores_directory_with_torrent_suffix() {
+        let path = PathBuf::from("folder.torrent");
+        let state = TreeViewState {
+            cursor_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let data = vec![filesystem_node("folder.torrent", path, true)];
+        let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
+
+        assert!(selected_filesystem_file_path(&state, &data).is_none());
+        assert!(!preview_content_for_selection(
+            &mode, false, false, &state, &data
+        ));
+    }
+
+    #[test]
+    fn preview_selection_accepts_non_directory_data_node() {
+        let path = PathBuf::from("sample.TORRENT");
+        let state = TreeViewState {
+            cursor_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let data = vec![filesystem_node("sample.TORRENT", path.clone(), false)];
+        let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
+
+        assert_eq!(selected_filesystem_file_path(&state, &data), Some(&path));
+        assert!(preview_content_for_selection(
+            &mode, false, false, &state, &data
+        ));
+    }
+
+    #[test]
+    fn browser_fetch_error_message_is_visible_and_single_line() {
+        assert_eq!(
+            file_browser_fetch_error_message("Directory unavailable\ntry another path"),
+            "   Error: Directory unavailable?try another path"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_draw_renders_fetch_error_in_filesystem_panel() {
+        let mut app = app_with_existing_torrent(AppMode::FileBrowser).await;
+        app.app_state.ui.file_browser.browser_mode = FileBrowserMode::Directory;
+        app.app_state.ui.file_browser.data.clear();
+        app.app_state.ui.file_browser.fetch_error =
+            Some("Directory unavailable for this location".to_string());
+
+        let dht_status = crate::dht_service::DhtStatus::default();
+        let dht_wave_telemetry = crate::dht_service::DhtWaveTelemetry::default();
+        let theme = ThemeContext::new(app.app_state.theme, app.app_state.ui.effects_phase_time);
+        let screen = ScreenContext::new(
+            &app.app_state,
+            &dht_status,
+            &dht_wave_telemetry,
+            &app.client_configs,
+            &theme,
+        );
+        let browser = &app.app_state.ui.file_browser;
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &screen,
+                    &browser.state,
+                    &browser.data,
+                    &browser.browser_mode,
+                );
+            })
+            .expect("draw browser");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Error: Directory unavailable for this location"));
+        let _ = app.shutdown_tx.send(());
     }
 
     #[test]
@@ -3062,6 +3528,25 @@ mod tests {
 
         assert!(rows.iter().any(|row| row.node.name == "alpha.bin"));
         assert!(rows.iter().any(|row| row.node.name == "beta.bin"));
+    }
+
+    #[test]
+    fn file_mode_extension_filter_is_case_insensitive() {
+        let tree = vec![
+            filesystem_node("sample.TORRENT", "sample.TORRENT", false),
+            filesystem_node("notes.txt", "notes.txt", false),
+        ];
+        let state = TreeViewState::default();
+        let filter = build_filesystem_filter(
+            &FileBrowserMode::File(vec![".torrent".to_string()]),
+            "",
+            SearchMode::Regex,
+        );
+
+        let rows = TreeMathHelper::get_visible_slice(&tree, &state, filter, 10);
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node.name, "sample.TORRENT");
     }
 
     #[test]
@@ -3235,6 +3720,31 @@ mod tests {
     }
 
     #[test]
+    fn preview_reducer_does_not_cycle_cursor_outside_visible_window() {
+        let mut tree = sample_preview_tree();
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("root/group/beta.bin")),
+            ..Default::default()
+        };
+        state.expanded_paths.insert(PathBuf::from("root"));
+        state.expanded_paths.insert(PathBuf::from("root/group"));
+
+        let out = reduce_browser_preview_action(
+            map_preview_key_to_action(KeyCode::Char('p')),
+            &mut state,
+            &mut tree,
+            TreeFilter::default(),
+            Some(2),
+        );
+
+        assert!(out.consumed);
+        assert_eq!(
+            tree[0].children[0].children[1].payload.priority,
+            FilePriority::Normal
+        );
+    }
+
+    #[test]
     fn download_name_edit_preserves_utf8_boundaries() {
         let mut name = String::from("Café Seed");
         let mut is_editing = true;
@@ -3277,6 +3787,69 @@ mod tests {
             SearchMode::Fuzzy,
             10,
         ));
+    }
+
+    #[test]
+    fn filesystem_cursor_visible_rejects_cursor_below_visible_window() {
+        let tree = sample_filesystem_tree();
+        let mode = FileBrowserMode::File(vec![".bin".to_string()]);
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("root/group/beta.bin")),
+            ..Default::default()
+        };
+        state.expanded_paths.insert(PathBuf::from("root"));
+        state.expanded_paths.insert(PathBuf::from("root/group"));
+
+        assert!(!filesystem_cursor_visible(
+            &tree,
+            &state,
+            &mode,
+            "",
+            SearchMode::Fuzzy,
+            2,
+        ));
+    }
+
+    #[test]
+    fn search_reconciliation_moves_offscreen_cursor_into_visible_window() {
+        let tree = sample_filesystem_tree();
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("root/group/beta.bin")),
+            top_most_offset: 2,
+            ..Default::default()
+        };
+        state.expanded_paths.insert(PathBuf::from("root"));
+        state.expanded_paths.insert(PathBuf::from("root/group"));
+
+        reconcile_tree_cursor_with_visible_window(
+            &mut state,
+            &tree,
+            build_filesystem_filter(&FileBrowserMode::Directory, "", SearchMode::Regex),
+            2,
+        );
+
+        assert_eq!(state.top_most_offset, 0);
+        assert_eq!(state.cursor_path, Some(PathBuf::from("root")));
+    }
+
+    #[test]
+    fn search_reconciliation_clears_cursor_when_filter_has_no_rows() {
+        let tree = sample_filesystem_tree();
+        let mut state = TreeViewState {
+            cursor_path: Some(PathBuf::from("root/group/alpha.bin")),
+            top_most_offset: 3,
+            ..Default::default()
+        };
+
+        reconcile_tree_cursor_with_visible_window(
+            &mut state,
+            &tree,
+            build_filesystem_filter(&FileBrowserMode::Directory, "no-match", SearchMode::Regex),
+            5,
+        );
+
+        assert_eq!(state.top_most_offset, 0);
+        assert_eq!(state.cursor_path, None);
     }
 
     #[test]
@@ -3430,7 +4003,11 @@ mod tests {
             cursor_path: Some(dir.path().to_path_buf()),
             ..Default::default()
         };
-        let data: Vec<RawNode<FileMetadata>> = vec![];
+        let data = vec![filesystem_node(
+            "selected-folder",
+            dir.path().to_path_buf(),
+            true,
+        )];
         let mode = FileBrowserMode::Directory;
         let (tx, mut rx) = mpsc::channel(1);
         let (shutdown_tx, _) = broadcast::channel(1);
@@ -3578,6 +4155,69 @@ mod tests {
             decision,
             ConfirmDecision::ToConfig(ConfigUiState { .. })
         ));
+    }
+
+    #[test]
+    fn selected_file_confirm_accepts_case_insensitive_extension_for_actual_file() {
+        let directory = tempfile::tempdir().expect("create tempdir");
+        let path = directory.path().join("sample.TORRENT");
+        std::fs::write(&path, []).expect("create selected file");
+        let state = TreeViewState {
+            cursor_path: Some(path.clone()),
+            ..Default::default()
+        };
+        let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
+
+        assert_eq!(selected_torrent_file_for_confirm(&state, &mode), Some(path));
+    }
+
+    #[tokio::test]
+    async fn uppercase_torrent_selection_queues_add_command_before_closing_browser() {
+        let directory = tempfile::tempdir().expect("create tempdir");
+        let path = directory.path().join("sample.TORRENT");
+        std::fs::write(&path, []).expect("create selected file");
+        let mut app = app_with_existing_torrent(AppMode::Normal).await;
+        while app.app_command_rx.try_recv().is_ok() {}
+        app.app_state.mode = AppMode::FileBrowser;
+        app.app_state.screen_area = Rect::new(0, 0, 120, 40);
+        app.app_state.ui.file_browser.browser_mode =
+            FileBrowserMode::File(vec![".torrent".to_string()]);
+        app.app_state.ui.file_browser.state.cursor_path = Some(path.clone());
+        app.app_state.ui.file_browser.data =
+            vec![filesystem_node("sample.TORRENT", path.clone(), false)];
+        app.app_state.ui.file_browser.fetch_pending = false;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE)),
+            &mut app,
+        )
+        .await;
+
+        let queued =
+            tokio::time::timeout(std::time::Duration::from_secs(1), app.app_command_rx.recv())
+                .await
+                .expect("timed out waiting for add command")
+                .expect("app command channel closed");
+        assert!(matches!(
+            queued,
+            AppCommand::AddTorrentFromFile(queued_path) if queued_path == path
+        ));
+        assert!(matches!(app.app_state.mode, AppMode::Normal));
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[test]
+    fn selected_file_confirm_rejects_directory_with_matching_suffix() {
+        let directory = tempfile::tempdir().expect("create tempdir");
+        let path = directory.path().join("folder.torrent");
+        std::fs::create_dir(&path).expect("create suffixed directory");
+        let state = TreeViewState {
+            cursor_path: Some(path),
+            ..Default::default()
+        };
+        let mode = FileBrowserMode::File(vec![".torrent".to_string()]);
+
+        assert_eq!(selected_torrent_file_for_confirm(&state, &mode), None);
     }
 
     #[test]
