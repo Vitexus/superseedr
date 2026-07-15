@@ -4,7 +4,10 @@
 #import <AppKit/AppKit.h>
 #import <CoreServices/CoreServices.h>
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#include <fcntl.h>
+#include <stdarg.h>
 #include <string.h>
+#include <unistd.h>
 
 #ifndef SUPERSEEDR_BINARY_PATH
 #define SUPERSEEDR_BINARY_PATH "/usr/local/bin/superseedr"
@@ -23,25 +26,110 @@ static NSString *const SuperseedrBundleIdentifier = @SUPERSEEDR_BUNDLE_IDENTIFIE
 static NSString *const SuperseedrBinaryPath = @SUPERSEEDR_BINARY_PATH;
 static NSString *const MagnetScheme = @SUPERSEEDR_MAGNET_SCHEME;
 static NSString *const TorrentTypeIdentifier = @SUPERSEEDR_TORRENT_TYPE_IDENTIFIER;
+static NSString *const HandlerLogRelativeDirectory =
+    @"com.github.jagalite.superseedr/logs/handler";
+static NSString *const HandlerLogFilename = @"handler.log";
+static const unsigned long long HandlerLogRotationBytes = 1024 * 1024;
 
-static BOOL handlerMatches(CFStringRef handler) {
-    if (handler == NULL) {
-        return NO;
+static NSString *handlerLogDirectory(void) {
+    NSArray<NSString *> *applicationSupportDirectories =
+        NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
+                                            NSUserDomainMask, YES);
+    if (applicationSupportDirectories.count == 0) {
+        return nil;
     }
-
-    BOOL matches = CFEqual(handler, (__bridge CFStringRef)SuperseedrBundleIdentifier);
-    CFRelease(handler);
-    return matches;
+    return [applicationSupportDirectories.firstObject
+        stringByAppendingPathComponent:HandlerLogRelativeDirectory];
 }
 
-static BOOL magnetHandlerIsCurrent(void) {
-    return handlerMatches(
+static void rotateHandlerLogIfNeeded(NSString *logPath) {
+    NSDictionary<NSFileAttributeKey, id> *attributes =
+        [NSFileManager.defaultManager attributesOfItemAtPath:logPath error:nil];
+    NSNumber *fileSize = attributes[NSFileSize];
+    if (fileSize == nil || fileSize.unsignedLongLongValue < HandlerLogRotationBytes) {
+        return;
+    }
+
+    NSString *rotatedPath = [logPath stringByAppendingString:@".1"];
+    [NSFileManager.defaultManager removeItemAtPath:rotatedPath error:nil];
+    [NSFileManager.defaultManager moveItemAtPath:logPath
+                                          toPath:rotatedPath
+                                           error:nil];
+}
+
+static void handlerLog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+static void handlerLog(NSString *format, ...) {
+    va_list arguments;
+    va_start(arguments, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:arguments];
+    va_end(arguments);
+
+    // Keep a copy in Unified Logging as well as the user-accessible support log.
+    NSLog(@"%@", message);
+
+    NSString *logDirectory = handlerLogDirectory();
+    if (logDirectory == nil) {
+        return;
+    }
+
+    NSError *directoryError = nil;
+    if (![NSFileManager.defaultManager
+            createDirectoryAtPath:logDirectory
+      withIntermediateDirectories:YES
+                       attributes:@{NSFilePosixPermissions : @0700}
+                            error:&directoryError]) {
+        NSLog(@"Unable to create handler log directory: %@",
+              directoryError.localizedDescription);
+        return;
+    }
+
+    NSString *logPath = [logDirectory stringByAppendingPathComponent:HandlerLogFilename];
+    rotateHandlerLogIfNeeded(logPath);
+
+    NSString *timestamp = [NSISO8601DateFormatter stringFromDate:NSDate.date
+                                                        timeZone:NSTimeZone.localTimeZone
+                                                   formatOptions:NSISO8601DateFormatWithInternetDateTime];
+    NSData *line = [[NSString stringWithFormat:@"%@ %@\n", timestamp, message]
+        dataUsingEncoding:NSUTF8StringEncoding];
+    int descriptor = open(logPath.fileSystemRepresentation,
+                          O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (descriptor < 0) {
+        return;
+    }
+
+    const uint8_t *bytes = line.bytes;
+    NSUInteger remaining = line.length;
+    while (remaining > 0) {
+        ssize_t written = write(descriptor, bytes, remaining);
+        if (written <= 0) {
+            break;
+        }
+        bytes += written;
+        remaining -= (NSUInteger)written;
+    }
+    close(descriptor);
+}
+
+static NSString *defaultMagnetHandler(void) {
+    return CFBridgingRelease(
         LSCopyDefaultHandlerForURLScheme((__bridge CFStringRef)MagnetScheme));
 }
 
-static BOOL torrentHandlerIsCurrent(void) {
-    return handlerMatches(LSCopyDefaultRoleHandlerForContentType(
+static NSString *defaultTorrentHandler(void) {
+    return CFBridgingRelease(LSCopyDefaultRoleHandlerForContentType(
         (__bridge CFStringRef)TorrentTypeIdentifier, kLSRolesAll));
+}
+
+static BOOL handlerMatches(NSString *handler) {
+    return [handler isEqualToString:SuperseedrBundleIdentifier];
+}
+
+static BOOL magnetHandlerIsCurrent(void) {
+    return handlerMatches(defaultMagnetHandler());
+}
+
+static BOOL torrentHandlerIsCurrent(void) {
+    return handlerMatches(defaultTorrentHandler());
 }
 
 static BOOL handlersAreCurrent(void) {
@@ -54,6 +142,7 @@ static BOOL handlersAreCurrent(void) {
 @property(nonatomic) BOOL terminationScheduled;
 @property(nonatomic) NSInteger pendingRegistrationUpdates;
 @property(nonatomic) BOOL registrationFailed;
+- (void)finishRegistrationUpdate:(NSError *)error label:(NSString *)label;
 @end
 
 @implementation SuperseedrHandlerDelegate
@@ -68,6 +157,8 @@ static BOOL handlersAreCurrent(void) {
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
     (void)notification;
+    handlerLog(@"handler launched mode=%@",
+               self.forceRegistration ? @"registration" : @"open");
     NSTimeInterval delay = self.forceRegistration ? 0.0 : 0.5;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -94,7 +185,7 @@ static BOOL handlersAreCurrent(void) {
             [self forwardSource:url.absoluteString];
             handledOpenEvent = YES;
         } else {
-            NSLog(@"Ignoring unsupported URL scheme: %@", url.scheme);
+            handlerLog(@"ignored unsupported URL scheme=%@", url.scheme);
         }
     }
 
@@ -120,8 +211,14 @@ static BOOL handlersAreCurrent(void) {
 
     NSError *error = nil;
     if (![task launchAndReturnError:&error]) {
-        NSLog(@"Unable to forward source to superseedr: %@", error.localizedDescription);
+        handlerLog(@"forward failed kind=%@ error_domain=%@ error_code=%ld",
+                   [source hasPrefix:@"magnet:"] ? @"magnet" : @"torrent",
+                   error.domain, (long)error.code);
+        return;
     }
+    handlerLog(@"forward launched kind=%@ pid=%d",
+               [source hasPrefix:@"magnet:"] ? @"magnet" : @"torrent",
+               task.processIdentifier);
 }
 
 - (void)scheduleTermination {
@@ -136,9 +233,14 @@ static BOOL handlersAreCurrent(void) {
 }
 
 - (void)registerDefaultHandlers {
+    NSString *magnetBefore = defaultMagnetHandler() ?: @"<none>";
+    NSString *torrentBefore = defaultTorrentHandler() ?: @"<none>";
     BOOL updateMagnetHandler = !magnetHandlerIsCurrent();
     BOOL updateTorrentHandler = !torrentHandlerIsCurrent();
+    handlerLog(@"registration starting magnet_before=%@ torrent_before=%@",
+               magnetBefore, torrentBefore);
     if (!updateMagnetHandler && !updateTorrentHandler) {
+        handlerLog(@"registration skipped reason=already_current");
         [NSApp terminate:nil];
         return;
     }
@@ -165,7 +267,10 @@ static BOOL handlersAreCurrent(void) {
     }
 
     if (magnetStatus != noErr || torrentStatus != noErr || !handlersAreCurrent()) {
-        NSLog(@"Unable to set default handlers (%d, %d)", magnetStatus, torrentStatus);
+        handlerLog(@"registration soft_failed api=legacy magnet_status=%d torrent_status=%d",
+                   magnetStatus, torrentStatus);
+    } else {
+        handlerLog(@"registration verified api=legacy magnet=yes torrent=yes");
     }
     [NSApp terminate:nil];
 }
@@ -182,7 +287,7 @@ static BOOL handlersAreCurrent(void) {
                         toOpenURLsWithScheme:MagnetScheme
                            completionHandler:^(NSError *error) {
                                dispatch_async(dispatch_get_main_queue(), ^{
-                                   [self finishRegistrationUpdate:error];
+                                   [self finishRegistrationUpdate:error label:@"magnet"];
                                });
                            }];
     }
@@ -194,7 +299,7 @@ static BOOL handlersAreCurrent(void) {
                             toOpenContentType:torrentType
                            completionHandler:^(NSError *error) {
                                dispatch_async(dispatch_get_main_queue(), ^{
-                                   [self finishRegistrationUpdate:error];
+                                   [self finishRegistrationUpdate:error label:@"torrent"];
                                });
                            }];
     }
@@ -202,23 +307,30 @@ static BOOL handlersAreCurrent(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
                        if (self.pendingRegistrationUpdates > 0) {
-                           NSLog(@"Timed out while setting default handlers");
+                           handlerLog(@"registration soft_failed reason=timeout pending=%ld",
+                                      (long)self.pendingRegistrationUpdates);
                            [NSApp terminate:nil];
                        }
                    });
 }
 
-- (void)finishRegistrationUpdate:(NSError *)error API_AVAILABLE(macos(12.0)) {
+- (void)finishRegistrationUpdate:(NSError *)error
+                            label:(NSString *)label API_AVAILABLE(macos(12.0)) {
     if (error != nil) {
         self.registrationFailed = YES;
-        NSLog(@"Unable to set a default handler: %@", error.localizedDescription);
+        handlerLog(@"registration update soft_failed kind=%@ error_domain=%@ error_code=%ld",
+                   label, error.domain, (long)error.code);
+    } else {
+        handlerLog(@"registration update completed kind=%@", label);
     }
     self.pendingRegistrationUpdates -= 1;
     if (self.pendingRegistrationUpdates == 0) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
                        dispatch_get_main_queue(), ^{
                            if (!self.registrationFailed && !handlersAreCurrent()) {
-                               NSLog(@"Default handler verification failed");
+                               handlerLog(@"registration soft_failed reason=verification");
+                           } else if (!self.registrationFailed) {
+                               handlerLog(@"registration verified api=modern magnet=yes torrent=yes");
                            }
                            [NSApp terminate:nil];
                        });
@@ -230,7 +342,14 @@ static BOOL handlersAreCurrent(void) {
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         if (argc == 2 && strcmp(argv[1], "--verify") == 0) {
-            return handlersAreCurrent() ? EXIT_SUCCESS : EXIT_FAILURE;
+            NSString *magnet = defaultMagnetHandler() ?: @"<none>";
+            NSString *torrent = defaultTorrentHandler() ?: @"<none>";
+            BOOL verified = handlersAreCurrent();
+            printf("magnet=%s\ntorrent=%s\nverified=%s\n",
+                   magnet.UTF8String, torrent.UTF8String, verified ? "true" : "false");
+            handlerLog(@"verification magnet=%@ torrent=%@ verified=%@",
+                       magnet, torrent, verified ? @"yes" : @"no");
+            return verified ? EXIT_SUCCESS : EXIT_FAILURE;
         }
 
         BOOL forceRegistration =
