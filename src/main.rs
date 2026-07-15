@@ -2177,6 +2177,7 @@ fn process_cli_request(
     output_mode: OutputMode,
 ) -> io::Result<()> {
     if let Some(direct_input) = &cli.input {
+        #[cfg(all(feature = "dht", feature = "pex"))]
         tracing::info!("Processing direct input: {}", direct_input);
         let command_path = queue_direct_input_command(settings, direct_input)?;
         print_success(
