@@ -1935,7 +1935,6 @@ pub(crate) struct TorrentManagementReviewCache {
     pub(crate) resume: Vec<String>,
     pub(crate) delete: Vec<String>,
     pub(crate) purge: Vec<String>,
-    pub(crate) purge_total_bytes: u64,
     pub(crate) longest_line_width: usize,
 }
 

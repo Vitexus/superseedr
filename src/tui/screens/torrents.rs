@@ -1152,6 +1152,7 @@ fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &Theme
         fallback_groups = pending_management_review_groups(app_state);
         &fallback_groups
     };
+    let purge_total_bytes = pending_management_purge_total_bytes(app_state);
     let area = management_review_popup_area(f.area(), groups);
     f.render_widget(Clear, area);
 
@@ -1167,7 +1168,7 @@ fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &Theme
     f.render_widget(block, area);
 
     let regions = management_review_regions(area);
-    let sections = pending_management_review_sections(groups);
+    let sections = pending_management_review_sections(groups, purge_total_bytes);
     let line_count = pending_management_review_line_count(&sections);
     let body_height = regions.body.height as usize;
     let max_scroll = line_count.saturating_sub(body_height);
@@ -1210,12 +1211,13 @@ fn draw_management_review_panel(f: &mut Frame, app_state: &AppState, ctx: &Theme
         f.render_stateful_widget(scrollbar, regions.body, &mut scrollbar_state);
     }
 
-    draw_management_review_summary(f, groups, regions, ctx);
+    draw_management_review_summary(f, groups, purge_total_bytes, regions, ctx);
     draw_management_review_footer(f, groups, regions, scroll_offset, line_count, ctx);
 }
 
 fn pending_management_review_sections(
     groups: &TorrentManagementReviewCache,
+    purge_total_bytes: u64,
 ) -> Vec<ManagementReviewSection<'_>> {
     let mut sections = Vec::new();
     if !groups.pause.is_empty() {
@@ -1243,7 +1245,7 @@ fn pending_management_review_sections(
         sections.push(ManagementReviewSection {
             action: ManagementReviewAction::Purge,
             names: &groups.purge,
-            detail: Some(format_gb(groups.purge_total_bytes)),
+            detail: Some(format_gb(purge_total_bytes)),
         });
     }
     sections
@@ -1482,7 +1484,7 @@ fn pending_management_review_popup_width(
 }
 
 fn pending_management_review_longest_line_width(groups: &TorrentManagementReviewCache) -> usize {
-    let sections = pending_management_review_sections(groups);
+    let sections = pending_management_review_sections(groups, 0);
     let mut longest = terminal_text_width(" Review Queued Changes ");
     for section in sections {
         longest = longest.max(terminal_text_width(&format!(
@@ -1540,9 +1542,10 @@ fn management_review_compact_visible_range(
 
 fn management_review_compact_purge_safety_label(
     groups: &TorrentManagementReviewCache,
+    purge_total_bytes: u64,
     max_width: usize,
 ) -> String {
-    let size = format_gb(groups.purge_total_bytes);
+    let size = format_gb(purge_total_bytes);
     let candidates = [
         format!("PURGE {} • DELETE FILES • {size}", groups.purge.len()),
         format!("PURGE {} • FILES • {size}", groups.purge.len()),
@@ -1558,6 +1561,7 @@ fn management_review_compact_purge_safety_label(
 fn draw_management_review_summary(
     f: &mut Frame,
     groups: &TorrentManagementReviewCache,
+    purge_total_bytes: u64,
     regions: ManagementReviewRegions,
     ctx: &ThemeContext,
 ) {
@@ -1582,7 +1586,11 @@ fn draw_management_review_summary(
     let total = pending_management_review_total(groups);
     if regions.compact || summary_content.height == 1 {
         let mut label = if !groups.purge.is_empty() && summary_content.height == 1 {
-            management_review_compact_purge_safety_label(groups, summary_content.width as usize)
+            management_review_compact_purge_safety_label(
+                groups,
+                purge_total_bytes,
+                summary_content.width as usize,
+            )
         } else {
             format!("{total} queued")
         };
@@ -1612,7 +1620,7 @@ fn draw_management_review_summary(
             ))),
             count_area,
         );
-        draw_management_review_safety_detail(f, groups, summary_content, ctx);
+        draw_management_review_safety_detail(f, groups, purge_total_bytes, summary_content, ctx);
         return;
     }
 
@@ -1651,12 +1659,13 @@ fn draw_management_review_summary(
     }
     f.render_widget(Paragraph::new(Line::from(spans)), count_area);
 
-    draw_management_review_safety_detail(f, groups, summary_content, ctx);
+    draw_management_review_safety_detail(f, groups, purge_total_bytes, summary_content, ctx);
 }
 
 fn draw_management_review_safety_detail(
     f: &mut Frame,
     groups: &TorrentManagementReviewCache,
+    purge_total_bytes: u64,
     summary_content: Rect,
     ctx: &ThemeContext,
 ) {
@@ -1675,13 +1684,13 @@ fn draw_management_review_safety_detail(
             if detail_area.width >= 52 {
                 format!(
                     "Purge permanently removes downloaded files • {}",
-                    format_gb(groups.purge_total_bytes)
+                    format_gb(purge_total_bytes)
                 )
             } else {
                 format!(
                     "PURGE {} • files • {}",
                     groups.purge.len(),
-                    format_gb(groups.purge_total_bytes)
+                    format_gb(purge_total_bytes)
                 )
             },
             ctx.state_error(),
@@ -2654,9 +2663,6 @@ fn pending_management_review_groups(app_state: &AppState) -> TorrentManagementRe
             ControlRequest::Delete {
                 delete_files: true, ..
             } => {
-                groups.purge_total_bytes = groups
-                    .purge_total_bytes
-                    .saturating_add(pending_management_command_total_size(app_state, command));
                 groups.purge.push(name);
             }
             ControlRequest::Delete {
@@ -2672,6 +2678,26 @@ fn pending_management_review_groups(app_state: &AppState) -> TorrentManagementRe
     groups.purge.sort();
     groups.longest_line_width = pending_management_review_longest_line_width(&groups);
     groups
+}
+
+fn pending_management_purge_total_bytes(app_state: &AppState) -> u64 {
+    app_state
+        .ui
+        .torrent_management
+        .pending_commands
+        .iter()
+        .filter(|command| {
+            matches!(
+                &command.request,
+                ControlRequest::Delete {
+                    delete_files: true,
+                    ..
+                }
+            )
+        })
+        .fold(0, |total, command| {
+            total.saturating_add(pending_management_command_total_size(app_state, command))
+        })
 }
 
 fn pending_management_command_total_size(
@@ -4685,8 +4711,14 @@ mod tests {
         assert_eq!(groups.pause, vec!["Cinder Trails S01E01"]);
         assert_eq!(groups.delete, vec!["Cinder Trails S01E02"]);
         assert_eq!(groups.purge, vec!["Meadow Saga S01E01"]);
-        assert_eq!(groups.purge_total_bytes, 2_500_000_000);
-        assert_eq!(format_gb(groups.purge_total_bytes), "2.50 GB");
+        assert_eq!(
+            pending_management_purge_total_bytes(&app_state),
+            2_500_000_000
+        );
+        assert_eq!(
+            format_gb(pending_management_purge_total_bytes(&app_state)),
+            "2.50 GB"
+        );
         assert!(groups.resume.is_empty());
     }
 
@@ -4820,6 +4852,38 @@ mod tests {
     }
 
     #[test]
+    fn open_review_refreshes_purge_size_when_metadata_arrives() {
+        let mut app_state =
+            app_state_with_torrents(vec![(hash(1), "Pending Metadata Packet", 100, 10, 2)]);
+        app_state.ui.torrent_management.pending_commands = vec![TorrentManagementPendingCommand {
+            request: ControlRequest::Delete {
+                info_hash_hex: hex::encode(hash(1)),
+                delete_files: true,
+            },
+            info_hash: hash(1),
+            state: TorrentControlState::Deleting,
+            delete_files: true,
+        }];
+        reduce_torrent_management_action(
+            &mut app_state,
+            TorrentManagementAction::ShowSubmitConfirmation,
+        );
+        assert!(app_state.ui.torrent_management.review_cache.is_some());
+
+        app_state
+            .torrents
+            .get_mut(&hash(1))
+            .expect("torrent")
+            .latest_state
+            .total_size = 2_500_000_000;
+
+        let rendered = render_management_screen(&mut app_state, 40, 20);
+
+        assert!(rendered.contains("PURGE: 1 Torrent (2.50 GB)"));
+        assert!(app_state.ui.torrent_management.review_cache.is_some());
+    }
+
+    #[test]
     fn review_truncates_wide_unicode_by_terminal_width() {
         let wide_name = format!("{}alpha.bin", "界".repeat(24));
         let mut app_state =
@@ -4843,7 +4907,7 @@ mod tests {
         app_state.screen_area = Rect::new(0, 0, 45, 18);
 
         let groups = pending_management_review_groups(&app_state);
-        let sections = pending_management_review_sections(&groups);
+        let sections = pending_management_review_sections(&groups, 0);
 
         assert_eq!(sections.len(), 1);
         assert_eq!(pending_management_review_line_count(&sections), 2);
@@ -5113,7 +5177,7 @@ mod tests {
             pause: names,
             ..Default::default()
         };
-        let sections = pending_management_review_sections(&groups);
+        let sections = pending_management_review_sections(&groups, 0);
         let ctx = ThemeContext::new(Default::default(), 0.0);
 
         let visible = pending_management_review_visible_lines(&sections, 65_540, 1, 40, &ctx);
@@ -5213,7 +5277,7 @@ mod tests {
         assert_eq!(summary.remove_count, 1);
         assert_eq!(summary.purge_count, 1);
         let groups = pending_management_review_groups(&app_state);
-        let sections = pending_management_review_sections(&groups);
+        let sections = pending_management_review_sections(&groups, 0);
         assert_eq!(
             pending_management_review_summary_line_count(&summary),
             pending_management_review_line_count(&sections)
