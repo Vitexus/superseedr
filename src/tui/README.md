@@ -55,9 +55,11 @@
   - `x` toggles anonymized torrent names.
   - `h`/`l` or `←`/`→` moves between visible columns; `s` sorts by the focused column.
   - `Space` multi-selects the focused torrent; `A` selects all visible torrents.
-  - `p`, `d`, and `D` queue pause/resume, remove, and purge actions for selected torrents.
-  - `Y` opens the draft-command confirmation when commands are queued; `Y` again submits confirmed draft commands.
-  - `u` clears draft commands for the current target set.
+  - `p`, `d`, and `D` queue pause/resume, remove, and purge actions while preserving the selected target set.
+  - `Y` opens the draft-command confirmation when commands are queued; `Enter` submits from review.
+  - `u` clears the current selection and any draft commands for that target set.
+  - Held shortcuts reported as key repeats cannot toggle actions repeatedly; deliberate Press events remain reusable on terminals without key-release reporting.
+  - Review mode supports `j`/`k`, arrows, Page Up/Down, Home, and End for scrolling large batches.
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:

@@ -44,6 +44,7 @@ use crate::tui::layout::normal::LayoutContext;
 use crate::tui::layout::normal::LayoutPlan;
 use crate::tui::layout::normal::DEFAULT_SIDEBAR_PERCENT;
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::torrents;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
 use chrono::{DateTime, Utc};
 use rand::rngs::StdRng;
@@ -7039,9 +7040,10 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             app.app_state.mode = AppMode::Journal;
         }
         UiEffect::OpenTorrentManagementScreen => {
-            app.app_state.ui.torrent_management.selected_index = 0;
             app.app_state.ui.torrent_management.status_message = None;
+            app.app_state.ui.torrent_management.review_scroll_offset = 0;
             app.app_state.mode = AppMode::TorrentManagement;
+            torrents::initialize_torrent_management_cursor(&mut app.app_state);
         }
         UiEffect::HandlePastedText(text) => {
             handle_pasted_text(app, &text).await;
