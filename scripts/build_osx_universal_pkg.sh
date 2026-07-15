@@ -13,7 +13,6 @@ INPUT_VERSION=$1       # e.g., v1.2.0
 NAME_SUFFIX=$2         # e.g., "normal" or "private"
 INSTALLER_CERT_NAME=$3 # e.g., "Developer ID Installer: Your Name (TEAMID)"
 shift 3                # Consume the first three arguments
-CARGO_FLAGS=("$@")     # Use all remaining arguments as flags
 
 # Derive the Application certificate name from the Installer one
 APP_CERT_NAME=$(echo "${INSTALLER_CERT_NAME}" | sed 's/Installer/Application/')
@@ -96,10 +95,10 @@ echo "-------------------------------------------"
 
 # --- 2. BUILD THE MAIN RUST TUI BINARIES (FOR BOTH ARCHS) ---
 echo "Building main TUI binary for Apple Silicon (aarch64)..."
-cargo build --target aarch64-apple-darwin --release "${CARGO_FLAGS[@]}"
+cargo build --target aarch64-apple-darwin --release "$@"
 
 echo "Building main TUI binary for Intel (x86_64)..."
-cargo build --target x86_64-apple-darwin --release "${CARGO_FLAGS[@]}"
+cargo build --target x86_64-apple-darwin --release "$@"
 
 # --- 3. CREATE UNIVERSAL (FAT) BINARY ---
 # --- Safety Check: Binaries ---
