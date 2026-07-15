@@ -79,17 +79,32 @@ static BOOL handlersAreCurrent(void) {
 
 - (void)application:(NSApplication *)application openURLs:(NSArray<NSURL *> *)urls {
     (void)application;
-    self.receivedOpenEvent = YES;
+    if (self.forceRegistration) {
+        // The package installer launches the app solely to change defaults.
+        // Ignore any synthetic open event LaunchServices sends at startup.
+        return;
+    }
+
+    BOOL handledOpenEvent = NO;
     for (NSURL *url in urls) {
         if (url.isFileURL) {
             [self forwardSource:url.path];
+            handledOpenEvent = YES;
         } else if ([url.scheme caseInsensitiveCompare:MagnetScheme] == NSOrderedSame) {
             [self forwardSource:url.absoluteString];
+            handledOpenEvent = YES;
         } else {
             NSLog(@"Ignoring unsupported URL scheme: %@", url.scheme);
         }
     }
-    [self scheduleTermination];
+
+    // LaunchServices can deliver an empty openURLs callback during an ordinary
+    // application launch. Do not let that callback cancel the registration
+    // path used by the package postinstall script.
+    if (handledOpenEvent) {
+        self.receivedOpenEvent = YES;
+        [self scheduleTermination];
+    }
 }
 
 - (void)forwardSource:(NSString *)source {
