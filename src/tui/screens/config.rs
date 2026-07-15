@@ -22,7 +22,6 @@ const UNLIMITED_RATE_LIMIT_BPS: u64 = crate::config::UNLIMITED_RATE_LIMIT_BPS;
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigAction {
     Exit,
-    SwitchPane,
     StartEditOrBrowse,
     ShiftSelected,
     SetSelectedBool(bool),
@@ -366,7 +365,6 @@ fn map_key_to_config_action(
 
     match key_code {
         KeyCode::Esc | KeyCode::Char('q' | 'Q') => Some(ConfigAction::Exit),
-        KeyCode::Tab | KeyCode::BackTab => Some(ConfigAction::SwitchPane),
         KeyCode::Enter | KeyCode::Char('e') => Some(ConfigAction::StartEditOrBrowse),
         KeyCode::Char(' ') => Some(ConfigAction::ShiftSelected),
         KeyCode::Char('t') => Some(ConfigAction::SetSelectedBool(true)),
@@ -431,9 +429,6 @@ pub fn reduce_config_action(
     let mut result = ConfigReduceResult::default();
     match action {
         ConfigAction::Exit => {
-            result.consumed = true;
-        }
-        ConfigAction::SwitchPane => {
             result.consumed = true;
         }
         ConfigAction::StartEditOrBrowse => {
@@ -832,21 +827,14 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>, state: ConfigDrawState<'_
             ),
         }
     } else {
-        render_settings_pane(
-            f,
-            &render_ctx,
-            items,
-            selected_index,
-            plan.list_pane,
-            active_pane == ConfigPane::Settings,
-        );
+        render_settings_pane(f, &render_ctx, items, selected_index, plan.list_pane, true);
         render_details_pane(
             f,
             &render_ctx,
             active_item,
             active_descriptor,
             plan.details_pane,
-            active_pane == ConfigPane::Details,
+            false,
         );
     }
 
@@ -1793,7 +1781,7 @@ fn render_config_footer(
     } else if render_ctx.layout_kind == ConfigLayoutKind::Compact
         && active_pane == ConfigPane::Settings
     {
-        actions.push(("Enter/Tab", "details", ActionTone::Open));
+        actions.push(("Enter/e", "details", ActionTone::Open));
         actions.push(("Esc", "close", ActionTone::Cancel));
         actions.push(("↑/↓", "setting", ActionTone::Navigate));
     } else {
@@ -1816,10 +1804,9 @@ fn render_config_footer(
         }
         if render_ctx.layout_kind == ConfigLayoutKind::Compact && active_pane == ConfigPane::Details
         {
-            actions.push(("Esc/Tab", "settings", ActionTone::Mode));
+            actions.push(("Esc", "settings", ActionTone::Mode));
         } else {
             actions.push(("Esc", "close", ActionTone::Cancel));
-            actions.push(("Tab", "pane", ActionTone::Mode));
         }
         if !locked {
             actions.push(("r", "reset", ActionTone::Clear));
@@ -2023,14 +2010,6 @@ pub fn handle_event(event: CrosstermEvent, ctx: ConfigHandleContext<'_>) -> Opti
                 } else {
                     exit_config(ctx.mode, ctx.file_browser_generation);
                 }
-                return None;
-            }
-
-            if action == ConfigAction::SwitchPane {
-                *ctx.active_pane = match *ctx.active_pane {
-                    ConfigPane::Settings => ConfigPane::Details,
-                    ConfigPane::Details => ConfigPane::Settings,
-                };
                 return None;
             }
 
@@ -2355,7 +2334,6 @@ mod tests {
         assert!(!rendered.contains("Settings ·"));
         assert!(rendered.contains("Listen Port · Network"));
         assert!(rendered.contains("[Space] edit"));
-        assert!(rendered.contains("[Tab] pane"));
     }
 
     #[test]
@@ -2551,8 +2529,8 @@ mod tests {
         assert!(!settings_rendered.contains("Unlimited"));
         assert!(details_rendered.contains("Listen Port · Network"));
         assert!(!details_rendered.contains("Settings ·"));
-        assert!(settings_rendered.contains("[Enter/Tab] details"));
-        assert!(details_rendered.contains("[Esc/Tab] settings"));
+        assert!(settings_rendered.contains("[Enter/e] details"));
+        assert!(details_rendered.contains("[Esc] settings"));
     }
 
     #[test]
@@ -3029,7 +3007,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_and_backtab_switch_config_panes() {
+    fn tab_and_backtab_do_not_switch_config_panes() {
         let applied = Settings::default();
         let mut settings_edit = Box::new(applied.clone());
         let mut mode = AppMode::Config;
@@ -3042,10 +3020,7 @@ mod tests {
         let (app_command_tx, _app_command_rx) = mpsc::channel(1);
         let (shutdown_tx, _shutdown_rx) = broadcast::channel(1);
 
-        for (key_code, expected_pane) in [
-            (KeyCode::Tab, ConfigPane::Details),
-            (KeyCode::BackTab, ConfigPane::Settings),
-        ] {
+        for key_code in [KeyCode::Tab, KeyCode::BackTab] {
             let update = handle_event(
                 CrosstermEvent::Key(ratatui::crossterm::event::KeyEvent::from(key_code)),
                 ConfigHandleContext {
@@ -3066,7 +3041,7 @@ mod tests {
             );
 
             assert!(update.is_none());
-            assert_eq!(active_pane, expected_pane);
+            assert_eq!(active_pane, ConfigPane::Settings);
         }
     }
 
@@ -3203,7 +3178,7 @@ mod tests {
     }
 
     #[test]
-    fn config_exit_and_pane_switch_shortcuts_are_mapped() {
+    fn config_exit_shortcuts_are_mapped_and_tab_is_ignored() {
         assert_eq!(
             map_key_to_config_action(KeyCode::Esc, &None),
             Some(ConfigAction::Exit)
@@ -3213,14 +3188,8 @@ mod tests {
             Some(ConfigAction::Exit)
         );
         assert_eq!(map_key_to_config_action(KeyCode::Char('s'), &None), None);
-        assert_eq!(
-            map_key_to_config_action(KeyCode::Tab, &None),
-            Some(ConfigAction::SwitchPane)
-        );
-        assert_eq!(
-            map_key_to_config_action(KeyCode::BackTab, &None),
-            Some(ConfigAction::SwitchPane)
-        );
+        assert_eq!(map_key_to_config_action(KeyCode::Tab, &None), None);
+        assert_eq!(map_key_to_config_action(KeyCode::BackTab, &None), None);
     }
 
     #[test]

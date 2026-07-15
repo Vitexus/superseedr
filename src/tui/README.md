@@ -63,7 +63,6 @@
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
-  - `Tab`/`Shift+Tab` switches between the settings and details panes.
   - `Space` shifts boolean and choice settings immediately, opens value editing for the listen port and global rate limits, or opens a path browser; `Left`/`Right` (or `h`/`l`) moves backward/forward through choices; `r` opens reset confirmation for the focused setting.
   - `Enter`/`e` opens the path browser for path settings.
   - In reset confirmation, `Y` restores the default and `Esc` cancels.
@@ -89,7 +88,6 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `Normal` | `z` | `PowerSaving` | Zen mode |
 | `PowerSaving` | `z` | `Normal` | Return from zen |
 | `Normal` | `c` | `Config` | Open settings |
-| `Config` | `Tab` or `Shift+Tab` | `Config` | Switch between settings and details panes |
 | `Config` | completed control change | `Config` | Apply toggles, choices, confirmed resets, and value edits immediately |
 | `Config` | `Esc` or `q` | `Normal` or `Config` | Close immediately; compact details first returns to the settings list |
 | `Normal` | `M` | `TorrentManagement` | Batch torrent management |
