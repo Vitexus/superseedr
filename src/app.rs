@@ -8879,7 +8879,7 @@ impl App {
         let configured_interval = self
             .status_dump_interval_override_secs
             .unwrap_or(self.client_configs.output_status_interval);
-        if configured_interval == 0 && self.is_current_shared_leader() {
+        if configured_interval == 0 && self.is_shared_mode_enabled() {
             5
         } else {
             configured_interval
@@ -17264,7 +17264,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_leader_defaults_status_follow_to_five_seconds() {
+    async fn standalone_zero_status_interval_remains_disabled() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            output_status_interval: 0,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("build standalone app");
+
+        assert_eq!(app.effective_status_dump_interval_secs(), 0);
+        app.reschedule_status_dump_deadline();
+        assert!(app.next_status_dump_at.is_none());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn shared_nodes_default_status_follow_to_five_seconds() {
         let _guard = lock_shared_env();
         let shared_root = tempfile::tempdir().expect("create shared root");
         let effective_root = shared_root.path().join("superseedr-config");
@@ -17287,14 +17305,21 @@ mod tests {
         .expect("write host config");
 
         let settings = crate::config::load_settings().expect("load shared settings");
-        let app = App::new(settings, AppRuntimeMode::SharedLeader)
-            .await
-            .expect("build shared leader app");
+        for runtime_mode in [AppRuntimeMode::SharedLeader, AppRuntimeMode::SharedFollower] {
+            let mut app = App::new(settings.clone(), runtime_mode)
+                .await
+                .expect("build shared app");
 
-        assert_eq!(app.client_configs.output_status_interval, 0);
-        assert_eq!(app.effective_status_dump_interval_secs(), 5);
+            assert_eq!(app.client_configs.output_status_interval, 0);
+            assert_eq!(app.effective_status_dump_interval_secs(), 5);
+            app.reschedule_status_dump_deadline();
+            assert!(
+                app.next_status_dump_at.is_some(),
+                "{runtime_mode:?} should keep the shared status timer armed"
+            );
 
-        let _ = app.shutdown_tx.send(());
+            let _ = app.shutdown_tx.send(());
+        }
         if let Some(value) = original_shared_dir {
             env::set_var("SUPERSEEDR_SHARED_CONFIG_DIR", value);
         } else {

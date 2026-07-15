@@ -137,6 +137,7 @@ The project uses model-based testing for protocol correctness. Fuzzing tests run
 - Check TUI rendering in different terminal emulators (iTerm2, Windows Terminal, Alacritty, etc.)
 - Test in both light and dark terminal colour schemes
 - Verify keyboard controls work as expected
+- Before a release, run the full [Release Candidate TUI And CLI Test Runbook](docs/release-candidate-testing.md)
 
 **When contributing code:**
 - Add unit tests for new functionality
