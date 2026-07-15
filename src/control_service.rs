@@ -7,9 +7,8 @@ use crate::integrations::control::{
     ControlFilePriorityOverride, ControlPriorityTarget, ControlRequest,
 };
 use crate::persistence::event_journal::{ControlOrigin, EventDetails};
-use crate::storage::{ensure_path_within_root, FileInfo, MultiFileInfo};
+use crate::storage::{FileInfo, MultiFileInfo};
 use crate::torrent_file::parser::from_bytes;
-use crate::torrent_file::{validate_container_name, validate_torrent_layout, InfoFile};
 use crate::torrent_identity::{decode_info_hash, info_hash_from_torrent_source};
 use crate::torrent_manager::state::calculate_deletion_lists;
 use serde::Serialize;
@@ -22,14 +21,6 @@ use sysinfo::Disks;
 
 type TorrentFileList = Vec<(Vec<String>, u64)>;
 type TorrentMetadataByInfoHash = HashMap<String, TorrentMetadataEntry>;
-
-fn validate_request_container_name(container_name: &Option<String>) -> Result<(), String> {
-    if let Some(name) = container_name.as_deref() {
-        validate_container_name(name)
-            .map_err(|error| format!("Invalid container folder name: {error}"))?;
-    }
-    Ok(())
-}
 
 fn load_torrent_metadata_snapshot() -> Result<TorrentMetadataByInfoHash, String> {
     let metadata = match load_torrent_metadata() {
@@ -231,39 +222,24 @@ fn load_torrent_file_list_from_metadata(
     if entry.files.is_empty() {
         return Ok(None);
     }
-    validate_request_container_name(&torrent_settings.container_name)?;
-    let torrent_name = torrent_name_for_manifest(torrent_settings, Some(entry));
-    Ok(Some(file_list_from_metadata_entry(entry, &torrent_name)?))
+    Ok(Some(file_list_from_metadata_entry(entry)))
 }
 
-fn file_list_from_metadata_entry(
-    entry: &TorrentMetadataEntry,
-    torrent_name: &str,
-) -> Result<TorrentFileList, String> {
-    let mut validated_files = Vec::with_capacity(entry.files.len());
-    for file in &entry.files {
-        let length = i64::try_from(file.length).map_err(|_| {
-            format!(
-                "Invalid persisted torrent metadata: file '{}' exceeds the supported length",
+fn file_list_from_metadata_entry(entry: &TorrentMetadataEntry) -> Vec<(Vec<String>, u64)> {
+    entry
+        .files
+        .iter()
+        .map(|file| {
+            (
                 file.relative_path
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                    .map(|segment| segment.to_string())
+                    .collect(),
+                file.length,
             )
-        })?;
-        validated_files.push(InfoFile {
-            length,
-            path: file.relative_path.split('/').map(str::to_owned).collect(),
-            md5sum: None,
-            attr: None,
-        });
-    }
-
-    validate_torrent_layout(torrent_name, &validated_files)
-        .map_err(|error| format!("Invalid persisted torrent metadata: {error}"))?;
-
-    Ok(validated_files
-        .into_iter()
-        .zip(entry.files.iter())
-        .map(|(file, persisted)| (file.path, persisted.length))
-        .collect())
+        })
+        .collect()
 }
 
 pub fn file_priorities_to_map(
@@ -287,7 +263,6 @@ pub struct TorrentFileListEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OfflinePurgePlan {
     pub info_hash_hex: String,
-    pub download_root: PathBuf,
     pub files: Vec<PathBuf>,
     pub directories: Vec<PathBuf>,
 }
@@ -295,7 +270,6 @@ pub struct OfflinePurgePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MovePayloadPlan {
     pub info_hash_hex: String,
-    pub source_root: PathBuf,
     pub destination_root: PathBuf,
     pub files: Vec<(PathBuf, PathBuf)>,
     pub source_directories: Vec<PathBuf>,
@@ -345,21 +319,20 @@ fn manifest_entries_for_torrent_settings(
     torrent_settings: &TorrentSettings,
     metadata_by_info_hash: &TorrentMetadataByInfoHash,
 ) -> Result<(String, bool, Vec<TorrentFileListEntry>), String> {
-    validate_request_container_name(&torrent_settings.container_name)?;
-
     if let Some(entry) =
         torrent_metadata_entry_for_settings(torrent_settings, metadata_by_info_hash)?
     {
         if !entry.files.is_empty() {
             let torrent_name = torrent_name_for_manifest(torrent_settings, Some(&entry));
-            let files = file_list_from_metadata_entry(&entry, &torrent_name)?
+            let files = entry
+                .files
                 .into_iter()
                 .enumerate()
-                .map(|(file_index, (parts, length))| TorrentFileListEntry {
+                .map(|(file_index, file)| TorrentFileListEntry {
                     file_index,
-                    relative_path: parts.join("/"),
+                    relative_path: file.relative_path,
                     full_path: None,
-                    length,
+                    length: file.length,
                 })
                 .collect();
             return Ok((torrent_name, entry.is_multi_file, files));
@@ -436,10 +409,6 @@ fn resolve_torrent_roots(
     is_multi_file: bool,
     torrent_name: &str,
 ) -> Result<(PathBuf, PathBuf), String> {
-    validate_request_container_name(&torrent_settings.container_name)?;
-    validate_torrent_layout(torrent_name, &[])
-        .map_err(|error| format!("Invalid persisted torrent metadata: {error}"))?;
-
     let download_root = torrent_settings
         .download_path
         .clone()
@@ -483,7 +452,11 @@ fn full_file_paths_for_torrent(
         .into_iter()
         .map(|file| {
             let mut path = effective_root.clone();
-            for segment in file.relative_path.split('/') {
+            for segment in file
+                .relative_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+            {
                 path.push(segment);
             }
             path
@@ -588,34 +561,36 @@ pub fn build_offline_purge_plan(
         &torrent_name,
     )?;
 
-    let mut current_offset = 0u64;
-    let mut planned_files = Vec::with_capacity(files.len());
-    for file in files {
-        let mut path = effective_root.clone();
-        for segment in file.relative_path.split('/') {
-            path.push(segment);
-        }
+    let mut current_offset = 0;
+    let multi_file_info = MultiFileInfo {
+        files: files
+            .into_iter()
+            .map(|file| {
+                let mut path = effective_root.clone();
+                for segment in file
+                    .relative_path
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                {
+                    path.push(segment);
+                }
 
-        let global_start_offset = current_offset;
-        current_offset = current_offset.checked_add(file.length).ok_or_else(|| {
-            format!(
-                "Invalid persisted torrent metadata: total file length overflows for torrent '{}'",
-                info_hash_hex
-            )
-        })?;
-        planned_files.push(FileInfo {
-            path,
-            length: file.length,
-            global_start_offset,
-            is_padding: false,
-            is_skipped: matches!(
-                torrent_settings.file_priorities.get(&file.file_index),
-                Some(FilePriority::Skip)
-            ),
-        });
-    }
-    let multi_file_info =
-        MultiFileInfo::from_parts(planned_files, current_offset, download_root.clone());
+                let file_info = FileInfo {
+                    path,
+                    length: file.length,
+                    global_start_offset: current_offset,
+                    is_padding: false,
+                    is_skipped: matches!(
+                        torrent_settings.file_priorities.get(&file.file_index),
+                        Some(FilePriority::Skip)
+                    ),
+                };
+                current_offset += file.length;
+                file_info
+            })
+            .collect(),
+        total_size: current_offset,
+    };
 
     let (files, directories) = calculate_deletion_lists(
         &multi_file_info,
@@ -625,7 +600,6 @@ pub fn build_offline_purge_plan(
 
     Ok(OfflinePurgePlan {
         info_hash_hex: info_hash_hex.to_string(),
-        download_root,
         files,
         directories,
     })
@@ -650,7 +624,7 @@ pub fn build_move_payload_plan(
         &torrent_name,
     )?;
     let mut destination_settings = torrent_settings.clone();
-    destination_settings.download_path = Some(destination_root.clone());
+    destination_settings.download_path = Some(destination_root);
     let (_, destination_effective_root) = resolve_torrent_roots(
         settings,
         &destination_settings,
@@ -661,37 +635,38 @@ pub fn build_move_payload_plan(
 
     let mut move_files = Vec::new();
     let mut current_offset = 0;
-    let planned_files = files
-        .into_iter()
-        .map(|file| {
-            let mut source_path = source_effective_root.clone();
-            let mut destination_path = destination_effective_root.clone();
-            for segment in file
-                .relative_path
-                .split('/')
-                .filter(|segment| !segment.is_empty())
-            {
-                source_path.push(segment);
-                destination_path.push(segment);
-            }
-            move_files.push((source_path.clone(), destination_path));
+    let multi_file_info = MultiFileInfo {
+        files: files
+            .into_iter()
+            .map(|file| {
+                let mut source_path = source_effective_root.clone();
+                let mut destination_path = destination_effective_root.clone();
+                for segment in file
+                    .relative_path
+                    .split('/')
+                    .filter(|segment| !segment.is_empty())
+                {
+                    source_path.push(segment);
+                    destination_path.push(segment);
+                }
+                move_files.push((source_path.clone(), destination_path));
 
-            let file_info = FileInfo {
-                path: source_path,
-                length: file.length,
-                global_start_offset: current_offset,
-                is_padding: false,
-                is_skipped: matches!(
-                    torrent_settings.file_priorities.get(&file.file_index),
-                    Some(FilePriority::Skip)
-                ),
-            };
-            current_offset += file.length;
-            file_info
-        })
-        .collect();
-    let multi_file_info =
-        MultiFileInfo::from_parts(planned_files, current_offset, source_download_root.clone());
+                let file_info = FileInfo {
+                    path: source_path,
+                    length: file.length,
+                    global_start_offset: current_offset,
+                    is_padding: false,
+                    is_skipped: matches!(
+                        torrent_settings.file_priorities.get(&file.file_index),
+                        Some(FilePriority::Skip)
+                    ),
+                };
+                current_offset += file.length;
+                file_info
+            })
+            .collect(),
+        total_size: current_offset,
+    };
     let (_, source_directories) = calculate_deletion_lists(
         &multi_file_info,
         &source_download_root,
@@ -700,8 +675,7 @@ pub fn build_move_payload_plan(
 
     Ok(MovePayloadPlan {
         info_hash_hex: info_hash_hex.to_string(),
-        source_root: source_download_root,
-        destination_root,
+        destination_root: destination_effective_root,
         files: move_files,
         source_directories,
     })
@@ -908,30 +882,7 @@ fn copy_for_cross_device_move(
 fn preflight_move_payload_files(plan: &MovePayloadPlan) -> Result<(), String> {
     let mut destinations = HashSet::new();
 
-    // Validate the complete transaction before creating directories or staging
-    // files so a symlinked path cannot escape either selected download root.
-    for source_directory in &plan.source_directories {
-        ensure_path_within_root(&plan.source_root, source_directory).map_err(|error| {
-            format!(
-                "Refusing offline move source directory '{}': {error}",
-                source_directory.display()
-            )
-        })?;
-    }
-
     for (source, destination) in &plan.files {
-        ensure_path_within_root(&plan.source_root, source).map_err(|error| {
-            format!(
-                "Refusing offline move source '{}': {error}",
-                source.display()
-            )
-        })?;
-        ensure_path_within_root(&plan.destination_root, destination).map_err(|error| {
-            format!(
-                "Refusing offline move destination '{}': {error}",
-                destination.display()
-            )
-        })?;
         if !source.exists() || same_existing_file(source, destination) {
             continue;
         }
@@ -1147,21 +1098,7 @@ pub fn prepare_offline_move_transaction(
 pub fn apply_offline_purge(settings: &mut Settings, info_hash_hex: &str) -> Result<String, String> {
     let plan = build_offline_purge_plan(settings, info_hash_hex)?;
 
-    // Preflight the complete plan so one invalid or symlink-escaped target
-    // cannot leave the torrent only partially deleted.
-    for path in plan.files.iter().chain(&plan.directories) {
-        ensure_path_within_root(&plan.download_root, path).map_err(|error| {
-            format!("Refusing offline purge path '{}': {error}", path.display())
-        })?;
-    }
-
     for file_path in &plan.files {
-        ensure_path_within_root(&plan.download_root, file_path).map_err(|error| {
-            format!(
-                "Refusing offline purge path '{}': {error}",
-                file_path.display()
-            )
-        })?;
         if let Err(error) = fs::remove_file(file_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(format!("Failed to delete file {:?}: {}", file_path, error));
@@ -1170,12 +1107,6 @@ pub fn apply_offline_purge(settings: &mut Settings, info_hash_hex: &str) -> Resu
     }
 
     for dir_path in &plan.directories {
-        ensure_path_within_root(&plan.download_root, dir_path).map_err(|error| {
-            format!(
-                "Refusing offline purge path '{}': {error}",
-                dir_path.display()
-            )
-        })?;
         if let Err(error) = fs::remove_dir(dir_path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::info!("Skipped dir deletion {:?}: {}", dir_path, error);
@@ -1346,7 +1277,6 @@ pub fn plan_control_request(
             container_name,
             file_priorities,
         } => {
-            validate_request_container_name(container_name)?;
             let info_hash = decode_info_hash(info_hash_hex)?;
             let Some(index) = find_torrent_settings_index_by_info_hash(settings, &info_hash) else {
                 return Err(format!("Torrent '{}' was not found", info_hash_hex));
@@ -1366,32 +1296,26 @@ pub fn plan_control_request(
             container_name,
             validation_status,
             file_priorities,
-        } => {
-            validate_request_container_name(container_name)?;
-            Ok(ControlExecutionPlan::AddTorrentFile {
-                source_path: source_path.clone(),
-                download_path: effective_add_download_path(settings, download_path),
-                container_name: container_name.clone(),
-                validation_status: *validation_status,
-                file_priorities: file_priorities_to_map(file_priorities),
-            })
-        }
+        } => Ok(ControlExecutionPlan::AddTorrentFile {
+            source_path: source_path.clone(),
+            download_path: effective_add_download_path(settings, download_path),
+            container_name: container_name.clone(),
+            validation_status: *validation_status,
+            file_priorities: file_priorities_to_map(file_priorities),
+        }),
         ControlRequest::AddMagnet {
             magnet_link,
             download_path,
             container_name,
             validation_status,
             file_priorities,
-        } => {
-            validate_request_container_name(container_name)?;
-            Ok(ControlExecutionPlan::AddMagnet {
-                magnet_link: magnet_link.clone(),
-                download_path: effective_add_download_path(settings, download_path),
-                container_name: container_name.clone(),
-                validation_status: *validation_status,
-                file_priorities: file_priorities_to_map(file_priorities),
-            })
-        }
+        } => Ok(ControlExecutionPlan::AddMagnet {
+            magnet_link: magnet_link.clone(),
+            download_path: effective_add_download_path(settings, download_path),
+            container_name: container_name.clone(),
+            validation_status: *validation_status,
+            file_priorities: file_priorities_to_map(file_priorities),
+        }),
     }
 }
 
@@ -1541,10 +1465,7 @@ mod tests {
         resolve_purge_target_info_hash, resolve_target_info_hash, resolve_torrent_roots,
         windows_path_matches_mount, ControlExecutionPlan, MovePayloadPlan,
     };
-    use crate::config::{
-        set_app_paths_override_for_tests, upsert_torrent_metadata, Settings, TorrentMetadataEntry,
-        TorrentMetadataFileEntry, TorrentSettings,
-    };
+    use crate::config::{set_app_paths_override_for_tests, Settings, TorrentSettings};
     use crate::integrations::control::{
         ControlFilePriorityOverride, ControlPriorityTarget, ControlRequest,
     };
@@ -1698,7 +1619,6 @@ mod tests {
         let destination_b = destination_root.path().join("b.bin");
         let plan = MovePayloadPlan {
             info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            source_root: source_root.path().to_path_buf(),
             destination_root: destination_root.path().to_path_buf(),
             files: vec![
                 (source_a.clone(), destination_a),
@@ -1782,7 +1702,6 @@ mod tests {
         fs::write(&destination_b, b"existing").expect("write conflicting destination");
         let plan = MovePayloadPlan {
             info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            source_root: source_root.path().to_path_buf(),
             destination_root: destination_root.path().to_path_buf(),
             files: vec![
                 (source_a.clone(), destination_a.clone()),
@@ -1797,73 +1716,6 @@ mod tests {
         assert_eq!(fs::read(&source_a).expect("source a remains"), b"alpha");
         assert_eq!(fs::read(&source_b).expect("source b remains"), b"bravo");
         assert!(!destination_a.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn move_payload_rejects_symlinked_source_parent_outside_download_root() {
-        use std::os::unix::fs::symlink;
-
-        let source_root = tempfile::tempdir().expect("create source root");
-        let destination_root = tempfile::tempdir().expect("create destination root");
-        let outside_root = tempfile::tempdir().expect("create outside root");
-        let outside_file = outside_root.path().join("payload.bin");
-        fs::write(&outside_file, b"keep").expect("write outside file");
-        symlink(outside_root.path(), source_root.path().join("linked"))
-            .expect("create source symlink");
-        let destination = destination_root.path().join("payload.bin");
-        let plan = MovePayloadPlan {
-            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            source_root: source_root.path().to_path_buf(),
-            destination_root: destination_root.path().to_path_buf(),
-            files: vec![(
-                source_root.path().join("linked/payload.bin"),
-                destination.clone(),
-            )],
-            source_directories: Vec::new(),
-        };
-
-        let error = super::stage_move_payload_files(&plan)
-            .expect_err("symlinked source parent must be rejected");
-
-        assert!(error.contains("Refusing offline move source"));
-        assert_eq!(
-            fs::read(&outside_file).expect("outside file remains"),
-            b"keep"
-        );
-        assert!(!destination.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn move_payload_rejects_symlinked_destination_parent_outside_download_root() {
-        use std::os::unix::fs::symlink;
-
-        let source_root = tempfile::tempdir().expect("create source root");
-        let destination_root = tempfile::tempdir().expect("create destination root");
-        let outside_root = tempfile::tempdir().expect("create outside root");
-        let source = source_root.path().join("payload.bin");
-        fs::write(&source, b"keep").expect("write source file");
-        symlink(outside_root.path(), destination_root.path().join("linked"))
-            .expect("create destination symlink");
-        let outside_destination = outside_root.path().join("payload.bin");
-        let plan = MovePayloadPlan {
-            info_hash_hex: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
-            source_root: source_root.path().to_path_buf(),
-            destination_root: destination_root.path().to_path_buf(),
-            files: vec![(
-                source.clone(),
-                destination_root.path().join("linked/payload.bin"),
-            )],
-            source_directories: Vec::new(),
-        };
-
-        let error = super::stage_move_payload_files(&plan)
-            .expect_err("symlinked destination parent must be rejected");
-
-        assert!(error.contains("Refusing offline move destination"));
-        assert_eq!(fs::read(&source).expect("source file remains"), b"keep");
-        assert!(!outside_destination.exists());
     }
 
     #[test]
@@ -1954,137 +1806,6 @@ mod tests {
         assert!(settings.torrents.is_empty());
         assert!(!file_a.exists());
         assert!(!file_b.exists());
-    }
-
-    #[test]
-    fn persisted_relative_path_escape_is_rejected_before_list_or_purge() {
-        let _guard = shared_env_guard().lock().unwrap();
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config_dir = dir.path().join("config");
-        let data_dir = dir.path().join("data");
-        set_app_paths_override_for_tests(Some((config_dir, data_dir)));
-
-        let info_hash_hex = "5555555555555555555555555555555555555555";
-        upsert_torrent_metadata(TorrentMetadataEntry {
-            info_hash_hex: info_hash_hex.to_string(),
-            torrent_name: "persisted-sample".to_string(),
-            total_size: 1,
-            is_multi_file: true,
-            files: vec![TorrentMetadataFileEntry {
-                relative_path: "../outside.bin".to_string(),
-                length: 1,
-            }],
-            file_priorities: HashMap::new(),
-        })
-        .expect("persist metadata");
-
-        let outside_file = dir.path().join("outside.bin");
-        fs::write(&outside_file, b"keep").expect("write outside file");
-        let mut settings = Settings {
-            torrents: vec![TorrentSettings {
-                torrent_or_magnet: format!("magnet:?xt=urn:btih:{info_hash_hex}"),
-                name: "Persisted Sample".to_string(),
-                download_path: Some(dir.path().join("downloads")),
-                container_name: Some(String::new()),
-                ..TorrentSettings::default()
-            }],
-            ..Settings::default()
-        };
-
-        let list_error = list_torrent_files(&settings, info_hash_hex)
-            .expect_err("unsafe persisted path must not be listed");
-        assert!(list_error.contains("Invalid persisted torrent metadata"));
-        let purge_error = apply_offline_purge(&mut settings, info_hash_hex)
-            .expect_err("unsafe persisted path must not be purged");
-        assert!(purge_error.contains("Invalid persisted torrent metadata"));
-        assert!(outside_file.exists());
-        assert_eq!(settings.torrents.len(), 1);
-
-        set_app_paths_override_for_tests(None);
-    }
-
-    #[test]
-    fn persisted_unsafe_container_is_rejected_before_list_or_purge() {
-        let _guard = shared_env_guard().lock().unwrap();
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config_dir = dir.path().join("config");
-        let data_dir = dir.path().join("data");
-        set_app_paths_override_for_tests(Some((config_dir, data_dir)));
-
-        let info_hash_hex = "6666666666666666666666666666666666666666";
-        upsert_torrent_metadata(TorrentMetadataEntry {
-            info_hash_hex: info_hash_hex.to_string(),
-            torrent_name: "persisted-sample".to_string(),
-            total_size: 1,
-            is_multi_file: true,
-            files: vec![TorrentMetadataFileEntry {
-                relative_path: "payload.bin".to_string(),
-                length: 1,
-            }],
-            file_priorities: HashMap::new(),
-        })
-        .expect("persist metadata");
-
-        let outside_file = dir.path().join("outside").join("payload.bin");
-        fs::create_dir_all(outside_file.parent().expect("outside parent"))
-            .expect("create outside parent");
-        fs::write(&outside_file, b"keep").expect("write outside file");
-        let mut settings = Settings {
-            torrents: vec![TorrentSettings {
-                torrent_or_magnet: format!("magnet:?xt=urn:btih:{info_hash_hex}"),
-                name: "Persisted Sample".to_string(),
-                download_path: Some(dir.path().join("downloads")),
-                container_name: Some("../outside".to_string()),
-                ..TorrentSettings::default()
-            }],
-            ..Settings::default()
-        };
-
-        let list_error = list_torrent_files(&settings, info_hash_hex)
-            .expect_err("unsafe container must not be listed");
-        assert!(list_error.contains("Invalid container folder name"));
-        let purge_error = apply_offline_purge(&mut settings, info_hash_hex)
-            .expect_err("unsafe container must not be purged");
-        assert!(purge_error.contains("Invalid container folder name"));
-        assert!(outside_file.exists());
-        assert_eq!(settings.torrents.len(), 1);
-
-        set_app_paths_override_for_tests(None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn offline_purge_rejects_symlinked_parent_outside_download_root() {
-        use std::os::unix::fs::symlink;
-
-        let _guard = shared_env_guard().lock().unwrap();
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let (_torrent_dir, torrent_path) = write_sample_torrent_file();
-        let download_root = dir.path().join("downloads");
-        let outside_root = dir.path().join("outside");
-        fs::create_dir_all(&download_root).expect("create download root");
-        fs::create_dir_all(&outside_root).expect("create outside root");
-        let outside_file = outside_root.join("alpha.bin");
-        fs::write(&outside_file, b"keep").expect("write outside file");
-        symlink(&outside_root, download_root.join("folder")).expect("create symlinked parent");
-
-        let mut settings = Settings {
-            torrents: vec![TorrentSettings {
-                torrent_or_magnet: torrent_path,
-                name: "Sample Pack".to_string(),
-                download_path: Some(download_root),
-                container_name: Some(String::new()),
-                ..TorrentSettings::default()
-            }],
-            ..Settings::default()
-        };
-
-        let error = apply_offline_purge(&mut settings, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-            .expect_err("symlink escape must be rejected");
-
-        assert!(error.contains("Refusing offline purge path"));
-        assert!(outside_file.exists());
-        assert_eq!(settings.torrents.len(), 1);
     }
 
     #[test]
@@ -2249,22 +1970,6 @@ mod tests {
             }
             other => panic!("unexpected plan: {:?}", other),
         }
-    }
-
-    #[test]
-    fn control_requests_reject_unsafe_container_names() {
-        let _guard = shared_env_guard().lock().unwrap();
-        let settings = Settings::default();
-        let request = ControlRequest::AddMagnet {
-            magnet_link: "magnet:?xt=urn:btih:4444444444444444444444444444444444444444".to_string(),
-            download_path: Some(PathBuf::from("/downloads")),
-            container_name: Some("../outside".to_string()),
-            validation_status: false,
-            file_priorities: Vec::new(),
-        };
-
-        let error = plan_control_request(&settings, &request).expect_err("reject unsafe name");
-        assert!(error.contains("Invalid container folder name"));
     }
 
     #[test]

@@ -84,7 +84,6 @@ use crate::integrity_scheduler::{
 use crate::networking::transport::PeerTransportKind;
 use crate::networking::{PeerConnection, TcpPeerTransport, UtpListenerSet, UtpPeerTransport};
 use crate::torrent_file::parser::from_bytes;
-use crate::torrent_file::validate_container_name;
 use crate::torrent_identity::info_hash_from_torrent_source;
 use crate::torrent_manager::data_availability_from_file_probe_result;
 use crate::torrent_manager::FileActivityUpdate;
@@ -3762,10 +3761,6 @@ impl App {
         container_name: Option<String>,
         file_priorities: HashMap<usize, FilePriority>,
     ) -> Result<ControlRequest, String> {
-        if let Some(name) = container_name.as_deref() {
-            validate_container_name(name)
-                .map_err(|error| format!("Invalid container folder name: {error}"))?;
-        }
         let request_source_path = if self.is_current_shared_follower() {
             let staging_dir = Self::shared_add_staging_dir()?;
             fs::create_dir_all(&staging_dir)
@@ -7388,15 +7383,6 @@ impl App {
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
     ) -> CommandIngestResult {
-        if let Some(name) = container_name.as_deref() {
-            if let Err(error) = validate_container_name(name) {
-                return CommandIngestResult::Invalid {
-                    info_hash: None,
-                    torrent_name: None,
-                    message: format!("Invalid container folder name: {error}"),
-                };
-            }
-        }
         let buffer = match fs::read(&path) {
             Ok(buf) => buf,
             Err(e) => {
@@ -7739,15 +7725,6 @@ impl App {
         file_priorities: HashMap<usize, FilePriority>,
         container_name: Option<String>,
     ) -> CommandIngestResult {
-        if let Some(name) = container_name.as_deref() {
-            if let Err(error) = validate_container_name(name) {
-                return CommandIngestResult::Invalid {
-                    info_hash: None,
-                    torrent_name: None,
-                    message: format!("Invalid container folder name: {error}"),
-                };
-            }
-        }
         let magnet = match Magnet::new(&magnet_link) {
             Ok(m) => m,
             Err(e) => {

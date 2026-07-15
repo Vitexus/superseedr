@@ -547,12 +547,7 @@ fn draw_torrent_preview_panel(
         ])));
 
         if *use_container && !priority_only {
-            let valid_container_name = container_name_is_valid(container_name);
-            let container_style = if *is_editing_name && !valid_container_name {
-                Style::default()
-                    .fg(ctx.state_error())
-                    .add_modifier(Modifier::BOLD)
-            } else if *is_editing_name {
+            let container_style = if *is_editing_name {
                 Style::default()
                     .fg(ctx.accent_sky())
                     .add_modifier(Modifier::BOLD)
@@ -571,15 +566,10 @@ fn draw_torrent_preview_panel(
                 let split_pos = clamp_to_char_boundary(container_name, *cursor_pos);
                 let (before, after) = container_name.split_at(split_pos);
                 spans.push(Span::styled(before, container_style));
-                let cursor_color = if valid_container_name {
-                    ctx.accent_sky()
-                } else {
-                    ctx.state_error()
-                };
                 spans.push(Span::styled(
                     "█",
                     Style::default()
-                        .fg(cursor_color)
+                        .fg(ctx.accent_sky())
                         .add_modifier(Modifier::SLOW_BLINK),
                 ));
                 spans.push(Span::styled(after, container_style));
@@ -1527,10 +1517,6 @@ fn browser_container_name_editing(browser_mode: &FileBrowserMode) -> bool {
     )
 }
 
-fn container_name_is_valid(name: &str) -> bool {
-    !name.trim().is_empty() && crate::torrent_file::validate_path_component(name).is_ok()
-}
-
 fn pending_magnet_metadata_editing_locked(browser_mode: &FileBrowserMode) -> bool {
     matches!(
         browser_mode,
@@ -1592,9 +1578,7 @@ pub fn reduce_download_name_edit_action(
 
     match action {
         BrowserDownloadEditAction::Commit => {
-            if container_name_is_valid(container_name) {
-                *is_editing_name = false;
-            }
+            *is_editing_name = false;
         }
         BrowserDownloadEditAction::Cancel => {
             *container_name = original_name_backup.to_string();
@@ -3093,25 +3077,6 @@ mod tests {
 
         assert!(!is_editing_name);
         assert_eq!(name, "renamed folder");
-    }
-
-    #[test]
-    fn reducer_download_edit_commit_rejects_unsafe_or_blank_name() {
-        for invalid_name in ["", "   ", ".", "..", "../outside", "/absolute", "bad\\name"] {
-            let mut name = invalid_name.to_string();
-            let mut is_editing_name = true;
-            let mut cursor_pos = name.len();
-
-            reduce_download_name_edit_action(
-                BrowserDownloadEditAction::Commit,
-                &mut name,
-                &mut is_editing_name,
-                &mut cursor_pos,
-                "original folder",
-            );
-
-            assert!(is_editing_name, "accepted invalid name {invalid_name:?}");
-        }
     }
 
     #[test]

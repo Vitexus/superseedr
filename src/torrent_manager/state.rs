@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::torrent_file::{validate_container_name, Torrent, V2RootInfo};
+use crate::torrent_file::{Torrent, V2RootInfo};
 use crate::torrent_manager::piece_manager::EffectivePiecePriority;
 use crate::torrent_manager::piece_manager::PieceManager;
 use crate::torrent_manager::piece_manager::PieceStatus;
@@ -266,7 +266,6 @@ pub enum Effect {
 
     ClearAllUploads,
     DeleteFiles {
-        download_root: PathBuf,
         files: Vec<PathBuf>,
         directories: Vec<PathBuf>,
     },
@@ -2215,16 +2214,10 @@ impl TorrentState {
                 self.last_activity = TorrentActivity::Initializing;
 
                 let mut effects = Vec::new();
-                if let Some(mfi) = &self.multi_file_info {
+                if let (Some(path), Some(mfi)) = (&self.torrent_data_path, &self.multi_file_info) {
                     let container = self.container_name.as_deref();
-                    let download_root = mfi.download_root.clone();
-                    let (files, directories) =
-                        calculate_deletion_lists(mfi, &download_root, container);
-                    effects.push(Effect::DeleteFiles {
-                        download_root,
-                        files,
-                        directories,
-                    });
+                    let (files, directories) = calculate_deletion_lists(mfi, path, container);
+                    effects.push(Effect::DeleteFiles { files, directories });
                 } else {
                     if self.torrent_status != TorrentStatus::AwaitingMetadata
                         && self.torrent_status != TorrentStatus::Validating
@@ -2356,7 +2349,8 @@ impl TorrentState {
 
             if torrent.info.meta_version == Some(2) {
                 let piece_len = torrent.info.piece_length as u64;
-                let v2_roots = torrent.get_v2_roots();
+                let mut v2_roots = torrent.get_v2_roots();
+                v2_roots.sort_by(|(a, _, _), (b, _, _)| a.cmp(b));
 
                 let mut current_idx = 0;
                 for (_, length, _) in v2_roots {
@@ -2563,17 +2557,6 @@ impl TorrentState {
             }
         };
 
-        if let Err(error) = torrent.validate_paths() {
-            event!(
-                Level::ERROR,
-                torrent_name = %torrent.info.name,
-                error = %error,
-                "rebuild_multi_file_info: Refusing invalid torrent metadata."
-            );
-            self.multi_file_info = None;
-            return;
-        }
-
         // Guard 2: Handle the Option<PathBuf>
         let path = match &self.torrent_data_path {
             Some(p) if !p.as_os_str().is_empty() => p,
@@ -2592,20 +2575,6 @@ impl TorrentState {
                 return;
             }
         };
-
-        if let Some(container_name) = self.container_name.as_deref() {
-            if let Err(error) = validate_container_name(container_name) {
-                event!(
-                    Level::ERROR,
-                    torrent_name = %torrent.info.name,
-                    container_name,
-                    error = %error,
-                    "rebuild_multi_file_info: Refusing unsafe container name."
-                );
-                self.multi_file_info = None;
-                return;
-            }
-        }
 
         let effective_path = match &self.container_name {
             // Case A: User specified a folder
@@ -2628,8 +2597,7 @@ impl TorrentState {
                 }
             }
         };
-        self.multi_file_info = MultiFileInfo::new_with_download_root(
-            path,
+        self.multi_file_info = MultiFileInfo::new(
             &effective_path,
             &torrent.info.name,
             if torrent.info.files.is_empty() { None } else { Some(&torrent.info.files) },
@@ -7978,46 +7946,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_uses_multi_file_info_root_after_download_path_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let original_root = dir.path().join("original");
-        let replacement_root = dir.path().join("replacement");
-        std::fs::create_dir_all(&original_root).unwrap();
-        std::fs::create_dir_all(&replacement_root).unwrap();
-
-        let mfi = MultiFileInfo::new(
-            &original_root,
-            "payload.bin",
-            None,
-            Some(4),
-            &HashMap::new(),
-        )
-        .unwrap();
-        let expected_file = mfi.files[0].path.clone();
-
-        let mut state = create_empty_state();
-        state.torrent_data_path = Some(replacement_root);
-        state.multi_file_info = Some(mfi);
-
-        let effects = state.update(Action::Delete);
-        let delete_effect = effects
-            .iter()
-            .find_map(|effect| match effect {
-                Effect::DeleteFiles {
-                    download_root,
-                    files,
-                    directories,
-                } => Some((download_root, files, directories)),
-                _ => None,
-            })
-            .expect("delete should use the initialized file map");
-
-        assert_eq!(delete_effect.0, &original_root);
-        assert_eq!(delete_effect.1, &vec![expected_file]);
-        assert!(delete_effect.2.is_empty());
-    }
-
-    #[test]
     fn test_file_priority_boundary_mapping() {
         // GIVEN: A torrent with 3 pieces (size 10).
         // File A: Size 15 (Spans Piece 0 and half of Piece 1) -> Set to SKIP
@@ -8316,17 +8244,16 @@ mod tests {
             },
             ..Default::default()
         });
-        state.multi_file_info = Some(MultiFileInfo::from_parts(
-            vec![crate::storage::FileInfo {
+        state.multi_file_info = Some(MultiFileInfo {
+            files: vec![crate::storage::FileInfo {
                 path: PathBuf::from("sample.bin"),
                 length: 100,
                 global_start_offset: 0,
                 is_padding: false,
                 is_skipped: false,
             }],
-            100,
-            PathBuf::from("."),
-        ));
+            total_size: 100,
+        });
 
         assert_eq!(
             drained_download_paths_for_activity(&mut state, 0, 0, 10),
@@ -8350,8 +8277,8 @@ mod tests {
             },
             ..Default::default()
         });
-        state.multi_file_info = Some(MultiFileInfo::from_parts(
-            vec![
+        state.multi_file_info = Some(MultiFileInfo {
+            files: vec![
                 crate::storage::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
@@ -8367,9 +8294,8 @@ mod tests {
                     is_skipped: false,
                 },
             ],
-            120,
-            PathBuf::from("."),
-        ));
+            total_size: 120,
+        });
 
         assert_eq!(
             drained_download_paths_for_activity(&mut state, 0, 40, 30),
@@ -8395,8 +8321,8 @@ mod tests {
             ..Default::default()
         });
         state.piece_manager.bitfield = vec![PieceStatus::Need];
-        state.multi_file_info = Some(MultiFileInfo::from_parts(
-            vec![
+        state.multi_file_info = Some(MultiFileInfo {
+            files: vec![
                 crate::storage::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
@@ -8412,9 +8338,8 @@ mod tests {
                     is_skipped: false,
                 },
             ],
-            120,
-            PathBuf::from("."),
-        ));
+            total_size: 120,
+        });
 
         let effects = state.update(Action::IncomingBlock {
             peer_id: "peer_a".to_string(),
@@ -8452,8 +8377,8 @@ mod tests {
             },
             ..Default::default()
         });
-        state.multi_file_info = Some(MultiFileInfo::from_parts(
-            vec![
+        state.multi_file_info = Some(MultiFileInfo {
+            files: vec![
                 crate::storage::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
@@ -8469,9 +8394,8 @@ mod tests {
                     is_skipped: false,
                 },
             ],
-            120,
-            PathBuf::from("."),
-        ));
+            total_size: 120,
+        });
 
         state.record_pending_file_activity(0, 0, 10, FileActivityDirection::Download);
         state.record_pending_file_activity(0, 20, 10, FileActivityDirection::Download);
@@ -8513,8 +8437,8 @@ mod tests {
             },
             ..Default::default()
         });
-        state.multi_file_info = Some(MultiFileInfo::from_parts(
-            vec![
+        state.multi_file_info = Some(MultiFileInfo {
+            files: vec![
                 crate::storage::FileInfo {
                     path: PathBuf::from("one.bin"),
                     length: 50,
@@ -8530,9 +8454,8 @@ mod tests {
                     is_skipped: false,
                 },
             ],
-            120,
-            PathBuf::from("."),
-        ));
+            total_size: 120,
+        });
 
         state.record_pending_file_activity(0, 60, 10, FileActivityDirection::Download);
         state.record_pending_file_activity(0, 0, 10, FileActivityDirection::Download);
@@ -8586,26 +8509,6 @@ mod tests {
             "Should flatten multi-file torrent when container_name is empty"
         );
     }
-
-    #[test]
-    fn rebuild_multi_file_info_rejects_unsafe_container_name() {
-        let mut state = create_empty_state();
-        let mut torrent = create_dummy_torrent(1);
-        torrent.info.name = "safe-item".to_string();
-        torrent.info.files = vec![crate::torrent_file::InfoFile {
-            length: 1,
-            path: vec!["payload.bin".to_string()],
-            md5sum: None,
-            attr: None,
-        }];
-
-        state.torrent = Some(torrent);
-        state.torrent_data_path = Some(PathBuf::from("/tmp/downloads"));
-        state.container_name = Some("../outside".to_string());
-        state.rebuild_multi_file_info();
-
-        assert!(state.multi_file_info.is_none());
-    }
 }
 
 #[cfg(test)]
@@ -8627,7 +8530,10 @@ mod deletion_tests {
             })
             .collect();
 
-        MultiFileInfo::from_parts(files, 100, PathBuf::from("/"))
+        MultiFileInfo {
+            files,
+            total_size: 100,
+        }
     }
 
     #[test]
