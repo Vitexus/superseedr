@@ -5,7 +5,7 @@ use crate::app::{AppCommand, AppMode, AppState, RssScreen, RssSectionFocus};
 use crate::config::RssFilterMode;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_batch_sender;
-use crate::tui::formatters::centered_rect;
+use crate::tui::formatters::{centered_rect, truncate_with_ellipsis};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local, Utc};
@@ -315,25 +315,6 @@ fn is_valid_feed_url(value: &str) -> bool {
         }
     }
     true
-}
-
-fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let char_count = input.chars().count();
-    if char_count <= max_chars {
-        return input.to_string();
-    }
-    if max_chars <= 3 {
-        return ".".repeat(max_chars);
-    }
-    let mut out = String::new();
-    for ch in input.chars().take(max_chars - 3) {
-        out.push(ch);
-    }
-    out.push_str("...");
-    out
 }
 
 fn execute_rss_effects(

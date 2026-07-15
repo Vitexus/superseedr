@@ -352,10 +352,7 @@ pub async fn build_fs_tree(
     depth: usize,
 ) -> Result<Vec<RawNode<FileMetadata>>, std::io::Error> {
     let mut nodes = Vec::new();
-    let mut entries = match fs::read_dir(path).await {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
-    };
+    let mut entries = fs::read_dir(path).await?;
 
     while let Some(entry) = entries.next_entry().await? {
         let meta = entry.metadata().await?;
@@ -368,9 +365,7 @@ pub async fn build_fs_tree(
 
         let children = if is_dir {
             if depth > 0 {
-                Box::pin(build_fs_tree(&entry.path(), depth - 1))
-                    .await
-                    .unwrap_or_default()
+                Box::pin(build_fs_tree(&entry.path(), depth - 1)).await?
             } else {
                 Vec::new()
             }
