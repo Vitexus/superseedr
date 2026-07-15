@@ -15,7 +15,6 @@ INSTALLER_CERT_NAME=$3 # e.g., "Developer ID Installer: Your Name (TEAMID)"
 shift 3                # Consume the first three arguments
 CARGO_FLAGS="$@"       # Use all remaining arguments as flags
 
-# --- NEW: Derive Application cert and create entitlements ---
 # Derive the Application certificate name from the Installer one
 APP_CERT_NAME=$(echo "${INSTALLER_CERT_NAME}" | sed 's/Installer/Application/')
 if [ "$APP_CERT_NAME" == "$INSTALLER_CERT_NAME" ]; then
@@ -23,24 +22,6 @@ if [ "$APP_CERT_NAME" == "$INSTALLER_CERT_NAME" ]; then
     echo "::error:: This script expects to be passed the 'Developer ID Installer' certificate."
     exit 1
 fi
-
-# Create a basic entitlements file for Hardened Runtime
-ENTITLEMENTS_PATH="target/entitlements.plist"
-echo "Creating entitlements file at ${ENTITLEMENTS_PATH}..."
-mkdir -p target # Ensure target dir exists
-cat > "${ENTITLEMENTS_PATH}" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>com.apple.security.cs.allow-jit</key>
-    <false/>
-    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
-    <false/>
-</dict>
-</plist>
-EOF
-# --- END NEW ---
 
 # Fixed Application Variables
 APP_NAME="superseedr"
@@ -71,6 +52,7 @@ TUI_BINARY_SOURCE_X86_64="target/x86_64-apple-darwin/release/${BINARY_NAME}"
 HANDLER_STAGING_DIR="target/handler_staging_${NAME_SUFFIX}"
 HANDLER_APP_PATH="${HANDLER_STAGING_DIR}/${HANDLER_APP_NAME}.app"
 HANDLER_SCRIPT_PATH="${HANDLER_STAGING_DIR}/main.applescript"
+HANDLER_SCRIPT_SOURCE="scripts/macos_handler.applescript"
 
 UNIVERSAL_STAGING_DIR="target/universal_staging_${NAME_SUFFIX}"
 UNIVERSAL_BINARY_PATH="${UNIVERSAL_STAGING_DIR}/${BINARY_NAME}"
@@ -132,40 +114,22 @@ echo "Building ${HANDLER_APP_NAME}.app programmatically..."
 rm -rf "${HANDLER_STAGING_DIR}"
 mkdir -p "${HANDLER_STAGING_DIR}"
 
-# 4a. Write the AppleScript code
-echo "Creating AppleScript file: ${HANDLER_SCRIPT_PATH}"
-cat > "${HANDLER_SCRIPT_PATH}" << EOF
-on run
-    tell application "Terminal"
-        activate
-        do script "/usr/local/bin/${BINARY_NAME}"
-    end tell
-end run
-on open location this_URL
-    process_link(this_URL)
-end open location
-on open these_files
-    repeat with this_file in these_files
-        process_link(POSIX path of this_file)
-    end repeat
-end open
-on process_link(the_link)
-    set link_to_process to the_link as text
-    if link_to_process is not "" then
-        try
-            set binary_path_posix to "/usr/local/bin/${BINARY_NAME}"
-            set full_command to (quoted form of binary_path_posix) & " " & (quoted form of link_to_process)
-            do shell script full_command & " > /dev/null 2>&1 &"
-        on error errMsg
-            display dialog "${HANDLER_APP_NAME} Error: " & errMsg
-        end try
-    end if
-end process_link
-EOF
+# 4a. Stage the AppleScript handler source
+echo "Staging AppleScript file: ${HANDLER_SCRIPT_PATH}"
+cp "${HANDLER_SCRIPT_SOURCE}" "${HANDLER_SCRIPT_PATH}"
+
+if grep -q 'tell application' "${HANDLER_SCRIPT_PATH}"; then
+    echo "::error:: Protocol handler must not depend on GUI application automation."
+    exit 1
+fi
+if ! grep -q 'event GURLGURL' "${HANDLER_SCRIPT_PATH}"; then
+    echo "::error:: Protocol handler is missing its URL-open entry point."
+    exit 1
+fi
 
 # 4b. Compile the AppleScript into an Application bundle
 echo "Compiling AppleScript into app bundle: ${HANDLER_APP_PATH}"
-osacompile -x -o "${HANDLER_APP_PATH}" "${HANDLER_SCRIPT_PATH}"
+osacompile -l AppleScript -x -o "${HANDLER_APP_PATH}" "${HANDLER_SCRIPT_PATH}"
 
 # 4b-2. Add custom icon
 echo "Adding custom icon to ${HANDLER_APP_NAME}.app..."
@@ -216,7 +180,6 @@ codesign -s "${APP_CERT_NAME}" \
   -v --force --deep \
   --options runtime \
   --timestamp \
-  --entitlements "${ENTITLEMENTS_PATH}" \
   "${HANDLER_APP_PATH}"
 # --- END MODIFIED ---
 
@@ -248,7 +211,6 @@ rm -rf "${HANDLER_STAGING_DIR}"
 rm -rf "${PKG_STAGING_ROOT}"
 rm -rf "${UNIVERSAL_STAGING_DIR}"
 rm -f "${UNSIGNED_PKG_OUTPUT_PATH}" # Remove the unsigned original
-rm -f "${ENTITLEMENTS_PATH}" # NEW: Remove entitlements file
 
 echo ""
 echo "Signed PKG creation complete at: ${SIGNED_PKG_OUTPUT_PATH}"
