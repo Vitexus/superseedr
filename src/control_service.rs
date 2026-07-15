@@ -650,7 +650,7 @@ pub fn build_move_payload_plan(
         &torrent_name,
     )?;
     let mut destination_settings = torrent_settings.clone();
-    destination_settings.download_path = Some(destination_root);
+    destination_settings.download_path = Some(destination_root.clone());
     let (_, destination_effective_root) = resolve_torrent_roots(
         settings,
         &destination_settings,

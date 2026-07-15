@@ -2080,8 +2080,18 @@ pub struct JournalUiState {
     pub status_message: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TorrentManagementReviewCache {
+    pub(crate) pause: Vec<String>,
+    pub(crate) resume: Vec<String>,
+    pub(crate) delete: Vec<String>,
+    pub(crate) purge: Vec<String>,
+    pub(crate) longest_line_width: usize,
+}
+
 pub struct TorrentManagementUiState {
     pub selected_index: usize,
+    pub cursor_hash: Option<Vec<u8>>,
     pub selected_hashes: HashSet<Vec<u8>>,
     pub pending_commands: Vec<TorrentManagementPendingCommand>,
     pub is_searching: bool,
@@ -2092,12 +2102,16 @@ pub struct TorrentManagementUiState {
     pub sort_direction: SortDirection,
     pub status_message: Option<String>,
     pub confirm_submit: bool,
+    pub review_scroll_offset: usize,
+    pub input_latch: Option<ratatui::crossterm::event::KeyCode>,
+    pub(crate) review_cache: Option<TorrentManagementReviewCache>,
 }
 
 impl Default for TorrentManagementUiState {
     fn default() -> Self {
         Self {
             selected_index: 0,
+            cursor_hash: None,
             selected_hashes: HashSet::new(),
             pending_commands: Vec::new(),
             is_searching: false,
@@ -2108,6 +2122,9 @@ impl Default for TorrentManagementUiState {
             sort_direction: SortDirection::Ascending,
             status_message: None,
             confirm_submit: false,
+            review_scroll_offset: 0,
+            input_latch: None,
+            review_cache: None,
         }
     }
 }
@@ -17229,12 +17246,18 @@ mod tests {
             .await
             .expect("build shared leader app");
 
-        app.dump_status_to_file();
-        time::sleep(Duration::from_millis(100)).await;
-
         let host_status_path = crate::config::shared_status_path().expect("host status path");
         let leader_status_path =
             crate::config::shared_leader_status_path().expect("leader status path");
+
+        app.dump_status_to_file();
+        time::timeout(Duration::from_secs(5), async {
+            while !host_status_path.exists() || !leader_status_path.exists() {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("status dumps should be written");
 
         assert!(host_status_path.exists());
         assert!(leader_status_path.exists());

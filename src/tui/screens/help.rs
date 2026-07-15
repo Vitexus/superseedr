@@ -500,6 +500,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
+        "Page Up / Page Down / Home / End",
+        "Move by a page or jump to the first or last visible torrent",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Torrent Management",
         "h / l / Left / Right",
         "Move between table columns",
         ActionTone::Navigate
@@ -528,6 +535,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
+        "f",
+        "Open files for the highlighted torrent",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Torrent Management",
         "p",
         "Queue pause or resume for the current target set",
         ActionTone::Queue
@@ -542,15 +556,15 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
-        "Y",
-        "Review queued commands; press Y again to submit",
+        "Y / Enter",
+        "Review queued commands with Y; submit from review with Enter",
         ActionTone::Confirm
     );
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
         "u",
-        "Clear draft commands for the current target set",
+        "Clear the current selection and its draft commands",
         ActionTone::Clear
     );
     action_item!(
@@ -1609,13 +1623,13 @@ mod tests {
         };
         app_state.ui.help.is_searching = true;
         app_state.ui.help.search_mode = SearchMode::Regex;
-        app_state.ui.help.search_query = "Torrent Management Y Review queued".to_string();
+        app_state.ui.help.search_query = "Torrent Management Y / Enter Review queued".to_string();
 
         let items = help_items_for_view(&settings, &app_state);
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].subsection, "Torrent Management");
-        assert_eq!(items[0].key, "Y");
+        assert_eq!(items[0].key, "Y / Enter");
     }
 
     #[test]

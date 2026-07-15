@@ -51,7 +51,7 @@ async fn flush_pending_paste_burst_at(app: &mut App, now: Instant) {
 
 fn translate_event(event: CrosstermEvent, app: &mut App, now: Instant) -> Vec<CrosstermEvent> {
     let mut translated = Vec::new();
-    if should_ignore_event_for_paste_burst(&event) {
+    if should_ignore_event_for_paste_burst(&event, app) {
         return translated;
     }
 
@@ -104,14 +104,18 @@ fn should_buffer_paste_burst_key(app: &App, key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
-fn should_ignore_event_for_paste_burst(event: &CrosstermEvent) -> bool {
-    matches!(
-        event,
-        CrosstermEvent::Key(KeyEvent {
-            kind: KeyEventKind::Release,
-            ..
-        })
-    )
+fn should_ignore_event_for_paste_burst(event: &CrosstermEvent, app: &App) -> bool {
+    let CrosstermEvent::Key(KeyEvent {
+        code,
+        kind: KeyEventKind::Release,
+        ..
+    }) = event
+    else {
+        return false;
+    };
+
+    !matches!(app.app_state.mode, AppMode::TorrentManagement)
+        || app.app_state.ui.torrent_management.input_latch != Some(*code)
 }
 
 async fn apply_event(event: CrosstermEvent, app: &mut App) {
@@ -162,7 +166,10 @@ fn handle_resize_event(event: &CrosstermEvent, app: &mut App) -> bool {
 
 fn should_debounce_escape(event: &CrosstermEvent) -> bool {
     if let CrosstermEvent::Key(key) = event {
-        if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && key.modifiers == KeyModifiers::NONE
+        {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -262,7 +269,10 @@ mod tests {
     use crate::tui::tree::RawNode;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::Instant;
+
+    static ESC_DEBOUNCE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Creates a mock TorrentMetrics with a specific number of peers.
     fn create_mock_metrics(peer_count: usize) -> TorrentMetrics {
@@ -580,6 +590,9 @@ mod tests {
 
     #[test]
     fn test_escape_debounce_ignores_non_escape_keys() {
+        let _guard = ESC_DEBOUNCE_TEST_LOCK
+            .lock()
+            .expect("escape debounce test lock poisoned");
         GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
         let event = CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         assert!(!should_debounce_escape(&event));
@@ -587,11 +600,27 @@ mod tests {
 
     #[test]
     fn test_escape_debounce_blocks_rapid_second_escape() {
+        let _guard = ESC_DEBOUNCE_TEST_LOCK
+            .lock()
+            .expect("escape debounce test lock poisoned");
         GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
         let event = CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
         assert!(!should_debounce_escape(&event));
         assert!(should_debounce_escape(&event));
+    }
+
+    #[test]
+    fn test_escape_debounce_modified_escape_does_not_block_next_plain_escape() {
+        let _guard = ESC_DEBOUNCE_TEST_LOCK
+            .lock()
+            .expect("escape debounce test lock poisoned");
+        GLOBAL_ESC_TIMESTAMP.store(0, Ordering::Relaxed);
+        let modified = CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT));
+        let plain = CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        assert!(!should_debounce_escape(&modified));
+        assert!(!should_debounce_escape(&plain));
     }
 
     #[tokio::test]
@@ -735,7 +764,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_events_are_ignored_by_translation() {
+    async fn release_events_are_forwarded_only_for_the_management_latch() {
         let mut app = build_test_app().await;
         app.app_state.mode = AppMode::Help;
 
@@ -750,6 +779,37 @@ mod tests {
         );
 
         assert!(translated.is_empty());
+
+        app.app_state.mode = AppMode::TorrentManagement;
+        app.app_state.ui.torrent_management.input_latch = Some(KeyCode::Char('/'));
+        let translated = translate_event(
+            CrosstermEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('m'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            &mut app,
+            Instant::now(),
+        );
+        assert!(translated.is_empty());
+
+        let translated = translate_event(
+            CrosstermEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            )),
+            &mut app,
+            Instant::now(),
+        );
+        assert!(matches!(
+            translated.as_slice(),
+            [CrosstermEvent::Key(KeyEvent {
+                code: KeyCode::Char('/'),
+                kind: KeyEventKind::Release,
+                ..
+            })]
+        ));
         let _ = app.shutdown_tx.send(());
     }
 }
