@@ -17,7 +17,7 @@ use fuzzy_matcher::FuzzyMatcher;
 use ratatui::crossterm::event::{
     Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
-use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Span, Style};
+use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Rect, Span, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 use std::collections::HashMap;
 use std::path::{Component, Path};
@@ -463,11 +463,9 @@ fn time_since_label(ts_iso: &str, now: &DateTime<Utc>) -> String {
     if days > 0 {
         format!("{days}d {hours}h ago")
     } else if hours > 0 {
-        let minute_unit = if minutes == 1 { "min" } else { "mins" };
-        format!("{hours}h {minutes}{minute_unit} ago")
+        format!("{hours:>2}h {minutes}m ago")
     } else if minutes > 0 {
-        let minute_unit = if minutes == 1 { "min" } else { "mins" };
-        format!("{minutes}{minute_unit} {seconds}s ago")
+        format!("{minutes}m {seconds}s ago")
     } else {
         format!("{seconds}s ago")
     }
@@ -628,40 +626,82 @@ fn journal_detail_height(inner_height: u16) -> u16 {
     u16::from(inner_height >= 5)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JournalScreenRegions {
+    header: Rect,
+    search: Option<Rect>,
+    panel: Rect,
+    footer: Rect,
+}
+
+fn journal_screen_regions(screen_area: Rect, search_active: bool) -> JournalScreenRegions {
+    let area = centered_rect(88, 94, screen_area);
+    let show_search = search_active && area.height >= 6;
+    if show_search {
+        let regions = ratatui::layout::Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        JournalScreenRegions {
+            header: regions[0],
+            search: Some(regions[1]),
+            panel: regions[2],
+            footer: regions[3],
+        }
+    } else {
+        let regions = ratatui::layout::Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        JournalScreenRegions {
+            header: regions[0],
+            search: None,
+            panel: regions[1],
+            footer: regions[2],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JournalContentRegions {
+    table: Rect,
+    detail: Rect,
+}
+
+fn journal_content_regions(content: Rect) -> JournalContentRegions {
+    let detail_height = journal_detail_height(content.height);
+    let spacer_height = u16::from(detail_height > 0);
+    let regions = ratatui::layout::Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(spacer_height),
+        Constraint::Length(detail_height),
+    ])
+    .split(content);
+    JournalContentRegions {
+        table: regions[0],
+        detail: regions[2],
+    }
+}
+
 fn journal_page_rows(app_state: &AppState) -> usize {
     let screen_area = app_state.screen_area;
     if screen_area.width == 0 || screen_area.height == 0 {
         return 1;
     }
 
-    let area = centered_rect(88, 94, screen_area);
     let search_panel_active =
         app_state.ui.journal.is_searching || !app_state.ui.journal.search_query.is_empty();
-    let journal_area = if search_panel_active && area.height >= 7 {
-        ratatui::layout::Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area)
-            [1]
-    } else {
-        area
-    };
-    let panel_area = ratatui::layout::Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(journal_area)[1];
+    let screen_regions = journal_screen_regions(screen_area, search_panel_active);
     let inner = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::new(2, 2, 0, 0))
-        .inner(panel_area);
-    let detail_height = journal_detail_height(inner.height);
-    let spacer_height = u16::from(detail_height > 0);
-    let table_height = ratatui::layout::Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(spacer_height),
-        Constraint::Length(detail_height),
-    ])
-    .split(inner)[0]
-        .height;
+        .inner(screen_regions.panel);
+    let table_height = journal_content_regions(inner).table.height;
 
     usize::from(table_height.saturating_sub(1).max(1))
 }
@@ -807,10 +847,7 @@ fn activity_detail_line(
     width: u16,
 ) -> Line<'static> {
     let Some(activity) = activity else {
-        return Line::from(Span::styled(
-            "No journal activities yet.",
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
-        ));
+        return Line::default();
     };
 
     let latest = activity.latest();
@@ -879,27 +916,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         app_state.ui.journal.is_searching || !app_state.ui.journal.search_query.is_empty();
     let area = centered_rect(88, 94, f.area());
     f.render_widget(Clear, area);
-
-    let (search_area, journal_area) = if search_panel_active && area.height >= 7 {
-        let chunks = ratatui::layout::Layout::vertical([Constraint::Length(3), Constraint::Min(1)])
-            .split(area);
-        (Some(chunks[0]), chunks[1])
-    } else {
-        (None, area)
-    };
-    if let Some(search_area) = search_area {
-        draw_journal_search_panel(f, search_area, app_state, activities.len(), ctx);
-    }
-
-    let layout = ratatui::layout::Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(journal_area);
-    let header_area = layout[0];
-    let panel_area = layout[1];
-    let footer_area = layout[2];
+    let screen_regions = journal_screen_regions(f.area(), search_panel_active);
 
     let entry_count = activities
         .iter()
@@ -938,16 +955,41 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     })
     .collect::<Vec<_>>();
 
+    let filter_width = filter_spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum::<usize>();
+    let count_width = count_label.chars().count();
+    let symmetric_gutter = count_width.saturating_add(1);
+    let show_count = usize::from(screen_regions.header.width)
+        >= filter_width.saturating_add(symmetric_gutter.saturating_mul(2));
+    let (filter_area, count_area) = if show_count {
+        let gutter_width = u16::try_from(symmetric_gutter).unwrap_or(u16::MAX);
+        let regions = ratatui::layout::Layout::horizontal([
+            Constraint::Length(gutter_width),
+            Constraint::Min(1),
+            Constraint::Length(gutter_width),
+        ])
+        .split(screen_regions.header);
+        (regions[1], Some(regions[2]))
+    } else {
+        (screen_regions.header, None)
+    };
     f.render_widget(
         Paragraph::new(Line::from(filter_spans)).alignment(Alignment::Center),
-        header_area,
+        filter_area,
     );
-    f.render_widget(
-        Paragraph::new(count_label)
-            .alignment(Alignment::Right)
-            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1))),
-        header_area,
-    );
+    if let Some(count_area) = count_area {
+        f.render_widget(
+            Paragraph::new(count_label)
+                .alignment(Alignment::Right)
+                .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1))),
+            count_area,
+        );
+    }
+    if let Some(search_area) = screen_regions.search {
+        draw_journal_search_panel(f, search_area, app_state, activities.len(), ctx);
+    }
 
     let mut panel = Block::default()
         .borders(Borders::ALL)
@@ -959,8 +1001,8 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             ctx.apply(Style::default().fg(ctx.state_warning()).bold()),
         ));
     }
-    let inner = panel.inner(panel_area);
-    f.render_widget(panel, panel_area);
+    let inner = panel.inner(screen_regions.panel);
+    f.render_widget(panel, screen_regions.panel);
 
     if inner.width == 0 || inner.height == 0 {
         return;
@@ -973,18 +1015,14 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         .min(activities.len().saturating_sub(1));
     let selected_activity = activities.get(selected_index);
     let detail_line = activity_detail_line(selected_activity, app_state, ctx, inner.width);
-    let detail_height = journal_detail_height(inner.height);
-    let spacer_height = u16::from(detail_height > 0);
-    let rows = ratatui::layout::Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(spacer_height),
-        Constraint::Length(detail_height),
-    ])
-    .split(inner);
+    let content_regions = journal_content_regions(inner);
 
     let columns = columns_for_filter(app_state.ui.journal.filter);
-    let (window_start, window_end) =
-        journal_table_window(activities.len(), selected_index, rows[0].height);
+    let (window_start, window_end) = journal_table_window(
+        activities.len(),
+        selected_index,
+        content_regions.table.height,
+    );
     let now = Utc::now();
     let body_rows = activities[window_start..window_end]
         .iter()
@@ -1027,12 +1065,33 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     if !activities.is_empty() {
         table_state.select(Some(selected_index.saturating_sub(window_start)));
     }
-    f.render_stateful_widget(table, rows[0], &mut table_state);
+    f.render_stateful_widget(table, content_regions.table, &mut table_state);
 
-    if detail_height > 0 {
+    if activities.is_empty() && content_regions.table.height > 1 {
+        let empty_body = Rect::new(
+            content_regions.table.x,
+            content_regions.table.y.saturating_add(1),
+            content_regions.table.width,
+            content_regions.table.height.saturating_sub(1),
+        );
+        let message = journal_empty_message(
+            app_state.ui.journal.filter,
+            !app_state.ui.journal.search_query.trim().is_empty(),
+        );
+        f.render_widget(
+            Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .style(ctx.apply(
+                    Style::default().fg(journal_filter_color(app_state.ui.journal.filter, ctx)),
+                )),
+            centered_line_rect(empty_body),
+        );
+    }
+
+    if content_regions.detail.height > 0 {
         f.render_widget(
             Paragraph::new(detail_line).alignment(Alignment::Left),
-            rows[2],
+            content_regions.detail,
         );
     }
 
@@ -1067,7 +1126,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         push_action("Shift+Y", "replay", ActionTone::Replay);
     }
     let footer_hint = Paragraph::new(Line::from(footer_spans)).alignment(Alignment::Center);
-    f.render_widget(footer_hint, footer_area);
+    f.render_widget(footer_hint, screen_regions.footer);
 }
 
 fn journal_filter_color(filter: JournalFilter, ctx: &ThemeContext) -> ratatui::style::Color {
@@ -1077,6 +1136,28 @@ fn journal_filter_color(filter: JournalFilter, ctx: &ThemeContext) -> ratatui::s
         JournalFilter::Commands => ctx.accent_sapphire(),
         JournalFilter::Health => ctx.state_success(),
     }
+}
+
+fn journal_empty_message(filter: JournalFilter, search_active: bool) -> &'static str {
+    match (filter, search_active) {
+        (JournalFilter::All, false) => "No journal activity yet.",
+        (JournalFilter::Queue, false) => "No ingest activity yet.",
+        (JournalFilter::Commands, false) => "No command activity yet.",
+        (JournalFilter::Health, false) => "No health activity yet.",
+        (JournalFilter::All, true) => "No journal activity matches the search.",
+        (JournalFilter::Queue, true) => "No ingest activity matches the search.",
+        (JournalFilter::Commands, true) => "No command activity matches the search.",
+        (JournalFilter::Health, true) => "No health activity matches the search.",
+    }
+}
+
+fn centered_line_rect(area: Rect) -> Rect {
+    Rect::new(
+        area.x,
+        area.y.saturating_add(area.height.saturating_sub(1) / 2),
+        area.width,
+        u16::from(area.height > 0),
+    )
 }
 
 fn draw_journal_search_panel(
@@ -1129,6 +1210,7 @@ mod tests {
     use crate::theme::ThemeContext;
     use crate::tui::screen_context::ScreenContext;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use std::fs;
@@ -1177,7 +1259,7 @@ mod tests {
         handle_event_inner(event, app_state, app_command_tx, None);
     }
 
-    fn render_journal_text(app_state: &AppState, width: u16, height: u16) -> String {
+    fn render_journal_buffer(app_state: &AppState, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("create journal test terminal");
         let dht_status = DhtStatus::default();
@@ -1198,7 +1280,11 @@ mod tests {
             })
             .expect("draw journal test frame");
 
-        let buffer = terminal.backend().buffer();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_journal_text(app_state: &AppState, width: u16, height: u16) -> String {
+        let buffer = render_journal_buffer(app_state, width, height);
         (0..height)
             .map(|y| {
                 (0..width)
@@ -1229,6 +1315,95 @@ mod tests {
             &tx,
         );
         assert_eq!(app_state.ui.journal.filter, JournalFilter::Commands);
+    }
+
+    #[test]
+    fn header_filter_items_keep_their_colors() {
+        let app_state = base_state();
+        let width = 120;
+        let height = 40;
+        let buffer = render_journal_buffer(&app_state, width, height);
+        let screen_regions = journal_screen_regions(Rect::new(0, 0, width, height), false);
+        let filter_y = screen_regions.header.y;
+        let filter_text = (0..width)
+            .filter_map(|x| buffer.cell((x, filter_y)).map(|cell| cell.symbol()))
+            .collect::<String>();
+        let ctx = ThemeContext::new(app_state.theme, 0.0);
+
+        for filter in [
+            JournalFilter::All,
+            JournalFilter::Queue,
+            JournalFilter::Commands,
+            JournalFilter::Health,
+        ] {
+            let label_x = filter_text
+                .find(filter.label())
+                .expect("filter label should render inside the panel")
+                as u16;
+            assert_eq!(
+                buffer.cell((label_x, filter_y)).expect("filter cell").fg,
+                journal_filter_color(filter, &ctx)
+            );
+        }
+    }
+
+    #[test]
+    fn layout_keeps_header_and_search_above_the_content_panel() {
+        let screen_regions = journal_screen_regions(Rect::new(0, 0, 120, 40), true);
+        let search = screen_regions.search.expect("search region");
+
+        assert!(screen_regions.header.bottom() <= search.y);
+        assert!(search.bottom() <= screen_regions.panel.y);
+        assert!(screen_regions.panel.bottom() <= screen_regions.footer.y);
+    }
+
+    #[test]
+    fn page_capacity_uses_the_rendered_table_region_with_search() {
+        let mut app_state = base_state();
+        app_state.screen_area = Rect::new(0, 0, 120, 30);
+        app_state.ui.journal.is_searching = true;
+        let screen_regions = journal_screen_regions(app_state.screen_area, true);
+        let inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(2, 2, 0, 0))
+            .inner(screen_regions.panel);
+        let table = journal_content_regions(inner).table;
+
+        assert_eq!(
+            journal_page_rows(&app_state),
+            usize::from(table.height.saturating_sub(1).max(1))
+        );
+    }
+
+    #[test]
+    fn empty_filters_render_specific_states() {
+        let mut app_state = base_state();
+        app_state.event_journal_state.entries.clear();
+
+        for (filter, message) in [
+            (JournalFilter::All, "No journal activity yet."),
+            (JournalFilter::Queue, "No ingest activity yet."),
+            (JournalFilter::Commands, "No command activity yet."),
+            (JournalFilter::Health, "No health activity yet."),
+        ] {
+            app_state.ui.journal.filter = filter;
+            let rendered = render_journal_text(&app_state, 120, 40);
+            assert!(rendered.contains(message), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn empty_search_uses_matching_state() {
+        let mut app_state = base_state();
+        app_state.ui.journal.filter = JournalFilter::Commands;
+        app_state.ui.journal.search_query = "no matching command".to_string();
+
+        let rendered = render_journal_text(&app_state, 120, 40);
+
+        assert!(
+            rendered.contains("No command activity matches the search."),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -1710,11 +1885,12 @@ mod tests {
         assert_eq!(time_since_label("2026-03-15T14:59:40Z", &now), "20s ago");
         assert_eq!(
             time_since_label("2026-03-15T14:29:40Z", &now),
-            "30mins 20s ago"
+            "30m 20s ago"
         );
+        assert_eq!(time_since_label("2026-03-15T12:55:00Z", &now), " 2h 5m ago");
         assert_eq!(
-            time_since_label("2026-03-15T12:55:00Z", &now),
-            "2h 5mins ago"
+            time_since_label("2026-03-15T13:14:00Z", &now),
+            " 1h 46m ago"
         );
         assert_eq!(time_since_label("invalid", &now), "-");
     }
