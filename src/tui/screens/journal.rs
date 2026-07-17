@@ -1,17 +1,22 @@
 // SPDX-FileCopyrightText: 2026 The superseedr Contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::app::{AppCommand, AppMode, AppState, JournalFilter};
+use crate::app::{AppCommand, AppMode, AppState, JournalFilter, SearchMode};
 use crate::persistence::event_journal::{
     EventCategory, EventDetails, EventJournalEntry, EventType,
 };
 use crate::theme::ThemeContext;
 use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
-use crate::tui::formatters::{sanitize_text, truncate_with_ellipsis};
+use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::input_panel::draw_prompt_panel;
 use chrono::{DateTime, Local};
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+use ratatui::crossterm::event::{
+    Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 use std::collections::HashMap;
@@ -26,20 +31,48 @@ enum JournalAction {
     MoveUp,
     MoveDown,
     ReplaySelected,
+    SearchStart,
+    SearchInsert(char),
+    SearchBackspace,
+    SearchClear,
+    SearchCommit,
+    SearchCancel,
+    ToggleSearchMode,
 }
 
-fn map_key_to_journal_action(key_code: KeyCode, key_kind: KeyEventKind) -> Option<JournalAction> {
-    if !matches!(key_kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+fn map_key_to_journal_action(key: KeyEvent, search_panel_active: bool) -> Option<JournalAction> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
 
-    match key_code {
+    let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let has_alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    if search_panel_active && matches!(key.code, KeyCode::Tab) {
+        return Some(JournalAction::ToggleSearchMode);
+    }
+
+    if search_panel_active {
+        return match key.code {
+            KeyCode::Esc => Some(JournalAction::SearchCancel),
+            KeyCode::Enter => Some(JournalAction::SearchCommit),
+            KeyCode::Backspace => Some(JournalAction::SearchBackspace),
+            KeyCode::Char('u') if has_ctrl => Some(JournalAction::SearchClear),
+            KeyCode::Up => Some(JournalAction::MoveUp),
+            KeyCode::Down => Some(JournalAction::MoveDown),
+            KeyCode::Char(c) if !has_ctrl && !has_alt => Some(JournalAction::SearchInsert(c)),
+            _ => None,
+        };
+    }
+
+    match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Some(JournalAction::ToNormal),
         KeyCode::Tab => Some(JournalAction::FilterNext),
         KeyCode::BackTab => Some(JournalAction::FilterPrev),
         KeyCode::Up | KeyCode::Char('k') => Some(JournalAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(JournalAction::MoveDown),
         KeyCode::Char('Y') => Some(JournalAction::ReplaySelected),
+        KeyCode::Char('/') => Some(JournalAction::SearchStart),
         _ => None,
     }
 }
@@ -67,7 +100,9 @@ fn handle_event_inner(
         return;
     };
 
-    let Some(action) = map_key_to_journal_action(key.code, key.kind) else {
+    let search_panel_active =
+        app_state.ui.journal.is_searching || !app_state.ui.journal.search_query.is_empty();
+    let Some(action) = map_key_to_journal_action(key, search_panel_active) else {
         return;
     };
 
@@ -96,6 +131,38 @@ fn handle_event_inner(
         }
         JournalAction::ReplaySelected => {
             replay_selected_entry(app_state, app_command_tx, shutdown_tx)
+        }
+        JournalAction::SearchStart => {
+            app_state.ui.journal.is_searching = true;
+            app_state.ui.journal.search_mode = SearchMode::Regex;
+            app_state.ui.journal.selected_index = 0;
+        }
+        JournalAction::SearchInsert(c) => {
+            app_state.ui.journal.search_query.push(c);
+            app_state.ui.journal.selected_index = 0;
+        }
+        JournalAction::SearchBackspace => {
+            app_state.ui.journal.search_query.pop();
+            app_state.ui.journal.selected_index = 0;
+        }
+        JournalAction::SearchClear => {
+            app_state.ui.journal.search_query.clear();
+            app_state.ui.journal.selected_index = 0;
+        }
+        JournalAction::SearchCommit => {
+            app_state.ui.journal.is_searching = false;
+        }
+        JournalAction::SearchCancel => {
+            app_state.ui.journal.is_searching = false;
+            app_state.ui.journal.search_query.clear();
+            app_state.ui.journal.selected_index = 0;
+        }
+        JournalAction::ToggleSearchMode => {
+            app_state.ui.journal.search_mode = match app_state.ui.journal.search_mode {
+                SearchMode::Fuzzy => SearchMode::Regex,
+                SearchMode::Regex => SearchMode::Fuzzy,
+            };
+            app_state.ui.journal.selected_index = 0;
         }
     }
 }
@@ -127,14 +194,12 @@ struct ActivityKey<'a> {
 #[derive(Debug)]
 struct JournalActivity<'a> {
     entries: Vec<&'a EventJournalEntry>,
-    latest_position: usize,
 }
 
 impl<'a> JournalActivity<'a> {
-    fn new(entry: &'a EventJournalEntry, position: usize) -> Self {
+    fn new(entry: &'a EventJournalEntry) -> Self {
         Self {
             entries: vec![entry],
-            latest_position: position,
         }
     }
 
@@ -150,15 +215,6 @@ impl<'a> JournalActivity<'a> {
             .iter()
             .rev()
             .find(|entry| entry.source_path.is_some() || entry.source_watch_folder.is_some())
-            .copied()
-            .unwrap_or_else(|| self.latest())
-    }
-
-    fn torrent_entry(&self) -> &'a EventJournalEntry {
-        self.entries
-            .iter()
-            .rev()
-            .find(|entry| entry.torrent_name.is_some() || entry.info_hash_hex.is_some())
             .copied()
             .unwrap_or_else(|| self.latest())
     }
@@ -203,36 +259,81 @@ fn activity_key(entry: &EventJournalEntry) -> Option<ActivityKey<'_>> {
 
 fn journal_activities(app_state: &AppState) -> Vec<JournalActivity<'_>> {
     let mut activities = Vec::<JournalActivity<'_>>::new();
-    let mut open_activities = HashMap::<ActivityKey<'_>, Vec<usize>>::new();
+    let mut pending_terminal_activities = HashMap::<ActivityKey<'_>, Vec<usize>>::new();
 
-    for (position, entry) in app_state.event_journal_state.entries.iter().enumerate() {
+    for entry in app_state.event_journal_state.entries.iter().rev() {
         if !entry_matches_filter(entry, app_state.ui.journal.filter) {
             continue;
         }
 
         match (activity_phase(entry), activity_key(entry)) {
-            (ActivityPhase::Queued, Some(key)) => {
-                let activity_index = activities.len();
-                activities.push(JournalActivity::new(entry, position));
-                open_activities.entry(key).or_default().push(activity_index);
-            }
             (ActivityPhase::Terminal, Some(key)) => {
-                let open_activity = open_activities
+                let activity_index = activities.len();
+                activities.push(JournalActivity::new(entry));
+                pending_terminal_activities
+                    .entry(key)
+                    .or_default()
+                    .push(activity_index);
+            }
+            (ActivityPhase::Queued, Some(key)) => {
+                let terminal_activity = pending_terminal_activities
                     .get_mut(&key)
                     .and_then(|activity_indices| activity_indices.pop());
-                if let Some(activity_index) = open_activity {
-                    activities[activity_index].entries.push(entry);
-                    activities[activity_index].latest_position = position;
+                if let Some(activity_index) = terminal_activity {
+                    activities[activity_index].entries.insert(0, entry);
                 } else {
-                    activities.push(JournalActivity::new(entry, position));
+                    activities.push(JournalActivity::new(entry));
                 }
             }
-            _ => activities.push(JournalActivity::new(entry, position)),
+            _ => activities.push(JournalActivity::new(entry)),
         }
     }
 
-    activities.sort_by_key(|activity| std::cmp::Reverse(activity.latest_position));
+    let query = app_state.ui.journal.search_query.trim();
+    if !query.is_empty() {
+        match app_state.ui.journal.search_mode {
+            SearchMode::Fuzzy => {
+                let matcher = SkimMatcherV2::default();
+                let query = query.to_lowercase();
+                activities.retain(|activity| {
+                    matcher
+                        .fuzzy_match(&activity_search_haystack(activity).to_lowercase(), &query)
+                        .is_some()
+                });
+            }
+            SearchMode::Regex => {
+                let regex = regex::RegexBuilder::new(query)
+                    .case_insensitive(true)
+                    .build();
+                if let Ok(regex) = regex {
+                    activities
+                        .retain(|activity| regex.is_match(&activity_search_haystack(activity)));
+                } else {
+                    activities.clear();
+                }
+            }
+        }
+    }
     activities
+}
+
+fn activity_search_haystack(activity: &JournalActivity<'_>) -> String {
+    activity
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            [
+                event_type_label(entry).to_string(),
+                command_action_label(entry),
+                torrent_label(entry, false),
+                source_label(entry, false),
+                detail_text(Some(entry), false),
+                entry.host_id.clone().unwrap_or_default(),
+                entry.info_hash_hex.clone().unwrap_or_default(),
+            ]
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn event_type_label(entry: &EventJournalEntry) -> &'static str {
@@ -285,36 +386,6 @@ fn torrent_label(entry: &EventJournalEntry, anonymize: bool) -> String {
         .torrent_name
         .as_ref()
         .map(|name| sanitize_text(name))
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn live_completion_percent(entry: &EventJournalEntry, app_state: &AppState) -> Option<f64> {
-    if let Some(info_hash_hex) = entry.info_hash_hex.as_deref() {
-        if let Some(display) = app_state
-            .torrents
-            .iter()
-            .find(|(info_hash, _)| hex::encode(info_hash.as_slice()) == info_hash_hex)
-            .map(|(_, display)| display)
-        {
-            return Some(crate::app::torrent_completion_percent(
-                &display.latest_state,
-            ));
-        }
-    }
-
-    entry.torrent_name.as_ref().and_then(|torrent_name| {
-        app_state
-            .torrents
-            .values()
-            .filter(|display| display.latest_state.torrent_name == *torrent_name)
-            .map(|display| crate::app::torrent_completion_percent(&display.latest_state))
-            .max_by(|left, right| left.total_cmp(right))
-    })
-}
-
-fn progress_label(entry: &EventJournalEntry, app_state: &AppState) -> String {
-    live_completion_percent(entry, app_state)
-        .map(|pct| format!("{pct:.0}%"))
         .unwrap_or_else(|| "-".to_string())
 }
 
@@ -476,40 +547,24 @@ enum JournalColumn {
     Time,
     Status,
     Subject,
-    Done,
-    Source,
 }
 
-fn columns_for_filter(filter: JournalFilter) -> Vec<JournalColumn> {
-    match filter {
-        JournalFilter::All => vec![
-            JournalColumn::Time,
-            JournalColumn::Status,
-            JournalColumn::Subject,
-            JournalColumn::Done,
-            JournalColumn::Source,
-        ],
-        JournalFilter::Queue => vec![
-            JournalColumn::Time,
-            JournalColumn::Status,
-            JournalColumn::Subject,
-            JournalColumn::Done,
-            JournalColumn::Source,
-        ],
-        JournalFilter::Commands => {
-            vec![
-                JournalColumn::Time,
-                JournalColumn::Status,
-                JournalColumn::Subject,
-                JournalColumn::Source,
-            ]
-        }
-        JournalFilter::Health => vec![
-            JournalColumn::Time,
-            JournalColumn::Status,
-            JournalColumn::Subject,
-        ],
-    }
+fn columns_for_filter(_filter: JournalFilter) -> Vec<JournalColumn> {
+    vec![
+        JournalColumn::Time,
+        JournalColumn::Status,
+        JournalColumn::Subject,
+    ]
+}
+
+fn journal_table_window(len: usize, selected_index: usize, table_height: u16) -> (usize, usize) {
+    let capacity = usize::from(table_height.saturating_sub(1).max(1));
+    let end = if selected_index < capacity {
+        capacity.min(len)
+    } else {
+        selected_index.saturating_add(1).min(len)
+    };
+    (end.saturating_sub(capacity), end)
 }
 
 fn column_header(column: JournalColumn, filter: JournalFilter) -> &'static str {
@@ -518,20 +573,7 @@ fn column_header(column: JournalColumn, filter: JournalFilter) -> &'static str {
         (JournalColumn::Subject, _) => "Torrent",
         (JournalColumn::Time, _) => "Time",
         (JournalColumn::Status, _) => "Status",
-        (JournalColumn::Done, _) => "Done",
-        (JournalColumn::Source, _) => "Source",
     }
-}
-
-fn visible_columns(filter: JournalFilter, width: u16) -> Vec<JournalColumn> {
-    columns_for_filter(filter)
-        .into_iter()
-        .filter(|column| match column {
-            JournalColumn::Source => width >= 96,
-            JournalColumn::Done => width >= 76,
-            _ => true,
-        })
-        .collect()
 }
 
 fn column_header_style(column: JournalColumn, ctx: &ThemeContext) -> Style {
@@ -539,8 +581,6 @@ fn column_header_style(column: JournalColumn, ctx: &ThemeContext) -> Style {
         JournalColumn::Time => ctx.theme.semantic.subtext0,
         JournalColumn::Status => ctx.state_warning(),
         JournalColumn::Subject => ctx.accent_sky(),
-        JournalColumn::Done => ctx.state_success(),
-        JournalColumn::Source => ctx.accent_sapphire(),
     };
     ctx.apply(Style::default().fg(color).bold())
 }
@@ -550,8 +590,6 @@ fn column_constraint(column: JournalColumn, filter: JournalFilter) -> Constraint
         (_, JournalColumn::Time) => Constraint::Length(13),
         (_, JournalColumn::Status) => Constraint::Length(22),
         (_, JournalColumn::Subject) => Constraint::Fill(1),
-        (_, JournalColumn::Done) => Constraint::Length(7),
-        (_, JournalColumn::Source) => Constraint::Length(22),
     }
 }
 
@@ -605,20 +643,31 @@ fn activity_status_cell(activity: &JournalActivity<'_>, ctx: &ThemeContext) -> C
 fn activity_subject_label(activity: &JournalActivity<'_>, anonymize: bool) -> String {
     let entry = activity.latest();
     if matches!(entry.category, EventCategory::Control) {
-        command_action_label(entry)
-    } else {
-        torrent_label(activity.torrent_entry(), anonymize)
+        return command_action_label(entry);
     }
-}
 
-fn activity_progress_label(activity: &JournalActivity<'_>, app_state: &AppState) -> String {
+    if anonymize {
+        return "Torrent".to_string();
+    }
+
     activity
         .entries
         .iter()
         .rev()
-        .find(|entry| live_completion_percent(entry, app_state).is_some())
-        .map(|entry| progress_label(entry, app_state))
-        .unwrap_or_else(|| "-".to_string())
+        .filter_map(|entry| entry.torrent_name.as_deref())
+        .find(|name| !name.trim().is_empty())
+        .map(sanitize_text)
+        .or_else(|| {
+            let source = activity.source_entry();
+            source
+                .source_path
+                .as_deref()
+                .or(source.source_watch_folder.as_deref())
+                .and_then(Path::file_name)
+                .map(|name| sanitize_text(&name.to_string_lossy()))
+        })
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| "Pending metadata".to_string())
 }
 
 fn column_cell(
@@ -636,13 +685,6 @@ fn column_cell(
             app_state.anonymize_torrent_names,
         ))
         .style(ctx.apply(Style::default().fg(ctx.theme.semantic.text))),
-        JournalColumn::Done => Cell::from(activity_progress_label(activity, app_state))
-            .style(ctx.apply(Style::default().fg(ctx.state_success()).bold())),
-        JournalColumn::Source => Cell::from(source_label(
-            activity.source_entry(),
-            app_state.anonymize_torrent_names,
-        ))
-        .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1))),
     }
 }
 
@@ -708,20 +750,33 @@ fn activity_detail_lines(
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let app_state = screen.app.state;
     let ctx = screen.theme;
-    let area = f.area();
-    let popup = crate::tui::formatters::centered_rect(94, 94, area);
-    let popup_layout = ratatui::layout::Layout::vertical([
+    let activities = journal_activities(app_state);
+    let search_panel_active =
+        app_state.ui.journal.is_searching || !app_state.ui.journal.search_query.is_empty();
+    let area = centered_rect(88, 94, f.area());
+    f.render_widget(Clear, area);
+
+    let (search_area, journal_area) = if search_panel_active && area.height >= 7 {
+        let chunks = ratatui::layout::Layout::vertical([Constraint::Length(3), Constraint::Min(1)])
+            .split(area);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, area)
+    };
+    if let Some(search_area) = search_area {
+        draw_journal_search_panel(f, search_area, app_state, activities.len(), ctx);
+    }
+
+    let layout = ratatui::layout::Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(0),
+        Constraint::Min(1),
         Constraint::Length(1),
     ])
-    .split(popup);
-    let filter_area = popup_layout[0];
-    let panel_area = popup_layout[1];
-    let footer_area = popup_layout[2];
-    f.render_widget(Clear, popup);
+    .split(journal_area);
+    let header_area = layout[0];
+    let panel_area = layout[1];
+    let footer_area = layout[2];
 
-    let activities = journal_activities(app_state);
     let entry_count = activities
         .iter()
         .map(|activity| activity.entries.len())
@@ -736,11 +791,6 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     } else {
         format!("{activity_label} · {entry_count} records")
     };
-    let count_width = u16::try_from(count_label.chars().count()).unwrap_or(u16::MAX);
-    let header_areas =
-        ratatui::layout::Layout::horizontal([Constraint::Min(0), Constraint::Length(count_width)])
-            .split(filter_area);
-
     let filter_spans = [
         JournalFilter::All,
         JournalFilter::Queue,
@@ -750,41 +800,41 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     .iter()
     .enumerate()
     .flat_map(|(index, filter)| {
+        let color = journal_filter_color(*filter, ctx);
         let style = if *filter == app_state.ui.journal.filter {
-            ctx.apply(
-                Style::default()
-                    .fg(ctx.state_warning())
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-            )
+            ctx.apply(Style::default().fg(color).add_modifier(Modifier::BOLD))
         } else {
-            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))
+            ctx.apply(Style::default().fg(color))
         };
         let mut spans = vec![Span::styled(filter.label(), style)];
         if index < 3 {
-            spans.push(Span::raw("   "));
+            spans.push(Span::raw("  "));
         }
         spans
     })
     .collect::<Vec<_>>();
+
     f.render_widget(
         Paragraph::new(Line::from(filter_spans)).alignment(Alignment::Center),
-        header_areas[0],
+        header_area,
     );
     f.render_widget(
         Paragraph::new(count_label)
             .alignment(Alignment::Right)
             .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1))),
-        header_areas[1],
+        header_area,
     );
 
-    let panel = Block::default()
-        .title(Span::styled(
-            " Event Journal ",
-            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
-        ))
+    let mut panel = Block::default()
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)))
         .padding(Padding::new(2, 2, 0, 0));
+    if let Some(message) = &app_state.ui.journal.status_message {
+        panel = panel.title_bottom(Span::styled(
+            format!(" {} ", sanitize_text(message)),
+            ctx.apply(Style::default().fg(ctx.state_warning()).bold()),
+        ));
+    }
     let inner = panel.inner(panel_area);
     f.render_widget(panel, panel_area);
 
@@ -792,24 +842,29 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         return;
     }
 
+    let selected_index = app_state
+        .ui
+        .journal
+        .selected_index
+        .min(activities.len().saturating_sub(1));
+    let selected_activity = activities.get(selected_index);
+    let detail_lines = activity_detail_lines(selected_activity, app_state, ctx, inner.width);
+    let detail_height = u16::try_from(detail_lines.len())
+        .unwrap_or(u16::MAX)
+        .min(4)
+        .min(inner.height.saturating_sub(4));
+    let spacer_height = u16::from(detail_height > 0);
     let rows = ratatui::layout::Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(5),
-        Constraint::Length(1),
-        Constraint::Length(4),
+        Constraint::Min(3),
+        Constraint::Length(spacer_height),
+        Constraint::Length(detail_height),
     ])
     .split(inner);
 
-    if let Some(message) = &app_state.ui.journal.status_message {
-        f.render_widget(
-            Paragraph::new(sanitize_text(message))
-                .style(ctx.apply(Style::default().fg(ctx.state_warning()))),
-            rows[0],
-        );
-    }
-
-    let columns = visible_columns(app_state.ui.journal.filter, rows[1].width);
-    let body_rows = activities
+    let columns = columns_for_filter(app_state.ui.journal.filter);
+    let (window_start, window_end) =
+        journal_table_window(activities.len(), selected_index, rows[0].height);
+    let body_rows = activities[window_start..window_end]
         .iter()
         .map(|activity| {
             Row::new(
@@ -819,7 +874,6 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
                     .map(|column| column_cell(column, activity, app_state, ctx))
                     .collect::<Vec<_>>(),
             )
-            .bottom_margin(1)
         })
         .collect::<Vec<_>>();
 
@@ -836,44 +890,36 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         .collect::<Vec<_>>();
 
     let table = Table::new(body_rows, constraints)
-        .header(Row::new(header_cells).bottom_margin(1))
-        .column_spacing(2)
+        .header(Row::new(header_cells))
+        .column_spacing(1)
         .row_highlight_style(
             ctx.apply(
                 Style::default()
                     .fg(ctx.state_warning())
                     .add_modifier(Modifier::BOLD),
             ),
-        )
-        .highlight_symbol("▌ ");
+        );
 
-    let selected_index = app_state
-        .ui
-        .journal
-        .selected_index
-        .min(activities.len().saturating_sub(1));
     let mut table_state = TableState::default();
     if !activities.is_empty() {
-        table_state.select(Some(selected_index));
+        table_state.select(Some(selected_index.saturating_sub(window_start)));
     }
-    f.render_stateful_widget(table, rows[1], &mut table_state);
+    f.render_stateful_widget(table, rows[0], &mut table_state);
 
-    let selected_activity = activities.get(selected_index);
-    f.render_widget(
-        Paragraph::new(activity_detail_lines(
-            selected_activity,
-            app_state,
-            ctx,
-            rows[3].width,
-        ))
-        .alignment(Alignment::Left),
-        rows[3],
-    );
+    if detail_height > 0 {
+        f.render_widget(
+            Paragraph::new(detail_lines).alignment(Alignment::Left),
+            rows[2],
+        );
+    }
 
     let mut footer_spans = Vec::new();
     let mut push_action = |key: &str, label: &str, tone: ActionTone| {
         if !footer_spans.is_empty() {
-            footer_spans.push(Span::raw("   "));
+            footer_spans.push(Span::styled(
+                " | ",
+                ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            ));
         }
         footer_spans.push(Span::styled(
             format!("[{key}]"),
@@ -884,18 +930,76 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
         ));
     };
-    push_action("↑/↓", "nav", ActionTone::Navigate);
-    push_action("Tab", "filter", ActionTone::Mode);
-    push_action("Shift+Y", "replay", ActionTone::Replay);
-    push_action("Esc", "back", ActionTone::Cancel);
+    if search_panel_active {
+        push_action("type", "query", ActionTone::Edit);
+        push_action("Tab", "mode", ActionTone::Mode);
+        push_action("Enter", "keep", ActionTone::Confirm);
+        push_action("Esc", "clear", ActionTone::Cancel);
+        push_action("↑/↓", "nav", ActionTone::Navigate);
+    } else {
+        push_action("Esc", "back", ActionTone::Cancel);
+        push_action("Tab", "filter", ActionTone::Mode);
+        push_action("/", "search", ActionTone::Search);
+        push_action("↑/↓", "nav", ActionTone::Navigate);
+        push_action("Shift+Y", "replay", ActionTone::Replay);
+    }
     let footer_hint = Paragraph::new(Line::from(footer_spans)).alignment(Alignment::Center);
     f.render_widget(footer_hint, footer_area);
+}
+
+fn journal_filter_color(filter: JournalFilter, ctx: &ThemeContext) -> ratatui::style::Color {
+    match filter {
+        JournalFilter::All => ctx.state_selected(),
+        JournalFilter::Queue => ctx.state_warning(),
+        JournalFilter::Commands => ctx.accent_sapphire(),
+        JournalFilter::Health => ctx.state_success(),
+    }
+}
+
+fn draw_journal_search_panel(
+    f: &mut Frame,
+    area: ratatui::prelude::Rect,
+    app_state: &AppState,
+    visible_count: usize,
+    ctx: &ThemeContext,
+) {
+    let mut trailing_spans = journal_search_mode_spans(app_state, ctx);
+    trailing_spans.push(Span::styled(
+        format!("  {visible_count} matches"),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+    ));
+    draw_prompt_panel(
+        f,
+        area,
+        " Journal Search ".to_string(),
+        sanitize_text(&app_state.ui.journal.search_query),
+        trailing_spans,
+        ctx,
+    );
+}
+
+fn journal_search_mode_spans(app_state: &AppState, ctx: &ThemeContext) -> Vec<Span<'static>> {
+    let (fuzzy_style, regex_style) = match app_state.ui.journal.search_mode {
+        SearchMode::Fuzzy => (
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+        ),
+        SearchMode::Regex => (
+            ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
+            ctx.apply(Style::default().fg(ctx.state_selected()).bold()),
+        ),
+    };
+    vec![
+        Span::raw("  "),
+        Span::styled("Fuzzy", fuzzy_style),
+        Span::raw(" / "),
+        Span::styled("Regex", regex_style),
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{TorrentDisplayState, TorrentMetrics};
     use crate::config::Settings;
     use crate::dht_service::{DhtStatus, DhtWaveTelemetry};
     use crate::persistence::event_journal::{EventCategory, EventJournalState, EventScope};
@@ -1005,6 +1109,55 @@ mod tests {
     }
 
     #[test]
+    fn journal_search_filters_activities_and_toggles_mode() {
+        let mut app_state = base_state();
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+        for character in "sample beta".chars() {
+            handle_event(
+                CrosstermEvent::Key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE)),
+                &mut app_state,
+                &tx,
+            );
+        }
+
+        assert!(app_state.ui.journal.is_searching);
+        assert_eq!(app_state.ui.journal.search_mode, SearchMode::Regex);
+        assert_eq!(journal_activities(&app_state).len(), 1);
+        assert_eq!(journal_activities(&app_state)[0].latest().id, 2);
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+        assert_eq!(app_state.ui.journal.search_mode, SearchMode::Fuzzy);
+    }
+
+    #[test]
+    fn journal_escape_clears_search_before_closing() {
+        let mut app_state = base_state();
+        let (tx, _rx) = mpsc::channel(1);
+        app_state.ui.journal.is_searching = true;
+        app_state.ui.journal.search_query = "sample".to_string();
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+
+        assert!(matches!(app_state.mode, AppMode::Journal));
+        assert!(!app_state.ui.journal.is_searching);
+        assert!(app_state.ui.journal.search_query.is_empty());
+    }
+
+    #[test]
     fn filter_selection_matches_requested_groups() {
         let mut app_state = base_state();
 
@@ -1059,6 +1212,48 @@ mod tests {
         assert_eq!(
             activity_subject_label(&activities[0], false),
             "Sample Delta"
+        );
+    }
+
+    #[test]
+    fn queued_activity_without_metadata_uses_source_filename_as_subject() {
+        let mut app_state = base_state();
+        app_state.ui.journal.filter = JournalFilter::Queue;
+        app_state.event_journal_state.entries = vec![EventJournalEntry {
+            id: 12,
+            category: EventCategory::Ingest,
+            event_type: EventType::IngestQueued,
+            source_path: Some(Path::new("/watch/pending-item.magnet").to_path_buf()),
+            correlation_id: Some("pending-source".to_string()),
+            ..Default::default()
+        }];
+
+        let activities = journal_activities(&app_state);
+
+        assert_eq!(activities.len(), 1);
+        assert_eq!(
+            activity_subject_label(&activities[0], false),
+            "pending-item.magnet"
+        );
+    }
+
+    #[test]
+    fn activity_without_name_or_source_uses_pending_metadata_label() {
+        let mut app_state = base_state();
+        app_state.ui.journal.filter = JournalFilter::Queue;
+        app_state.event_journal_state.entries = vec![EventJournalEntry {
+            id: 13,
+            category: EventCategory::Ingest,
+            event_type: EventType::IngestQueued,
+            ..Default::default()
+        }];
+
+        let activities = journal_activities(&app_state);
+
+        assert_eq!(activities.len(), 1);
+        assert_eq!(
+            activity_subject_label(&activities[0], false),
+            "Pending metadata"
         );
     }
 
@@ -1250,6 +1445,15 @@ mod tests {
     }
 
     #[test]
+    fn table_window_builds_only_the_visible_rows_around_selection() {
+        assert_eq!(journal_table_window(100, 0, 6), (0, 5));
+        assert_eq!(journal_table_window(100, 4, 6), (0, 5));
+        assert_eq!(journal_table_window(100, 5, 6), (1, 6));
+        assert_eq!(journal_table_window(100, 73, 6), (69, 74));
+        assert_eq!(journal_table_window(3, 2, 6), (0, 3));
+    }
+
+    #[test]
     fn grouped_activity_renders_once_and_keeps_both_stage_details() {
         let mut app_state = base_state();
         app_state.ui.journal.filter = JournalFilter::Queue;
@@ -1342,29 +1546,6 @@ mod tests {
     }
 
     #[test]
-    fn progress_label_uses_live_torrent_metrics_when_info_hash_matches() {
-        let mut app_state = base_state();
-        let info_hash = vec![0x11; 20];
-        app_state.event_journal_state.entries[0].info_hash_hex = Some(hex::encode(&info_hash));
-        app_state.torrents.insert(
-            info_hash,
-            TorrentDisplayState {
-                latest_state: TorrentMetrics {
-                    number_of_pieces_total: 10,
-                    number_of_pieces_completed: 4,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-        );
-
-        assert_eq!(
-            progress_label(&app_state.event_journal_state.entries[0], &app_state),
-            "40%"
-        );
-    }
-
-    #[test]
     fn anonymized_journal_hides_torrent_names_and_paths() {
         let entry = EventJournalEntry {
             torrent_name: Some("Sample Alpha".to_string()),
@@ -1400,7 +1581,7 @@ mod tests {
         };
 
         assert_eq!(command_action_label(&entry), "pause");
-        assert_eq!(columns_for_filter(JournalFilter::Commands).len(), 4);
+        assert_eq!(columns_for_filter(JournalFilter::Commands).len(), 3);
         assert_eq!(
             column_header(
                 columns_for_filter(JournalFilter::Commands)[1],
@@ -1415,23 +1596,19 @@ mod tests {
             ),
             "Action"
         );
-        assert_eq!(
-            column_header(
-                columns_for_filter(JournalFilter::Commands)[3],
-                JournalFilter::Commands
-            ),
-            "Source"
-        );
         assert_eq!(command_action_label(&entry), "pause");
     }
 
     #[test]
-    fn health_filter_hides_source_column() {
-        let columns = columns_for_filter(JournalFilter::Health);
-        assert_eq!(columns.len(), 3);
-        assert!(columns
-            .iter()
-            .all(|column| !matches!(column, JournalColumn::Source)));
+    fn every_filter_uses_the_same_three_core_columns() {
+        for filter in [
+            JournalFilter::All,
+            JournalFilter::Queue,
+            JournalFilter::Commands,
+            JournalFilter::Health,
+        ] {
+            assert_eq!(columns_for_filter(filter).len(), 3);
+        }
     }
 
     #[test]

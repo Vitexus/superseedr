@@ -2072,11 +2072,26 @@ impl JournalFilter {
     }
 }
 
-#[derive(Default)]
 pub struct JournalUiState {
     pub filter: JournalFilter,
     pub selected_index: usize,
     pub status_message: Option<String>,
+    pub is_searching: bool,
+    pub search_query: String,
+    pub search_mode: SearchMode,
+}
+
+impl Default for JournalUiState {
+    fn default() -> Self {
+        Self {
+            filter: JournalFilter::default(),
+            selected_index: 0,
+            status_message: None,
+            is_searching: false,
+            search_query: String::new(),
+            search_mode: SearchMode::Regex,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
