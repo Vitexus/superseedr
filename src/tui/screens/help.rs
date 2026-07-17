@@ -577,6 +577,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Journal",
+        "Page Up / Page Down",
+        "Move through journal activities by one visible page",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Journal",
         "/",
         "Search the current journal filter; use Tab to toggle fuzzy or regex matching",
         ActionTone::Search

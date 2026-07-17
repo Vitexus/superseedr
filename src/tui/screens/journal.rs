@@ -11,7 +11,7 @@ use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
 use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 use ratatui::crossterm::event::{
@@ -30,6 +30,8 @@ enum JournalAction {
     FilterPrev,
     MoveUp,
     MoveDown,
+    MovePageUp,
+    MovePageDown,
     ReplaySelected,
     SearchStart,
     SearchInsert(char),
@@ -60,6 +62,8 @@ fn map_key_to_journal_action(key: KeyEvent, search_panel_active: bool) -> Option
             KeyCode::Char('u') if has_ctrl => Some(JournalAction::SearchClear),
             KeyCode::Up => Some(JournalAction::MoveUp),
             KeyCode::Down => Some(JournalAction::MoveDown),
+            KeyCode::PageUp => Some(JournalAction::MovePageUp),
+            KeyCode::PageDown => Some(JournalAction::MovePageDown),
             KeyCode::Char(c) if !has_ctrl && !has_alt => Some(JournalAction::SearchInsert(c)),
             _ => None,
         };
@@ -71,6 +75,8 @@ fn map_key_to_journal_action(key: KeyEvent, search_panel_active: bool) -> Option
         KeyCode::BackTab => Some(JournalAction::FilterPrev),
         KeyCode::Up | KeyCode::Char('k') => Some(JournalAction::MoveUp),
         KeyCode::Down | KeyCode::Char('j') => Some(JournalAction::MoveDown),
+        KeyCode::PageUp => Some(JournalAction::MovePageUp),
+        KeyCode::PageDown => Some(JournalAction::MovePageDown),
         KeyCode::Char('Y') => Some(JournalAction::ReplaySelected),
         KeyCode::Char('/') => Some(JournalAction::SearchStart),
         _ => None,
@@ -127,6 +133,26 @@ fn handle_event_inner(
             if len > 0 {
                 app_state.ui.journal.selected_index =
                     (app_state.ui.journal.selected_index + 1).min(len - 1);
+            }
+        }
+        JournalAction::MovePageUp => {
+            let page_rows = journal_page_rows(app_state);
+            app_state.ui.journal.selected_index = app_state
+                .ui
+                .journal
+                .selected_index
+                .saturating_sub(page_rows);
+        }
+        JournalAction::MovePageDown => {
+            let len = journal_activities(app_state).len();
+            if len > 0 {
+                let page_rows = journal_page_rows(app_state);
+                app_state.ui.journal.selected_index = app_state
+                    .ui
+                    .journal
+                    .selected_index
+                    .saturating_add(page_rows)
+                    .min(len - 1);
             }
         }
         JournalAction::ReplaySelected => {
@@ -418,6 +444,35 @@ fn detailed_timestamp(ts_iso: &str) -> String {
         .unwrap_or_else(|_| ts_iso.to_string())
 }
 
+fn time_since_label(ts_iso: &str, now: &DateTime<Utc>) -> String {
+    let Ok(timestamp) = DateTime::parse_from_rfc3339(ts_iso) else {
+        return "-".to_string();
+    };
+    let elapsed_seconds = now
+        .signed_duration_since(timestamp.with_timezone(&Utc))
+        .num_seconds();
+    if elapsed_seconds <= 0 {
+        return "now".to_string();
+    }
+
+    let days = elapsed_seconds / 86_400;
+    let hours = (elapsed_seconds % 86_400) / 3_600;
+    let minutes = (elapsed_seconds % 3_600) / 60;
+    let seconds = elapsed_seconds % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h ago")
+    } else if hours > 0 {
+        let minute_unit = if minutes == 1 { "min" } else { "mins" };
+        format!("{hours}h {minutes}{minute_unit} ago")
+    } else if minutes > 0 {
+        let minute_unit = if minutes == 1 { "min" } else { "mins" };
+        format!("{minutes}{minute_unit} {seconds}s ago")
+    } else {
+        format!("{seconds}s ago")
+    }
+}
+
 fn compact_path_label(path: &Path, depth: usize) -> String {
     let components = path
         .components()
@@ -545,6 +600,7 @@ fn replay_selected_entry(
 #[derive(Clone, Copy)]
 enum JournalColumn {
     Time,
+    TimeSince,
     Status,
     Subject,
 }
@@ -552,6 +608,7 @@ enum JournalColumn {
 fn columns_for_filter(_filter: JournalFilter) -> Vec<JournalColumn> {
     vec![
         JournalColumn::Time,
+        JournalColumn::TimeSince,
         JournalColumn::Status,
         JournalColumn::Subject,
     ]
@@ -567,19 +624,66 @@ fn journal_table_window(len: usize, selected_index: usize, table_height: u16) ->
     (end.saturating_sub(capacity), end)
 }
 
+fn journal_detail_height(inner_height: u16) -> u16 {
+    u16::from(inner_height >= 5)
+}
+
+fn journal_page_rows(app_state: &AppState) -> usize {
+    let screen_area = app_state.screen_area;
+    if screen_area.width == 0 || screen_area.height == 0 {
+        return 1;
+    }
+
+    let area = centered_rect(88, 94, screen_area);
+    let search_panel_active =
+        app_state.ui.journal.is_searching || !app_state.ui.journal.search_query.is_empty();
+    let journal_area = if search_panel_active && area.height >= 7 {
+        ratatui::layout::Layout::vertical([Constraint::Length(3), Constraint::Min(1)]).split(area)
+            [1]
+    } else {
+        area
+    };
+    let panel_area = ratatui::layout::Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(journal_area)[1];
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::new(2, 2, 0, 0))
+        .inner(panel_area);
+    let detail_height = journal_detail_height(inner.height);
+    let spacer_height = u16::from(detail_height > 0);
+    let table_height = ratatui::layout::Layout::vertical([
+        Constraint::Min(3),
+        Constraint::Length(spacer_height),
+        Constraint::Length(detail_height),
+    ])
+    .split(inner)[0]
+        .height;
+
+    usize::from(table_height.saturating_sub(1).max(1))
+}
+
 fn column_header(column: JournalColumn, filter: JournalFilter) -> &'static str {
     match (column, filter) {
         (JournalColumn::Subject, JournalFilter::Commands) => "Action",
         (JournalColumn::Subject, _) => "Torrent",
         (JournalColumn::Time, _) => "Time",
+        (JournalColumn::TimeSince, _) => "Time Since",
         (JournalColumn::Status, _) => "Status",
     }
 }
 
-fn column_header_style(column: JournalColumn, ctx: &ThemeContext) -> Style {
+fn column_header_style(column: JournalColumn, filter: JournalFilter, ctx: &ThemeContext) -> Style {
     let color = match column {
-        JournalColumn::Time => ctx.theme.semantic.subtext0,
+        JournalColumn::Time => ctx.accent_peach(),
+        JournalColumn::TimeSince => ctx.accent_teal(),
         JournalColumn::Status => ctx.state_warning(),
+        JournalColumn::Subject if matches!(filter, JournalFilter::Commands) => {
+            ctx.accent_sapphire()
+        }
         JournalColumn::Subject => ctx.accent_sky(),
     };
     ctx.apply(Style::default().fg(color).bold())
@@ -588,6 +692,7 @@ fn column_header_style(column: JournalColumn, ctx: &ThemeContext) -> Style {
 fn column_constraint(column: JournalColumn, filter: JournalFilter) -> Constraint {
     match (filter, column) {
         (_, JournalColumn::Time) => Constraint::Length(13),
+        (_, JournalColumn::TimeSince) => Constraint::Length(15),
         (_, JournalColumn::Status) => Constraint::Length(22),
         (_, JournalColumn::Subject) => Constraint::Fill(1),
     }
@@ -622,7 +727,7 @@ fn event_status_style(entry: &EventJournalEntry, ctx: &ThemeContext) -> Style {
     }
 }
 
-fn activity_status_cell(activity: &JournalActivity<'_>, ctx: &ThemeContext) -> Cell<'static> {
+fn activity_status_spans(activity: &JournalActivity<'_>, ctx: &ThemeContext) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (index, entry) in activity.entries.iter().enumerate() {
         if index > 0 {
@@ -637,7 +742,11 @@ fn activity_status_cell(activity: &JournalActivity<'_>, ctx: &ThemeContext) -> C
             event_status_style(entry, ctx),
         ));
     }
-    Cell::from(Line::from(spans))
+    spans
+}
+
+fn activity_status_cell(activity: &JournalActivity<'_>, ctx: &ThemeContext) -> Cell<'static> {
+    Cell::from(Line::from(activity_status_spans(activity, ctx)))
 }
 
 fn activity_subject_label(activity: &JournalActivity<'_>, anonymize: bool) -> String {
@@ -674,11 +783,14 @@ fn column_cell(
     column: JournalColumn,
     activity: &JournalActivity<'_>,
     app_state: &AppState,
+    now: &DateTime<Utc>,
     ctx: &ThemeContext,
 ) -> Cell<'static> {
     match column {
         JournalColumn::Time => Cell::from(pretty_timestamp(&activity.latest().ts_iso))
             .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0))),
+        JournalColumn::TimeSince => Cell::from(time_since_label(&activity.latest().ts_iso, now))
+            .style(ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1))),
         JournalColumn::Status => activity_status_cell(activity, ctx),
         JournalColumn::Subject => Cell::from(activity_subject_label(
             activity,
@@ -688,63 +800,75 @@ fn column_cell(
     }
 }
 
-fn activity_detail_lines(
+fn activity_detail_line(
     activity: Option<&JournalActivity<'_>>,
     app_state: &AppState,
     ctx: &ThemeContext,
     width: u16,
-) -> Vec<Line<'static>> {
+) -> Line<'static> {
     let Some(activity) = activity else {
-        return vec![Line::from(Span::styled(
+        return Line::from(Span::styled(
             "No journal activities yet.",
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
-        ))];
+        ));
     };
 
-    let record_message_width = usize::from(width.saturating_sub(35));
-    let mut lines = activity
+    let latest = activity.latest();
+    let timestamp = detailed_timestamp(&latest.ts_iso);
+    let status_width = activity
         .entries
         .iter()
-        .map(|entry| {
-            let message = detail_text(Some(entry), app_state.anonymize_torrent_names);
-            Line::from(vec![
-                Span::styled("● ", event_status_style(entry, ctx)),
-                Span::styled(
-                    format!("{:<10}", event_type_label(entry)),
-                    event_status_style(entry, ctx),
-                ),
-                Span::styled(
-                    format!("{}  ", detailed_timestamp(&entry.ts_iso)),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-                ),
-                Span::styled(
-                    truncate_with_ellipsis(&message, record_message_width),
-                    ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
-                ),
-            ])
+        .enumerate()
+        .map(|(index, entry)| {
+            usize::from(index > 0) * 3 + 2 + event_type_label(entry).chars().count()
         })
-        .collect::<Vec<_>>();
+        .sum::<usize>();
+    let timestamp_width = timestamp.chars().count() + 4;
+    let source = (width >= 84)
+        .then(|| preferred_source_text(activity.source_entry()))
+        .flatten()
+        .map(|source| {
+            if app_state.anonymize_torrent_names {
+                "/path/to/source".to_string()
+            } else {
+                sanitize_text(&source)
+            }
+        })
+        .map(|source| truncate_with_ellipsis(&source, usize::from(width / 5).max(16)));
+    let source_width = source
+        .as_ref()
+        .map(|source| 10 + source.chars().count())
+        .unwrap_or(0);
+    let message_width = usize::from(width)
+        .saturating_sub(status_width)
+        .saturating_sub(timestamp_width)
+        .saturating_sub(source_width);
+    let message = truncate_with_ellipsis(
+        &detail_text(Some(latest), app_state.anonymize_torrent_names),
+        message_width,
+    );
 
-    if let Some(source) = preferred_source_text(activity.source_entry()) {
-        let source = if app_state.anonymize_torrent_names {
-            "/path/to/source".to_string()
-        } else {
-            sanitize_text(&source)
-        };
-        let source = truncate_with_ellipsis(&source, usize::from(width.saturating_sub(10)));
-        lines.push(Line::from(vec![
-            Span::styled(
-                "  Source  ",
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-            ),
-            Span::styled(
-                source,
-                ctx.apply(Style::default().fg(ctx.accent_sapphire())),
-            ),
-        ]));
+    let mut spans = activity_status_spans(activity, ctx);
+    spans.push(Span::styled(
+        format!("  {timestamp}  "),
+        ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+    ));
+    spans.push(Span::styled(
+        message,
+        ctx.apply(Style::default().fg(ctx.theme.semantic.text)),
+    ));
+    if let Some(source) = source {
+        spans.push(Span::styled(
+            "  Source  ",
+            ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
+        ));
+        spans.push(Span::styled(
+            source,
+            ctx.apply(Style::default().fg(ctx.accent_sapphire())),
+        ));
     }
 
-    lines
+    Line::from(spans)
 }
 
 pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
@@ -848,11 +972,8 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         .selected_index
         .min(activities.len().saturating_sub(1));
     let selected_activity = activities.get(selected_index);
-    let detail_lines = activity_detail_lines(selected_activity, app_state, ctx, inner.width);
-    let detail_height = u16::try_from(detail_lines.len())
-        .unwrap_or(u16::MAX)
-        .min(4)
-        .min(inner.height.saturating_sub(4));
+    let detail_line = activity_detail_line(selected_activity, app_state, ctx, inner.width);
+    let detail_height = journal_detail_height(inner.height);
     let spacer_height = u16::from(detail_height > 0);
     let rows = ratatui::layout::Layout::vertical([
         Constraint::Min(3),
@@ -864,6 +985,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let columns = columns_for_filter(app_state.ui.journal.filter);
     let (window_start, window_end) =
         journal_table_window(activities.len(), selected_index, rows[0].height);
+    let now = Utc::now();
     let body_rows = activities[window_start..window_end]
         .iter()
         .map(|activity| {
@@ -871,7 +993,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
                 columns
                     .iter()
                     .copied()
-                    .map(|column| column_cell(column, activity, app_state, ctx))
+                    .map(|column| column_cell(column, activity, app_state, &now, ctx))
                     .collect::<Vec<_>>(),
             )
         })
@@ -884,8 +1006,9 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let header_cells = columns
         .iter()
         .map(|column| {
-            Cell::from(column_header(*column, app_state.ui.journal.filter))
-                .style(column_header_style(*column, ctx))
+            Cell::from(column_header(*column, app_state.ui.journal.filter)).style(
+                column_header_style(*column, app_state.ui.journal.filter, ctx),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -908,7 +1031,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
 
     if detail_height > 0 {
         f.render_widget(
-            Paragraph::new(detail_lines).alignment(Alignment::Left),
+            Paragraph::new(detail_line).alignment(Alignment::Left),
             rows[2],
         );
     }
@@ -935,12 +1058,12 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         push_action("Tab", "mode", ActionTone::Mode);
         push_action("Enter", "keep", ActionTone::Confirm);
         push_action("Esc", "clear", ActionTone::Cancel);
-        push_action("↑/↓", "nav", ActionTone::Navigate);
+        push_action("↑/↓ PgUp/PgDn", "nav", ActionTone::Navigate);
     } else {
         push_action("Esc", "back", ActionTone::Cancel);
         push_action("Tab", "filter", ActionTone::Mode);
         push_action("/", "search", ActionTone::Search);
-        push_action("↑/↓", "nav", ActionTone::Navigate);
+        push_action("↑/↓ PgUp/PgDn", "nav", ActionTone::Navigate);
         push_action("Shift+Y", "replay", ActionTone::Replay);
     }
     let footer_hint = Paragraph::new(Line::from(footer_spans)).alignment(Alignment::Center);
@@ -1454,7 +1577,46 @@ mod tests {
     }
 
     #[test]
-    fn grouped_activity_renders_once_and_keeps_both_stage_details() {
+    fn detail_region_keeps_a_stable_height() {
+        assert_eq!(journal_detail_height(30), 1);
+        assert_eq!(journal_detail_height(8), 1);
+        assert_eq!(journal_detail_height(5), 1);
+        assert_eq!(journal_detail_height(4), 0);
+    }
+
+    #[test]
+    fn page_keys_move_by_the_visible_table_capacity() {
+        let mut app_state = base_state();
+        app_state.screen_area = ratatui::prelude::Rect::new(0, 0, 120, 30);
+        app_state.event_journal_state.entries = (0..40)
+            .map(|id| EventJournalEntry {
+                id,
+                category: EventCategory::Ingest,
+                event_type: EventType::IngestAdded,
+                torrent_name: Some(format!("Sample Item {id}")),
+                ..Default::default()
+            })
+            .collect();
+        let page_rows = journal_page_rows(&app_state);
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+        assert_eq!(app_state.ui.journal.selected_index, page_rows);
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+        assert_eq!(app_state.ui.journal.selected_index, 0);
+    }
+
+    #[test]
+    fn grouped_activity_uses_one_line_with_latest_detail() {
         let mut app_state = base_state();
         app_state.ui.journal.filter = JournalFilter::Queue;
         app_state.ui.journal.selected_index = 99;
@@ -1487,16 +1649,13 @@ mod tests {
         assert!(rendered.contains("1 activity"), "{rendered}");
         assert!(rendered.contains("2 records"), "{rendered}");
         assert_eq!(rendered.matches("Sample Delta").count(), 1, "{rendered}");
-        assert!(rendered.contains("Queued ingest item"), "{rendered}");
         assert!(rendered.contains("Added ingest item"), "{rendered}");
-        assert!(
-            rendered.contains("/watch/sample-delta.magnet"),
-            "{rendered}"
-        );
+        assert!(!rendered.contains("Queued ingest item"), "{rendered}");
+        assert!(rendered.contains("/watch/sample"), "{rendered}");
     }
 
     #[test]
-    fn narrow_render_keeps_each_stage_and_source_on_separate_rows() {
+    fn narrow_render_keeps_latest_detail_on_one_line() {
         let mut app_state = base_state();
         app_state.ui.journal.filter = JournalFilter::Queue;
         app_state.event_journal_state.entries = vec![
@@ -1525,12 +1684,8 @@ mod tests {
 
         let rendered = render_journal_text(&app_state, 80, 24);
 
-        assert!(rendered.contains("Queue detail"), "{rendered}");
         assert!(rendered.contains("Result detail"), "{rendered}");
-        assert!(
-            rendered.contains("/watch/sample-epsilon.magnet"),
-            "{rendered}"
-        );
+        assert!(!rendered.contains("Queue detail"), "{rendered}");
     }
 
     #[test]
@@ -1543,6 +1698,25 @@ mod tests {
     fn pretty_timestamp_formats_rfc3339_values() {
         let label = pretty_timestamp("2026-03-15T14:26:28Z");
         assert!(label.contains("Mar"));
+    }
+
+    #[test]
+    fn time_since_label_uses_two_live_time_units() {
+        let now = DateTime::parse_from_rfc3339("2026-03-15T15:00:00Z")
+            .expect("valid now timestamp")
+            .with_timezone(&Utc);
+
+        assert_eq!(time_since_label("2026-03-15T15:00:00Z", &now), "now");
+        assert_eq!(time_since_label("2026-03-15T14:59:40Z", &now), "20s ago");
+        assert_eq!(
+            time_since_label("2026-03-15T14:29:40Z", &now),
+            "30mins 20s ago"
+        );
+        assert_eq!(
+            time_since_label("2026-03-15T12:55:00Z", &now),
+            "2h 5mins ago"
+        );
+        assert_eq!(time_since_label("invalid", &now), "-");
     }
 
     #[test]
@@ -1581,17 +1755,24 @@ mod tests {
         };
 
         assert_eq!(command_action_label(&entry), "pause");
-        assert_eq!(columns_for_filter(JournalFilter::Commands).len(), 3);
+        assert_eq!(columns_for_filter(JournalFilter::Commands).len(), 4);
         assert_eq!(
             column_header(
                 columns_for_filter(JournalFilter::Commands)[1],
+                JournalFilter::Commands
+            ),
+            "Time Since"
+        );
+        assert_eq!(
+            column_header(
+                columns_for_filter(JournalFilter::Commands)[2],
                 JournalFilter::Commands
             ),
             "Status"
         );
         assert_eq!(
             column_header(
-                columns_for_filter(JournalFilter::Commands)[2],
+                columns_for_filter(JournalFilter::Commands)[3],
                 JournalFilter::Commands
             ),
             "Action"
@@ -1600,14 +1781,14 @@ mod tests {
     }
 
     #[test]
-    fn every_filter_uses_the_same_three_core_columns() {
+    fn every_filter_uses_the_same_four_core_columns() {
         for filter in [
             JournalFilter::All,
             JournalFilter::Queue,
             JournalFilter::Commands,
             JournalFilter::Health,
         ] {
-            assert_eq!(columns_for_filter(filter).len(), 3);
+            assert_eq!(columns_for_filter(filter).len(), 4);
         }
     }
 
