@@ -2075,6 +2075,7 @@ impl JournalFilter {
 pub struct JournalUiState {
     pub filter: JournalFilter,
     pub selected_index: usize,
+    pub scroll_offset: usize,
     pub status_message: Option<String>,
     pub is_searching: bool,
     pub search_query: String,
@@ -2086,6 +2087,7 @@ impl Default for JournalUiState {
         Self {
             filter: JournalFilter::default(),
             selected_index: 0,
+            scroll_offset: 0,
             status_message: None,
             is_searching: false,
             search_query: String::new(),
@@ -4933,6 +4935,8 @@ impl App {
     ) -> bool {
         match mode {
             AppMode::PowerSaving => ui_needs_redraw,
+            // The one-second stats tick dirties the Journal often enough to refresh live ages.
+            AppMode::Journal => ui_needs_redraw,
             AppMode::Normal => ui_needs_redraw || normal_animation_active,
             _ => true,
         }
@@ -10734,6 +10738,12 @@ mod tests {
             true,
             false
         ));
+    }
+
+    #[test]
+    fn should_only_draw_dirty_in_journal_mode() {
+        assert!(!App::should_draw_this_frame(&AppMode::Journal, false, true));
+        assert!(App::should_draw_this_frame(&AppMode::Journal, true, false));
     }
 
     #[test]

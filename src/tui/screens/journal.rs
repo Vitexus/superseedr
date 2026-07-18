@@ -10,7 +10,7 @@ use crate::tui::action_style::{footer_key_style, ActionTone};
 use crate::tui::app_command::spawn_app_command_sender;
 use crate::tui::formatters::{centered_rect, sanitize_text, truncate_with_ellipsis};
 use crate::tui::screen_context::ScreenContext;
-use crate::tui::screens::input_panel::draw_prompt_panel;
+use crate::tui::screens::input_panel::draw_prompt_panel_with_cursor;
 use chrono::{DateTime, Local, Utc};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -20,6 +20,7 @@ use ratatui::crossterm::event::{
 use ratatui::prelude::{Alignment, Constraint, Frame, Line, Modifier, Rect, Span, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::path::{Component, Path};
 use tokio::sync::{broadcast, mpsc};
 
@@ -42,7 +43,7 @@ enum JournalAction {
     ToggleSearchMode,
 }
 
-fn map_key_to_journal_action(key: KeyEvent, search_panel_active: bool) -> Option<JournalAction> {
+fn map_key_to_journal_action(key: KeyEvent, search_editing: bool) -> Option<JournalAction> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
@@ -50,11 +51,11 @@ fn map_key_to_journal_action(key: KeyEvent, search_panel_active: bool) -> Option
     let has_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let has_alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    if search_panel_active && matches!(key.code, KeyCode::Tab) {
+    if search_editing && matches!(key.code, KeyCode::Tab) {
         return Some(JournalAction::ToggleSearchMode);
     }
 
-    if search_panel_active {
+    if search_editing {
         return match key.code {
             KeyCode::Esc => Some(JournalAction::SearchCancel),
             KeyCode::Enter => Some(JournalAction::SearchCommit),
@@ -106,9 +107,7 @@ fn handle_event_inner(
         return;
     };
 
-    let search_panel_active =
-        app_state.ui.journal.is_searching || !app_state.ui.journal.search_query.is_empty();
-    let Some(action) = map_key_to_journal_action(key, search_panel_active) else {
+    let Some(action) = map_key_to_journal_action(key, app_state.ui.journal.is_searching) else {
         return;
     };
 
@@ -119,20 +118,38 @@ fn handle_event_inner(
         JournalAction::FilterNext => {
             app_state.ui.journal.filter = app_state.ui.journal.filter.next();
             app_state.ui.journal.selected_index = 0;
+            app_state.ui.journal.scroll_offset = 0;
         }
         JournalAction::FilterPrev => {
             app_state.ui.journal.filter = app_state.ui.journal.filter.prev();
             app_state.ui.journal.selected_index = 0;
+            app_state.ui.journal.scroll_offset = 0;
         }
         JournalAction::MoveUp => {
             app_state.ui.journal.selected_index =
                 app_state.ui.journal.selected_index.saturating_sub(1);
+            app_state.ui.journal.scroll_offset = app_state
+                .ui
+                .journal
+                .scroll_offset
+                .min(app_state.ui.journal.selected_index);
         }
         JournalAction::MoveDown => {
             let len = journal_activities(app_state).len();
             if len > 0 {
+                let page_rows = journal_page_rows(app_state);
                 app_state.ui.journal.selected_index =
                     (app_state.ui.journal.selected_index + 1).min(len - 1);
+                if app_state.ui.journal.selected_index
+                    >= app_state.ui.journal.scroll_offset.saturating_add(page_rows)
+                {
+                    app_state.ui.journal.scroll_offset = app_state
+                        .ui
+                        .journal
+                        .selected_index
+                        .saturating_add(1)
+                        .saturating_sub(page_rows);
+                }
             }
         }
         JournalAction::MovePageUp => {
@@ -142,6 +159,12 @@ fn handle_event_inner(
                 .journal
                 .selected_index
                 .saturating_sub(page_rows);
+            app_state.ui.journal.scroll_offset = app_state
+                .ui
+                .journal
+                .scroll_offset
+                .saturating_sub(page_rows)
+                .min(app_state.ui.journal.selected_index);
         }
         JournalAction::MovePageDown => {
             let len = journal_activities(app_state).len();
@@ -153,6 +176,12 @@ fn handle_event_inner(
                     .selected_index
                     .saturating_add(page_rows)
                     .min(len - 1);
+                app_state.ui.journal.scroll_offset = app_state
+                    .ui
+                    .journal
+                    .scroll_offset
+                    .saturating_add(page_rows)
+                    .min(len.saturating_sub(page_rows));
             }
         }
         JournalAction::ReplaySelected => {
@@ -162,18 +191,22 @@ fn handle_event_inner(
             app_state.ui.journal.is_searching = true;
             app_state.ui.journal.search_mode = SearchMode::Regex;
             app_state.ui.journal.selected_index = 0;
+            app_state.ui.journal.scroll_offset = 0;
         }
         JournalAction::SearchInsert(c) => {
             app_state.ui.journal.search_query.push(c);
             app_state.ui.journal.selected_index = 0;
+            app_state.ui.journal.scroll_offset = 0;
         }
         JournalAction::SearchBackspace => {
             app_state.ui.journal.search_query.pop();
             app_state.ui.journal.selected_index = 0;
+            app_state.ui.journal.scroll_offset = 0;
         }
         JournalAction::SearchClear => {
             app_state.ui.journal.search_query.clear();
             app_state.ui.journal.selected_index = 0;
+            app_state.ui.journal.scroll_offset = 0;
         }
         JournalAction::SearchCommit => {
             app_state.ui.journal.is_searching = false;
@@ -182,6 +215,7 @@ fn handle_event_inner(
             app_state.ui.journal.is_searching = false;
             app_state.ui.journal.search_query.clear();
             app_state.ui.journal.selected_index = 0;
+            app_state.ui.journal.scroll_offset = 0;
         }
         JournalAction::ToggleSearchMode => {
             app_state.ui.journal.search_mode = match app_state.ui.journal.search_mode {
@@ -189,8 +223,10 @@ fn handle_event_inner(
                 SearchMode::Regex => SearchMode::Fuzzy,
             };
             app_state.ui.journal.selected_index = 0;
+            app_state.ui.journal.scroll_offset = 0;
         }
     }
+    app_state.ui.needs_redraw = true;
 }
 
 fn entry_matches_filter(entry: &EventJournalEntry, filter: JournalFilter) -> bool {
@@ -219,29 +255,45 @@ struct ActivityKey<'a> {
 
 #[derive(Debug)]
 struct JournalActivity<'a> {
-    entries: Vec<&'a EventJournalEntry>,
+    first: &'a EventJournalEntry,
+    second: Option<&'a EventJournalEntry>,
 }
 
 impl<'a> JournalActivity<'a> {
     fn new(entry: &'a EventJournalEntry) -> Self {
         Self {
-            entries: vec![entry],
+            first: entry,
+            second: None,
         }
     }
 
+    fn prepend(&mut self, entry: &'a EventJournalEntry) {
+        debug_assert!(self.second.is_none());
+        self.second = Some(self.first);
+        self.first = entry;
+    }
+
+    fn entries(&self) -> impl DoubleEndedIterator<Item = &'a EventJournalEntry> {
+        [Some(self.first), self.second].into_iter().flatten()
+    }
+
+    fn len(&self) -> usize {
+        1 + usize::from(self.second.is_some())
+    }
+
+    #[cfg(test)]
+    fn entry(&self, index: usize) -> Option<&'a EventJournalEntry> {
+        self.entries().nth(index)
+    }
+
     fn latest(&self) -> &'a EventJournalEntry {
-        self.entries
-            .last()
-            .copied()
-            .expect("journal activities always contain an entry")
+        self.second.unwrap_or(self.first)
     }
 
     fn source_entry(&self) -> &'a EventJournalEntry {
-        self.entries
-            .iter()
+        self.entries()
             .rev()
             .find(|entry| entry.source_path.is_some() || entry.source_watch_folder.is_some())
-            .copied()
             .unwrap_or_else(|| self.latest())
     }
 }
@@ -285,7 +337,8 @@ fn activity_key(entry: &EventJournalEntry) -> Option<ActivityKey<'_>> {
 
 fn journal_activities(app_state: &AppState) -> Vec<JournalActivity<'_>> {
     let mut activities = Vec::<JournalActivity<'_>>::new();
-    let mut pending_terminal_activities = HashMap::<ActivityKey<'_>, Vec<usize>>::new();
+    let mut pending_terminal_activities = HashMap::<ActivityKey<'_>, usize>::new();
+    let mut previous_pending_activity = Vec::<Option<usize>>::new();
 
     for entry in app_state.event_journal_state.entries.iter().rev() {
         if !entry_matches_filter(entry, app_state.ui.journal.filter) {
@@ -296,22 +349,26 @@ fn journal_activities(app_state: &AppState) -> Vec<JournalActivity<'_>> {
             (ActivityPhase::Terminal, Some(key)) => {
                 let activity_index = activities.len();
                 activities.push(JournalActivity::new(entry));
-                pending_terminal_activities
-                    .entry(key)
-                    .or_default()
-                    .push(activity_index);
+                previous_pending_activity
+                    .push(pending_terminal_activities.insert(key, activity_index));
             }
             (ActivityPhase::Queued, Some(key)) => {
-                let terminal_activity = pending_terminal_activities
-                    .get_mut(&key)
-                    .and_then(|activity_indices| activity_indices.pop());
-                if let Some(activity_index) = terminal_activity {
-                    activities[activity_index].entries.insert(0, entry);
+                if let Some(activity_index) = pending_terminal_activities.get(&key).copied() {
+                    if let Some(previous) = previous_pending_activity[activity_index] {
+                        pending_terminal_activities.insert(key, previous);
+                    } else {
+                        pending_terminal_activities.remove(&key);
+                    }
+                    activities[activity_index].prepend(entry);
                 } else {
                     activities.push(JournalActivity::new(entry));
+                    previous_pending_activity.push(None);
                 }
             }
-            _ => activities.push(JournalActivity::new(entry)),
+            _ => {
+                activities.push(JournalActivity::new(entry));
+                previous_pending_activity.push(None);
+            }
         }
     }
 
@@ -319,11 +376,10 @@ fn journal_activities(app_state: &AppState) -> Vec<JournalActivity<'_>> {
     if !query.is_empty() {
         match app_state.ui.journal.search_mode {
             SearchMode::Fuzzy => {
-                let matcher = SkimMatcherV2::default();
-                let query = query.to_lowercase();
+                let matcher = SkimMatcherV2::default().ignore_case();
                 activities.retain(|activity| {
                     matcher
-                        .fuzzy_match(&activity_search_haystack(activity).to_lowercase(), &query)
+                        .fuzzy_match(&activity_search_haystack(activity), query)
                         .is_some()
                 });
             }
@@ -332,8 +388,7 @@ fn journal_activities(app_state: &AppState) -> Vec<JournalActivity<'_>> {
                     .case_insensitive(true)
                     .build();
                 if let Ok(regex) = regex {
-                    activities
-                        .retain(|activity| regex.is_match(&activity_search_haystack(activity)));
+                    activities.retain(|activity| activity_matches_regex(activity, &regex));
                 } else {
                     activities.clear();
                 }
@@ -344,22 +399,78 @@ fn journal_activities(app_state: &AppState) -> Vec<JournalActivity<'_>> {
 }
 
 fn activity_search_haystack(activity: &JournalActivity<'_>) -> String {
-    activity
-        .entries
-        .iter()
-        .flat_map(|entry| {
-            [
-                event_type_label(entry).to_string(),
-                command_action_label(entry),
-                torrent_label(entry, false),
-                source_label(entry, false),
-                detail_text(Some(entry), false),
-                entry.host_id.clone().unwrap_or_default(),
-                entry.info_hash_hex.clone().unwrap_or_default(),
-            ]
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut haystack = String::with_capacity(activity.len().saturating_mul(192));
+    for entry in activity.entries() {
+        append_search_field(&mut haystack, event_type_label(entry));
+        if let EventDetails::Control { action, .. } = &entry.details {
+            append_search_field(&mut haystack, action);
+        }
+        append_search_field(&mut haystack, entry.torrent_name.as_deref().unwrap_or("-"));
+        if let Some(path) = entry
+            .source_path
+            .as_deref()
+            .or(entry.source_watch_folder.as_deref())
+        {
+            if !haystack.is_empty() {
+                haystack.push(' ');
+            }
+            let _ = write!(haystack, "{}", path.display());
+        } else {
+            append_search_field(&mut haystack, "-");
+        }
+        append_search_field(
+            &mut haystack,
+            entry.message.as_deref().unwrap_or("No details recorded."),
+        );
+        if let Some(host_id) = entry.host_id.as_deref() {
+            append_search_field(&mut haystack, host_id);
+        }
+        if let Some(info_hash) = entry.info_hash_hex.as_deref() {
+            append_search_field(&mut haystack, info_hash);
+        }
+    }
+    haystack
+}
+
+fn append_search_field(haystack: &mut String, field: &str) {
+    if field.is_empty() {
+        return;
+    }
+    if !haystack.is_empty() {
+        haystack.push(' ');
+    }
+    haystack.push_str(field);
+}
+
+fn activity_matches_regex(activity: &JournalActivity<'_>, regex: &regex::Regex) -> bool {
+    activity.entries().any(|entry| {
+        regex.is_match(event_type_label(entry))
+            || matches!(
+                &entry.details,
+                EventDetails::Control { action, .. } if regex.is_match(action)
+            )
+            || entry
+                .torrent_name
+                .as_deref()
+                .map_or_else(|| regex.is_match("-"), |name| regex.is_match(name))
+            || entry
+                .source_path
+                .as_deref()
+                .or(entry.source_watch_folder.as_deref())
+                .map_or_else(
+                    || regex.is_match("-"),
+                    |path| regex.is_match(&path.to_string_lossy()),
+                )
+            || regex.is_match(entry.message.as_deref().unwrap_or("No details recorded."))
+            || entry
+                .host_id
+                .as_deref()
+                .is_some_and(|host_id| regex.is_match(host_id))
+            || entry
+                .info_hash_hex
+                .as_deref()
+                .is_some_and(|info_hash| regex.is_match(info_hash))
+    })
 }
 
 fn event_type_label(entry: &EventJournalEntry) -> &'static str {
@@ -383,36 +494,6 @@ fn command_action_label(entry: &EventJournalEntry) -> String {
         EventDetails::Control { action, .. } => sanitize_text(action),
         _ => event_type_label(entry).to_string(),
     }
-}
-
-fn source_label(entry: &EventJournalEntry, anonymize: bool) -> String {
-    if anonymize {
-        return "/path/to/source".to_string();
-    }
-
-    entry
-        .source_path
-        .as_ref()
-        .map(|path| compact_path_label(path, 1))
-        .or_else(|| {
-            entry
-                .source_watch_folder
-                .as_ref()
-                .map(|path| compact_path_label(path, 1))
-        })
-        .unwrap_or_else(|| "-".to_string())
-}
-
-fn torrent_label(entry: &EventJournalEntry, anonymize: bool) -> String {
-    if anonymize {
-        return "Torrent".to_string();
-    }
-
-    entry
-        .torrent_name
-        .as_ref()
-        .map(|name| sanitize_text(name))
-        .unwrap_or_else(|| "-".to_string())
 }
 
 fn preferred_source_text(entry: &EventJournalEntry) -> Option<String> {
@@ -555,8 +636,7 @@ fn replay_selected_entry(
     };
 
     let Some(source_path) = activity
-        .entries
-        .iter()
+        .entries()
         .rev()
         .find_map(|entry| entry.source_path.as_ref())
     else {
@@ -612,14 +692,24 @@ fn columns_for_filter(_filter: JournalFilter) -> Vec<JournalColumn> {
     ]
 }
 
-fn journal_table_window(len: usize, selected_index: usize, table_height: u16) -> (usize, usize) {
+fn journal_table_window(
+    len: usize,
+    selected_index: usize,
+    requested_offset: usize,
+    table_height: u16,
+) -> (usize, usize) {
     let capacity = usize::from(table_height.saturating_sub(1).max(1));
-    let end = if selected_index < capacity {
-        capacity.min(len)
-    } else {
-        selected_index.saturating_add(1).min(len)
-    };
-    (end.saturating_sub(capacity), end)
+    let max_offset = len.saturating_sub(capacity);
+    let mut start = requested_offset.min(max_offset);
+    if selected_index < start {
+        start = selected_index;
+    } else if selected_index >= start.saturating_add(capacity) {
+        start = selected_index
+            .saturating_add(1)
+            .saturating_sub(capacity)
+            .min(max_offset);
+    }
+    (start, start.saturating_add(capacity).min(len))
 }
 
 fn journal_detail_height(inner_height: u16) -> u16 {
@@ -769,7 +859,7 @@ fn event_status_style(entry: &EventJournalEntry, ctx: &ThemeContext) -> Style {
 
 fn activity_status_spans(activity: &JournalActivity<'_>, ctx: &ThemeContext) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
-    for (index, entry) in activity.entries.iter().enumerate() {
+    for (index, entry) in activity.entries().enumerate() {
         if index > 0 {
             spans.push(Span::styled(
                 " → ",
@@ -800,8 +890,7 @@ fn activity_subject_label(activity: &JournalActivity<'_>, anonymize: bool) -> St
     }
 
     activity
-        .entries
-        .iter()
+        .entries()
         .rev()
         .filter_map(|entry| entry.torrent_name.as_deref())
         .find(|name| !name.trim().is_empty())
@@ -853,8 +942,7 @@ fn activity_detail_line(
     let latest = activity.latest();
     let timestamp = detailed_timestamp(&latest.ts_iso);
     let status_width = activity
-        .entries
-        .iter()
+        .entries()
         .enumerate()
         .map(|(index, entry)| {
             usize::from(index > 0) * 3 + 2 + event_type_label(entry).chars().count()
@@ -918,10 +1006,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     f.render_widget(Clear, area);
     let screen_regions = journal_screen_regions(f.area(), search_panel_active);
 
-    let entry_count = activities
-        .iter()
-        .map(|activity| activity.entries.len())
-        .sum::<usize>();
+    let entry_count = activities.iter().map(JournalActivity::len).sum::<usize>();
     let activity_label = if activities.len() == 1 {
         "1 activity".to_string()
     } else {
@@ -1021,6 +1106,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     let (window_start, window_end) = journal_table_window(
         activities.len(),
         selected_index,
+        app_state.ui.journal.scroll_offset,
         content_regions.table.height,
     );
     let now = Utc::now();
@@ -1112,7 +1198,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
         ));
     };
-    if search_panel_active {
+    if app_state.ui.journal.is_searching {
         push_action("type", "query", ActionTone::Edit);
         push_action("Tab", "mode", ActionTone::Mode);
         push_action("Enter", "keep", ActionTone::Confirm);
@@ -1172,12 +1258,13 @@ fn draw_journal_search_panel(
         format!("  {visible_count} matches"),
         ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
     ));
-    draw_prompt_panel(
+    draw_prompt_panel_with_cursor(
         f,
         area,
         " Journal Search ".to_string(),
         sanitize_text(&app_state.ui.journal.search_query),
         trailing_spans,
+        app_state.ui.journal.is_searching,
         ctx,
     );
 }
@@ -1456,6 +1543,81 @@ mod tests {
     }
 
     #[test]
+    fn journal_enter_keeps_query_and_returns_to_normal_navigation() {
+        let mut app_state = base_state();
+        let (tx, _rx) = mpsc::channel(1);
+        app_state.ui.journal.is_searching = true;
+        app_state.ui.journal.search_query = "sample".to_string();
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+
+        assert!(!app_state.ui.journal.is_searching);
+        assert_eq!(app_state.ui.journal.search_query, "sample");
+        assert_eq!(app_state.ui.journal.filter, JournalFilter::Queue);
+        assert_eq!(app_state.ui.journal.search_mode, SearchMode::Regex);
+    }
+
+    #[test]
+    fn retained_search_query_hides_the_edit_cursor() {
+        let mut app_state = base_state();
+        let (tx, _rx) = mpsc::channel(1);
+        app_state.ui.journal.is_searching = true;
+        app_state.ui.journal.search_query = "sample".to_string();
+
+        let editing = render_journal_text(&app_state, 120, 40);
+        assert!(editing.contains("sample_"), "{editing}");
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+
+        let retained = render_journal_text(&app_state, 120, 40);
+        assert!(retained.contains("sample"), "{retained}");
+        assert!(!retained.contains("sample_"), "{retained}");
+    }
+
+    #[test]
+    fn regex_search_matches_fields_without_a_joined_haystack() {
+        let entry = EventJournalEntry {
+            category: EventCategory::Ingest,
+            event_type: EventType::IngestAdded,
+            torrent_name: Some("Sample Item".to_string()),
+            source_path: Some(Path::new("/watch/sample-source.magnet").to_path_buf()),
+            host_id: Some("node-alpha".to_string()),
+            info_hash_hex: Some("a1b2c3".to_string()),
+            message: Some("Ingest completed normally".to_string()),
+            ..Default::default()
+        };
+        let activity = JournalActivity::new(&entry);
+
+        for pattern in [
+            "added",
+            "sample item",
+            "sample-source",
+            "node-alpha",
+            "a1b2c3",
+            "completed normally",
+        ] {
+            let regex = regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .expect("valid search regex");
+            assert!(activity_matches_regex(&activity, &regex), "{pattern}");
+        }
+    }
+
+    #[test]
     fn filter_selection_matches_requested_groups() {
         let mut app_state = base_state();
 
@@ -1504,8 +1666,8 @@ mod tests {
         let activities = journal_activities(&app_state);
 
         assert_eq!(activities.len(), 1);
-        assert_eq!(activities[0].entries.len(), 2);
-        assert_eq!(activities[0].entries[0].id, 10);
+        assert_eq!(activities[0].len(), 2);
+        assert_eq!(activities[0].entry(0).expect("queued entry").id, 10);
         assert_eq!(activities[0].latest().id, 11);
         assert_eq!(
             activity_subject_label(&activities[0], false),
@@ -1578,9 +1740,9 @@ mod tests {
         let activities = journal_activities(&app_state);
 
         assert_eq!(activities.len(), 2);
-        assert_eq!(activities[0].entries.len(), 2);
+        assert_eq!(activities[0].len(), 2);
         assert_eq!(activities[0].latest().id, 23);
-        assert_eq!(activities[1].entries.len(), 2);
+        assert_eq!(activities[1].len(), 2);
         assert_eq!(activities[1].latest().id, 21);
     }
 
@@ -1606,9 +1768,9 @@ mod tests {
         let activities = journal_activities(&app_state);
 
         assert_eq!(activities.len(), 2);
-        assert_eq!(activities[0].entries[0].id, 25);
+        assert_eq!(activities[0].entry(0).expect("queued entry").id, 25);
         assert_eq!(activities[0].latest().id, 26);
-        assert_eq!(activities[1].entries.len(), 1);
+        assert_eq!(activities[1].len(), 1);
         assert_eq!(activities[1].latest().id, 24);
     }
 
@@ -1655,15 +1817,17 @@ mod tests {
         let activities = journal_activities(&app_state);
 
         assert_eq!(activities.len(), 3);
-        assert_eq!(activities[0].entries.len(), 2);
+        assert_eq!(activities[0].len(), 2);
         assert_eq!(
-            activities[0].entries[0].host_id.as_deref(),
+            activities[0]
+                .entry(0)
+                .expect("queued entry")
+                .host_id
+                .as_deref(),
             Some("host-beta")
         );
         assert_eq!(activities[0].latest().id, 30);
-        assert!(activities[1..]
-            .iter()
-            .all(|activity| activity.entries.len() == 1));
+        assert!(activities[1..].iter().all(|activity| activity.len() == 1));
     }
 
     #[test]
@@ -1704,9 +1868,9 @@ mod tests {
         let activities = journal_activities(&app_state);
 
         assert_eq!(activities.len(), 2);
-        assert_eq!(activities[0].entries[0].id, 31);
+        assert_eq!(activities[0].entry(0).expect("queued entry").id, 31);
         assert_eq!(activities[0].latest().id, 33);
-        assert_eq!(activities[1].entries[0].id, 30);
+        assert_eq!(activities[1].entry(0).expect("queued entry").id, 30);
         assert_eq!(activities[1].latest().id, 32);
     }
 
@@ -1744,11 +1908,11 @@ mod tests {
 
     #[test]
     fn table_window_builds_only_the_visible_rows_around_selection() {
-        assert_eq!(journal_table_window(100, 0, 6), (0, 5));
-        assert_eq!(journal_table_window(100, 4, 6), (0, 5));
-        assert_eq!(journal_table_window(100, 5, 6), (1, 6));
-        assert_eq!(journal_table_window(100, 73, 6), (69, 74));
-        assert_eq!(journal_table_window(3, 2, 6), (0, 3));
+        assert_eq!(journal_table_window(100, 0, 0, 6), (0, 5));
+        assert_eq!(journal_table_window(100, 4, 0, 6), (0, 5));
+        assert_eq!(journal_table_window(100, 5, 0, 6), (1, 6));
+        assert_eq!(journal_table_window(100, 73, 69, 6), (69, 74));
+        assert_eq!(journal_table_window(3, 2, 0, 6), (0, 3));
     }
 
     #[test]
@@ -1763,7 +1927,7 @@ mod tests {
     fn page_keys_move_by_the_visible_table_capacity() {
         let mut app_state = base_state();
         app_state.screen_area = ratatui::prelude::Rect::new(0, 0, 120, 30);
-        app_state.event_journal_state.entries = (0..40)
+        app_state.event_journal_state.entries = (0..100)
             .map(|id| EventJournalEntry {
                 id,
                 category: EventCategory::Ingest,
@@ -1781,6 +1945,23 @@ mod tests {
             &tx,
         );
         assert_eq!(app_state.ui.journal.selected_index, page_rows);
+        assert_eq!(app_state.ui.journal.scroll_offset, page_rows);
+
+        let screen_regions = journal_screen_regions(app_state.screen_area, false);
+        let inner = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(2, 2, 0, 0))
+            .inner(screen_regions.panel);
+        assert_eq!(
+            journal_table_window(
+                100,
+                app_state.ui.journal.selected_index,
+                app_state.ui.journal.scroll_offset,
+                journal_content_regions(inner).table.height,
+            )
+            .0,
+            page_rows
+        );
 
         handle_event(
             CrosstermEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
@@ -1788,6 +1969,7 @@ mod tests {
             &tx,
         );
         assert_eq!(app_state.ui.journal.selected_index, 0);
+        assert_eq!(app_state.ui.journal.scroll_offset, 0);
     }
 
     #[test]
@@ -1906,8 +2088,8 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(torrent_label(&entry, true), "Torrent");
-        assert_eq!(source_label(&entry, true), "/path/to/source");
+        let activity = JournalActivity::new(&entry);
+        assert_eq!(activity_subject_label(&activity, true), "Torrent");
 
         let details = detail_text(Some(&entry), true);
         assert!(!details.contains("Sample Alpha"));
