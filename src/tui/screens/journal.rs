@@ -138,6 +138,11 @@ fn handle_event_inner(
             let len = journal_activities(app_state).len();
             if len > 0 {
                 let page_rows = journal_page_rows(app_state);
+                app_state.ui.journal.scroll_offset = app_state
+                    .ui
+                    .journal
+                    .scroll_offset
+                    .min(app_state.ui.journal.selected_index);
                 app_state.ui.journal.selected_index =
                     (app_state.ui.journal.selected_index + 1).min(len - 1);
                 if app_state.ui.journal.selected_index
@@ -404,17 +409,20 @@ fn activity_search_haystack(activity: &JournalActivity<'_>) -> String {
         append_search_field(&mut haystack, event_type_label(entry));
         append_event_detail_search_fields(&mut haystack, &entry.details);
         append_search_field(&mut haystack, entry.torrent_name.as_deref().unwrap_or("-"));
-        if let Some(path) = entry
-            .source_path
-            .as_deref()
-            .or(entry.source_watch_folder.as_deref())
+        if entry.source_path.is_none() && entry.source_watch_folder.is_none() {
+            append_search_field(&mut haystack, "-");
+        }
+        for path in [
+            entry.source_path.as_deref(),
+            entry.source_watch_folder.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if !haystack.is_empty() {
                 haystack.push(' ');
             }
             let _ = write!(haystack, "{}", path.display());
-        } else {
-            append_search_field(&mut haystack, "-");
         }
         append_search_field(
             &mut haystack,
@@ -449,6 +457,19 @@ fn append_search_number(haystack: &mut String, number: usize) {
 
 fn append_event_detail_search_fields(haystack: &mut String, details: &EventDetails) {
     match details {
+        EventDetails::Ingest {
+            download_path,
+            container_name,
+            payload_path,
+            ..
+        } => {
+            for path in [download_path, payload_path].into_iter().flatten() {
+                append_search_field(haystack, &path.to_string_lossy());
+            }
+            if let Some(container_name) = container_name.as_deref() {
+                append_search_field(haystack, container_name);
+            }
+        }
         EventDetails::Control {
             action,
             target_info_hash_hex,
@@ -486,6 +507,20 @@ fn append_event_detail_search_fields(haystack: &mut String, details: &EventDetai
 
 fn event_details_match_regex(details: &EventDetails, regex: &regex::Regex) -> bool {
     match details {
+        EventDetails::Ingest {
+            download_path,
+            container_name,
+            payload_path,
+            ..
+        } => {
+            [download_path, payload_path]
+                .into_iter()
+                .flatten()
+                .any(|path| regex.is_match(&path.to_string_lossy()))
+                || container_name
+                    .as_deref()
+                    .is_some_and(|name| regex.is_match(name))
+        }
         EventDetails::Control {
             action,
             target_info_hash_hex,
@@ -530,11 +565,14 @@ fn activity_matches_regex(activity: &JournalActivity<'_>, regex: &regex::Regex) 
             || entry
                 .source_path
                 .as_deref()
-                .or(entry.source_watch_folder.as_deref())
-                .map_or_else(
-                    || regex.is_match("-"),
-                    |path| regex.is_match(&path.to_string_lossy()),
-                )
+                .is_some_and(|path| regex.is_match(&path.to_string_lossy()))
+            || entry
+                .source_watch_folder
+                .as_deref()
+                .is_some_and(|path| regex.is_match(&path.to_string_lossy()))
+            || (entry.source_path.is_none()
+                && entry.source_watch_folder.is_none()
+                && regex.is_match("-"))
             || regex.is_match(entry.message.as_deref().unwrap_or("No details recorded."))
             || entry
                 .host_id
@@ -1755,6 +1793,44 @@ mod tests {
     }
 
     #[test]
+    fn ingest_search_matches_detail_and_source_fields_in_both_modes() {
+        let mut app_state = base_state();
+        app_state.ui.journal.filter = JournalFilter::Queue;
+        app_state.event_journal_state.entries = vec![EventJournalEntry {
+            category: EventCategory::Ingest,
+            event_type: EventType::IngestAdded,
+            source_path: Some(Path::new("/staging/item-alpha.torrent").to_path_buf()),
+            source_watch_folder: Some(Path::new("/watch-root/incoming").to_path_buf()),
+            details: EventDetails::Ingest {
+                origin: crate::persistence::event_journal::IngestOrigin::WatchFolder,
+                ingest_kind: crate::persistence::event_journal::IngestKind::TorrentFile,
+                download_path: Some(Path::new("/library/collection-ember").to_path_buf()),
+                container_name: Some("archive-slate".to_string()),
+                payload_path: Some(Path::new("payload/segment-omega.bin").to_path_buf()),
+            },
+            ..Default::default()
+        }];
+
+        for mode in [SearchMode::Fuzzy, SearchMode::Regex] {
+            app_state.ui.journal.search_mode = mode;
+            for query in [
+                "collection-ember",
+                "archive-slate",
+                "segment-omega",
+                "item-alpha",
+                "watch-root",
+            ] {
+                app_state.ui.journal.search_query = query.to_string();
+                assert_eq!(
+                    journal_activities(&app_state).len(),
+                    1,
+                    "{mode:?} search should match {query}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn filter_selection_matches_requested_groups() {
         let mut app_state = base_state();
 
@@ -2041,6 +2117,33 @@ mod tests {
 
         assert_eq!(journal_activities(&app_state).len(), 2);
         assert_eq!(app_state.ui.journal.selected_index, 1);
+    }
+
+    #[test]
+    fn move_down_clamps_stale_scroll_offset_before_advancing() {
+        let mut app_state = base_state();
+        app_state.screen_area = Rect::new(0, 0, 120, 30);
+        app_state.event_journal_state.entries = (0..100)
+            .map(|id| EventJournalEntry {
+                id,
+                category: EventCategory::Ingest,
+                event_type: EventType::IngestAdded,
+                torrent_name: Some(format!("Sample Item {id}")),
+                ..Default::default()
+            })
+            .collect();
+        app_state.ui.journal.selected_index = 0;
+        app_state.ui.journal.scroll_offset = 50;
+        let (tx, _rx) = mpsc::channel(1);
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            &mut app_state,
+            &tx,
+        );
+
+        assert_eq!(app_state.ui.journal.selected_index, 1);
+        assert_eq!(app_state.ui.journal.scroll_offset, 0);
     }
 
     #[test]
