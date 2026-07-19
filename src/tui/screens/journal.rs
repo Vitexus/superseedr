@@ -402,7 +402,7 @@ fn activity_search_haystack(activity: &JournalActivity<'_>) -> String {
     let mut haystack = String::with_capacity(activity.len().saturating_mul(192));
     for entry in activity.entries() {
         append_search_field(&mut haystack, event_type_label(entry));
-        append_control_search_fields(&mut haystack, &entry.details);
+        append_event_detail_search_fields(&mut haystack, &entry.details);
         append_search_field(&mut haystack, entry.torrent_name.as_deref().unwrap_or("-"));
         if let Some(path) = entry
             .source_path
@@ -440,67 +440,89 @@ fn append_search_field(haystack: &mut String, field: &str) {
     haystack.push_str(field);
 }
 
-fn append_control_search_fields(haystack: &mut String, details: &EventDetails) {
-    let EventDetails::Control {
-        action,
-        target_info_hash_hex,
-        file_index,
-        file_path,
-        priority,
-        ..
-    } = details
-    else {
-        return;
-    };
+fn append_search_number(haystack: &mut String, number: usize) {
+    if !haystack.is_empty() {
+        haystack.push(' ');
+    }
+    let _ = write!(haystack, "{number}");
+}
 
-    append_search_field(haystack, action);
-    if let Some(info_hash) = target_info_hash_hex.as_deref() {
-        append_search_field(haystack, info_hash);
-    }
-    if let Some(file_index) = file_index {
-        if !haystack.is_empty() {
-            haystack.push(' ');
+fn append_event_detail_search_fields(haystack: &mut String, details: &EventDetails) {
+    match details {
+        EventDetails::Control {
+            action,
+            target_info_hash_hex,
+            file_index,
+            file_path,
+            priority,
+            ..
+        } => {
+            append_search_field(haystack, action);
+            if let Some(info_hash) = target_info_hash_hex.as_deref() {
+                append_search_field(haystack, info_hash);
+            }
+            if let Some(file_index) = file_index {
+                append_search_number(haystack, *file_index);
+            }
+            if let Some(file_path) = file_path.as_deref() {
+                append_search_field(haystack, file_path);
+            }
+            if let Some(priority) = priority.as_deref() {
+                append_search_field(haystack, priority);
+            }
         }
-        let _ = write!(haystack, "{file_index}");
-    }
-    if let Some(file_path) = file_path.as_deref() {
-        append_search_field(haystack, file_path);
-    }
-    if let Some(priority) = priority.as_deref() {
-        append_search_field(haystack, priority);
+        EventDetails::DataHealth {
+            issue_count,
+            issue_files,
+        } => {
+            append_search_number(haystack, *issue_count);
+            for issue_file in issue_files {
+                append_search_field(haystack, issue_file);
+            }
+        }
+        _ => {}
     }
 }
 
-fn control_details_match_regex(details: &EventDetails, regex: &regex::Regex) -> bool {
-    let EventDetails::Control {
-        action,
-        target_info_hash_hex,
-        file_index,
-        file_path,
-        priority,
-        ..
-    } = details
-    else {
-        return false;
-    };
-
-    regex.is_match(action)
-        || target_info_hash_hex
-            .as_deref()
-            .is_some_and(|info_hash| regex.is_match(info_hash))
-        || file_index.is_some_and(|index| regex.is_match(&index.to_string()))
-        || file_path
-            .as_deref()
-            .is_some_and(|path| regex.is_match(path))
-        || priority
-            .as_deref()
-            .is_some_and(|priority| regex.is_match(priority))
+fn event_details_match_regex(details: &EventDetails, regex: &regex::Regex) -> bool {
+    match details {
+        EventDetails::Control {
+            action,
+            target_info_hash_hex,
+            file_index,
+            file_path,
+            priority,
+            ..
+        } => {
+            regex.is_match(action)
+                || target_info_hash_hex
+                    .as_deref()
+                    .is_some_and(|info_hash| regex.is_match(info_hash))
+                || file_index.is_some_and(|index| regex.is_match(&index.to_string()))
+                || file_path
+                    .as_deref()
+                    .is_some_and(|path| regex.is_match(path))
+                || priority
+                    .as_deref()
+                    .is_some_and(|priority| regex.is_match(priority))
+        }
+        EventDetails::DataHealth {
+            issue_count,
+            issue_files,
+        } => {
+            regex.is_match(&issue_count.to_string())
+                || issue_files
+                    .iter()
+                    .any(|issue_file| regex.is_match(issue_file))
+        }
+        _ => false,
+    }
 }
 
 fn activity_matches_regex(activity: &JournalActivity<'_>, regex: &regex::Regex) -> bool {
     activity.entries().any(|entry| {
         regex.is_match(event_type_label(entry))
-            || control_details_match_regex(&entry.details, regex)
+            || event_details_match_regex(&entry.details, regex)
             || entry
                 .torrent_name
                 .as_deref()
@@ -1691,6 +1713,37 @@ mod tests {
         for mode in [SearchMode::Fuzzy, SearchMode::Regex] {
             app_state.ui.journal.search_mode = mode;
             for query in ["feedcafe", "731", "segment-omega", "high"] {
+                app_state.ui.journal.search_query = query.to_string();
+                assert_eq!(
+                    journal_activities(&app_state).len(),
+                    1,
+                    "{mode:?} search should match {query}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn health_search_matches_issue_details_in_both_modes() {
+        let mut app_state = base_state();
+        app_state.ui.journal.filter = JournalFilter::Health;
+        app_state.event_journal_state.entries = vec![EventJournalEntry {
+            category: EventCategory::DataHealth,
+            event_type: EventType::DataUnavailable,
+            message: Some("Health probe found unavailable data.".to_string()),
+            details: EventDetails::DataHealth {
+                issue_count: 731,
+                issue_files: vec![
+                    "content/missing-ember.bin".to_string(),
+                    "content/corrupt-slate.bin".to_string(),
+                ],
+            },
+            ..Default::default()
+        }];
+
+        for mode in [SearchMode::Fuzzy, SearchMode::Regex] {
+            app_state.ui.journal.search_mode = mode;
+            for query in ["731", "missing-ember", "corrupt-slate"] {
                 app_state.ui.journal.search_query = query.to_string();
                 assert_eq!(
                     journal_activities(&app_state).len(),
