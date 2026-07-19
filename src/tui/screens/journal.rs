@@ -402,9 +402,7 @@ fn activity_search_haystack(activity: &JournalActivity<'_>) -> String {
     let mut haystack = String::with_capacity(activity.len().saturating_mul(192));
     for entry in activity.entries() {
         append_search_field(&mut haystack, event_type_label(entry));
-        if let EventDetails::Control { action, .. } = &entry.details {
-            append_search_field(&mut haystack, action);
-        }
+        append_control_search_fields(&mut haystack, &entry.details);
         append_search_field(&mut haystack, entry.torrent_name.as_deref().unwrap_or("-"));
         if let Some(path) = entry
             .source_path
@@ -442,13 +440,67 @@ fn append_search_field(haystack: &mut String, field: &str) {
     haystack.push_str(field);
 }
 
+fn append_control_search_fields(haystack: &mut String, details: &EventDetails) {
+    let EventDetails::Control {
+        action,
+        target_info_hash_hex,
+        file_index,
+        file_path,
+        priority,
+        ..
+    } = details
+    else {
+        return;
+    };
+
+    append_search_field(haystack, action);
+    if let Some(info_hash) = target_info_hash_hex.as_deref() {
+        append_search_field(haystack, info_hash);
+    }
+    if let Some(file_index) = file_index {
+        if !haystack.is_empty() {
+            haystack.push(' ');
+        }
+        let _ = write!(haystack, "{file_index}");
+    }
+    if let Some(file_path) = file_path.as_deref() {
+        append_search_field(haystack, file_path);
+    }
+    if let Some(priority) = priority.as_deref() {
+        append_search_field(haystack, priority);
+    }
+}
+
+fn control_details_match_regex(details: &EventDetails, regex: &regex::Regex) -> bool {
+    let EventDetails::Control {
+        action,
+        target_info_hash_hex,
+        file_index,
+        file_path,
+        priority,
+        ..
+    } = details
+    else {
+        return false;
+    };
+
+    regex.is_match(action)
+        || target_info_hash_hex
+            .as_deref()
+            .is_some_and(|info_hash| regex.is_match(info_hash))
+        || file_index.is_some_and(|index| regex.is_match(&index.to_string()))
+        || file_path
+            .as_deref()
+            .is_some_and(|path| regex.is_match(path))
+        || priority
+            .as_deref()
+            .is_some_and(|priority| regex.is_match(priority))
+}
+
 fn activity_matches_regex(activity: &JournalActivity<'_>, regex: &regex::Regex) -> bool {
     activity.entries().any(|entry| {
         regex.is_match(event_type_label(entry))
-            || matches!(
-                &entry.details,
-                EventDetails::Control { action, .. } if regex.is_match(action)
-            )
+            || control_details_match_regex(&entry.details, regex)
             || entry
                 .torrent_name
                 .as_deref()
@@ -1614,6 +1666,38 @@ mod tests {
                 .build()
                 .expect("valid search regex");
             assert!(activity_matches_regex(&activity, &regex), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn command_search_matches_control_targets_in_both_modes() {
+        let mut app_state = base_state();
+        app_state.ui.journal.filter = JournalFilter::Commands;
+        app_state.event_journal_state.entries = vec![EventJournalEntry {
+            category: EventCategory::Control,
+            event_type: EventType::ControlQueued,
+            message: Some("Queued control request.".to_string()),
+            details: EventDetails::Control {
+                origin: crate::persistence::event_journal::ControlOrigin::CliOnline,
+                action: "set_file_priority".to_string(),
+                target_info_hash_hex: Some("feedcafe1234".to_string()),
+                file_index: Some(731),
+                file_path: Some("content/segment-omega.bin".to_string()),
+                priority: Some("High".to_string()),
+            },
+            ..Default::default()
+        }];
+
+        for mode in [SearchMode::Fuzzy, SearchMode::Regex] {
+            app_state.ui.journal.search_mode = mode;
+            for query in ["feedcafe", "731", "segment-omega", "high"] {
+                app_state.ui.journal.search_query = query.to_string();
+                assert_eq!(
+                    journal_activities(&app_state).len(),
+                    1,
+                    "{mode:?} search should match {query}"
+                );
+            }
         }
     }
 
