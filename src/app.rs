@@ -3111,8 +3111,13 @@ impl App {
         runtime_mode: AppRuntimeMode,
         app_lock_handle: Option<File>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let listener = bind_peer_listener(client_configs.client_port).await?;
-        if client_configs.client_port == 0 {
+        let requested_port = if client_configs.randomize_client_port {
+            0
+        } else {
+            client_configs.client_port
+        };
+        let listener = bind_peer_listener(requested_port).await?;
+        if requested_port == 0 {
             if let Some(bound_port) = listener.as_ref().and_then(ListenerSet::local_port) {
                 client_configs.client_port = bound_port;
             }
@@ -5767,21 +5772,38 @@ impl App {
             }
         }
 
-        let port_changed = new_settings.client_port != old_settings.client_port;
+        let port_changed = new_settings.randomize_client_port != old_settings.randomize_client_port
+            || (!new_settings.randomize_client_port
+                && new_settings.client_port != old_settings.client_port);
         let bootstrap_changed = new_settings.bootstrap_nodes != old_settings.bootstrap_nodes;
         let mut config_error = None;
 
         if port_changed {
+            let requested_port = if new_settings.randomize_client_port {
+                0
+            } else {
+                new_settings.client_port
+            };
             tracing::info!(
                 "Config update: Port changed to {}",
-                new_settings.client_port
+                if requested_port == 0 {
+                    "RANDOM".to_string()
+                } else {
+                    requested_port.to_string()
+                }
             );
-            if !self.rebind_listener(new_settings.client_port).await {
+            if !self.rebind_listener(requested_port).await {
                 config_error = Some(format!(
                     "Could not activate listen port {}. Port {} remains active.",
-                    new_settings.client_port, old_settings.client_port
+                    if requested_port == 0 {
+                        "RANDOM".to_string()
+                    } else {
+                        requested_port.to_string()
+                    },
+                    old_settings.client_port
                 ));
                 self.client_configs.client_port = old_settings.client_port;
+                self.client_configs.randomize_client_port = old_settings.randomize_client_port;
                 let _ = self.rss_settings_tx.send(self.client_configs.clone());
                 if bootstrap_changed {
                     tracing::info!("Config update: DHT bootstrap nodes changed.");
@@ -12077,6 +12099,23 @@ mod tests {
             .app_state
             .externally_accessable_port_v6_highlight_until
             .is_none());
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn randomized_client_port_binds_an_ephemeral_port_and_preserves_the_mode() {
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+
+        assert_ne!(app.client_configs.client_port, 0);
+        assert!(app.client_configs.randomize_client_port);
 
         let _ = app.shutdown_tx.send(());
     }
