@@ -10,7 +10,6 @@ use crate::app::torrent_is_effectively_incomplete;
 use crate::app::AppCommand;
 
 use crate::app::ChartPanelView;
-use crate::app::FileBrowserMode;
 use crate::app::GraphDisplayMode;
 use crate::app::PeerInfo;
 use crate::app::SwarmAvailabilityFlashState;
@@ -44,6 +43,7 @@ use crate::tui::layout::normal::LayoutContext;
 use crate::tui::layout::normal::LayoutPlan;
 use crate::tui::layout::normal::DEFAULT_SIDEBAR_PERCENT;
 use crate::tui::screen_context::ScreenContext;
+use crate::tui::screens::torrents;
 use crate::tui::tree::{TreeFilter, TreeMathHelper, TreeViewState};
 use chrono::{DateTime, Utc};
 use rand::rngs::StdRng;
@@ -6931,19 +6931,7 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             app.app_state.mode = AppMode::DeleteConfirm;
         }
         UiEffect::OpenAddTorrentFileBrowser => {
-            let initial_path = app.get_initial_source_path();
-            let browser_generation = app.app_state.ui.file_browser.next_browser_generation();
-            spawn_app_command_sender(
-                app.app_command_tx.clone(),
-                app.shutdown_tx.subscribe(),
-                AppCommand::FetchFileTree {
-                    browser_generation,
-                    path: initial_path,
-                    browser_mode: FileBrowserMode::File(vec![".torrent".to_string()]),
-                    preserve_browser_mode: false,
-                    highlight_path: None,
-                },
-            );
+            app.open_add_torrent_file_browser();
         }
         UiEffect::OpenExistingTorrentFileBrowser(info_hash) => {
             app.open_existing_torrent_file_browser(info_hash);
@@ -6952,6 +6940,7 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             *app.app_state.ui.config.settings_edit = app.client_configs.clone();
             app.app_state.ui.config.selected_index = 0;
             app.app_state.ui.config.items = ConfigItem::iter().collect::<Vec<_>>();
+            app.app_state.ui.config.active_pane = crate::app::ConfigPane::Settings;
             app.app_state.ui.config.editing = None;
             app.app_state.mode = AppMode::Config;
         }
@@ -7035,12 +7024,14 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
         }
         UiEffect::OpenJournalScreen => {
             app.app_state.ui.journal.selected_index = 0;
+            app.app_state.ui.journal.scroll_offset = 0;
             app.app_state.mode = AppMode::Journal;
         }
         UiEffect::OpenTorrentManagementScreen => {
-            app.app_state.ui.torrent_management.selected_index = 0;
             app.app_state.ui.torrent_management.status_message = None;
+            app.app_state.ui.torrent_management.review_scroll_offset = 0;
             app.app_state.mode = AppMode::TorrentManagement;
+            torrents::initialize_torrent_management_cursor(&mut app.app_state);
         }
         UiEffect::HandlePastedText(text) => {
             handle_pasted_text(app, &text).await;
@@ -7052,8 +7043,8 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
 mod tests {
     use super::*;
     use crate::app::{
-        AppState, BrowserSearchState, DataRate, PeerInfo, SelectedHeader, TorrentControlState,
-        TorrentDisplayState, TorrentMetrics,
+        AppState, BrowserSearchState, DataRate, FileBrowserMode, PeerInfo, SelectedHeader,
+        TorrentControlState, TorrentDisplayState, TorrentMetrics,
     };
     use crate::config::{PeerSortColumn, SortDirection, TorrentSortColumn};
     use crate::errors::StorageError;
@@ -9992,6 +9983,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_open_add_torrent_browser_enters_file_browser_immediately() {
+        let settings = crate::config::Settings {
+            client_port: 0,
+            ..crate::config::Settings::default()
+        };
+        let mut app = App::new(settings, crate::app::AppRuntimeMode::Normal)
+            .await
+            .expect("build app");
+        while app.app_command_rx.try_recv().is_ok() {}
+        app.app_state.mode = AppMode::Normal;
+        app.app_state.ui.file_browser.search_state = BrowserSearchState::Applied;
+        app.app_state.ui.file_browser.search_query = "stale search".to_string();
+        let expected_path = app.get_initial_source_path();
+        let previous_generation = app.app_state.ui.file_browser.browser_generation;
+
+        execute_ui_effect(&mut app, UiEffect::OpenAddTorrentFileBrowser).await;
+
+        assert!(matches!(app.app_state.mode, AppMode::FileBrowser));
+        assert_eq!(
+            app.app_state.ui.file_browser.browser_generation,
+            previous_generation.wrapping_add(1)
+        );
+        assert_eq!(
+            app.app_state.ui.file_browser.state.current_path,
+            expected_path
+        );
+        assert!(app.app_state.ui.file_browser.fetch_pending);
+        assert!(matches!(
+            &app.app_state.ui.file_browser.browser_mode,
+            FileBrowserMode::File(extensions) if extensions == &[".torrent".to_string()]
+        ));
+        assert_eq!(
+            app.app_state.ui.file_browser.search_state,
+            BrowserSearchState::Closed
+        );
+        assert!(app.app_state.ui.file_browser.search_query.is_empty());
+        while let Ok(command) = app.app_command_rx.try_recv() {
+            assert!(!matches!(command, AppCommand::FetchFileTree { .. }));
+        }
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
     async fn apply_open_rss_screen_sets_rss_mode_and_unified_screen() {
         let settings = crate::config::Settings {
             client_port: 0,
@@ -10022,11 +10056,13 @@ mod tests {
             .await
             .expect("build app");
         app.app_state.ui.journal.selected_index = 9;
+        app.app_state.ui.journal.scroll_offset = 7;
 
         execute_ui_effect(&mut app, UiEffect::OpenJournalScreen).await;
 
         assert!(matches!(app.app_state.mode, AppMode::Journal));
         assert_eq!(app.app_state.ui.journal.selected_index, 0);
+        assert_eq!(app.app_state.ui.journal.scroll_offset, 0);
         let _ = app.shutdown_tx.send(());
     }
 

@@ -546,6 +546,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
+        "Page Up / Page Down / Home / End",
+        "Move by a page or jump to the first or last visible torrent",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Torrent Management",
         "h / l / Left / Right",
         "Move between table columns",
         ActionTone::Navigate
@@ -574,6 +581,13 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
+        "f",
+        "Open files for the highlighted torrent",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Torrent Management",
         "p",
         "Queue pause or resume for the current target set",
         ActionTone::Queue
@@ -588,15 +602,15 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
-        "Y",
-        "Review queued commands; press Y again to submit",
+        "Y / Enter",
+        "Review queued commands with Y; submit from review with Enter",
         ActionTone::Confirm
     );
     action_item!(
         HelpSection::Screens,
         "Torrent Management",
         "u",
-        "Clear draft commands for the current target set",
+        "Clear the current selection and its draft commands",
         ActionTone::Clear
     );
     action_item!(
@@ -609,6 +623,20 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Journal",
+        "Page Up / Page Down",
+        "Move through journal activities by one visible page",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Journal",
+        "/",
+        "Search the current journal filter; use Tab to toggle fuzzy or regex matching",
+        ActionTone::Search
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Journal",
         "Y",
         "Replay selected archived torrent, magnet, or path source",
         ActionTone::Replay
@@ -616,15 +644,50 @@ fn build_help_items(settings: &Settings, app_state: &AppState) -> Vec<HelpItem> 
     action_item!(
         HelpSection::Screens,
         "Config",
-        "Enter",
-        "Start or confirm editing",
-        ActionTone::Edit
+        "Space",
+        "Shift or open the selected control",
+        ActionTone::Navigate
     );
     action_item!(
         HelpSection::Screens,
         "Config",
         "h / l",
-        "Decrease or increase the focused value",
+        "Move backward or forward through choices",
+        ActionTone::Navigate
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config",
+        "r",
+        "Open confirmation before resetting the focused setting",
+        ActionTone::Clear
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config",
+        "Esc / q",
+        "Close Config immediately",
+        ActionTone::Cancel
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config · Editing",
+        "Enter / Esc",
+        "Apply the edited value or cancel the current edit",
+        ActionTone::Edit
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config · Path Picker",
+        "Y",
+        "Apply the confirmed path and return to Config",
+        ActionTone::Confirm
+    );
+    action_item!(
+        HelpSection::Screens,
+        "Config · Compact Details",
+        "Esc",
+        "Return to the settings list",
         ActionTone::Navigate
     );
     action_item!(
@@ -2052,6 +2115,44 @@ mod tests {
     }
 
     #[test]
+    fn layout_keeps_search_above_the_content_panel_below_the_header() {
+        let layout = calculate_help_layout(Rect::new(0, 0, 120, 40), true, Some("Service notice"));
+        let search = layout.search.expect("search region");
+        let warning = layout.warning.expect("warning region");
+
+        assert!(search.bottom() <= layout.tabs.y);
+        assert!(layout.tabs.bottom() <= layout.panel.y);
+        assert!(layout.hero.bottom() <= warning.y);
+        assert!(warning.bottom() <= layout.table.y);
+        assert!(layout.table.bottom() <= layout.position.y);
+        assert!(layout.position.bottom() <= layout.panel.bottom());
+        assert!(layout.panel.bottom() <= layout.controls.y);
+    }
+
+    #[test]
+    fn scroll_capacity_uses_the_rendered_content_region_with_search() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            screen_area: Rect::new(0, 0, 120, 30),
+            system_warning: Some("Service notice".to_string()),
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = true;
+        let expected = calculate_help_layout(
+            app_state.screen_area,
+            true,
+            app_state.system_warning.as_deref(),
+        )
+        .table;
+
+        assert_eq!(help_table_area_for_state(&app_state), expected);
+        assert_eq!(
+            help_visible_count_for_state(&app_state),
+            expected.height as usize
+        );
+    }
+
+    #[test]
     fn help_down_scroll_clamps_at_visible_bottom() {
         let settings = Settings::default();
         let mut app_state = AppState {
@@ -2195,13 +2296,13 @@ mod tests {
         };
         app_state.ui.help.is_searching = true;
         app_state.ui.help.search_mode = SearchMode::Regex;
-        app_state.ui.help.search_query = "Torrent Management Y Review queued".to_string();
+        app_state.ui.help.search_query = "Torrent Management Y / Enter Review queued".to_string();
 
         let items = help_items_for_view(&settings, &app_state);
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].subsection, "Torrent Management");
-        assert_eq!(items[0].key, "Y");
+        assert_eq!(items[0].key, "Y / Enter");
     }
 
     #[test]

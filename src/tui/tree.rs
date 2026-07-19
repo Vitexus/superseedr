@@ -84,7 +84,7 @@ impl<T: Clone + Default + std::ops::AddAssign> RawNode<T> {
         };
 
         for (path_parts, payload) in files {
-            internal_root.insert_recursive(&path_parts, payload, Path::new(""));
+            let _ = internal_root.insert_recursive(&path_parts, payload, Path::new(""));
         }
 
         internal_root.sort_recursive();
@@ -103,36 +103,58 @@ impl<T: Clone + Default + std::ops::AddAssign> RawNode<T> {
         }
     }
 
-    fn insert_recursive(&mut self, path_parts: &[String], payload: T, parent_path: &Path) {
-        // This line is the reason we need AddAssign
-        self.payload += payload.clone();
-
+    fn insert_recursive(&mut self, path_parts: &[String], payload: T, parent_path: &Path) -> bool {
         if path_parts.is_empty() {
-            return;
+            return false;
         }
 
         let name = &path_parts[0];
         let is_last = path_parts.len() == 1;
         let current_path = parent_path.join(name);
 
-        let child_idx = if let Some(idx) = self.children.iter().position(|c| &c.name == name) {
-            idx
-        } else {
-            let new_node = RawNode {
-                name: name.clone(),
-                full_path: current_path.clone(),
-                children: Vec::new(),
-                payload: T::default(),
-                is_dir: !is_last,
+        let (child_idx, created) =
+            if let Some(idx) = self.children.iter().position(|child| &child.name == name) {
+                // A valid path list cannot contain an exact duplicate or use the same path as both
+                // a file and a directory. Keep the first structurally valid entry if malformed data
+                // reaches this generic helper instead of overwriting its payload or hiding children.
+                if is_last || !self.children[idx].is_dir {
+                    tracing::warn!(
+                        path = %current_path.display(),
+                        "Ignoring duplicate or prefix-colliding tree entry"
+                    );
+                    return false;
+                }
+                (idx, false)
+            } else {
+                let new_node = RawNode {
+                    name: name.clone(),
+                    full_path: current_path.clone(),
+                    children: Vec::new(),
+                    payload: T::default(),
+                    is_dir: !is_last,
+                };
+                self.children.push(new_node);
+                (self.children.len() - 1, true)
             };
-            self.children.push(new_node);
-            self.children.len() - 1
-        };
 
         if is_last {
-            self.children[child_idx].payload = payload;
+            self.children[child_idx].payload = payload.clone();
+            self.payload += payload;
+            return true;
+        }
+
+        if self.children[child_idx].insert_recursive(
+            &path_parts[1..],
+            payload.clone(),
+            &current_path,
+        ) {
+            self.payload += payload;
+            true
         } else {
-            self.children[child_idx].insert_recursive(&path_parts[1..], payload, &current_path);
+            if created {
+                self.children.remove(child_idx);
+            }
+            false
         }
     }
 }
@@ -848,5 +870,31 @@ mod tests {
         );
         assert!(!state.expanded_paths.contains(&PathBuf::from("Root")));
         assert!(state.selected_paths.contains(&child_path));
+    }
+
+    #[test]
+    fn duplicate_and_prefix_collisions_keep_the_first_valid_tree_entry() {
+        let duplicate_tree = RawNode::from_path_list(
+            Some("root".to_string()),
+            vec![
+                (vec!["entry".to_string()], 5u64),
+                (vec!["entry".to_string()], 9u64),
+            ],
+        );
+        assert_eq!(duplicate_tree[0].payload, 5);
+        assert_eq!(duplicate_tree[0].children.len(), 1);
+        assert_eq!(duplicate_tree[0].children[0].payload, 5);
+
+        let prefix_tree = RawNode::from_path_list(
+            Some("root".to_string()),
+            vec![
+                (vec!["entry".to_string()], 5u64),
+                (vec!["entry".to_string(), "child".to_string()], 9u64),
+            ],
+        );
+        assert_eq!(prefix_tree[0].payload, 5);
+        assert_eq!(prefix_tree[0].children.len(), 1);
+        assert!(!prefix_tree[0].children[0].is_dir);
+        assert!(prefix_tree[0].children[0].children.is_empty());
     }
 }

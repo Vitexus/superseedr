@@ -10,7 +10,7 @@ use ratatui::prelude::Constraint;
 use ratatui::prelude::Direction;
 use ratatui::prelude::Layout;
 use ratatui::prelude::Rect;
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 
 use crate::app::GraphDisplayMode;
 
@@ -21,8 +21,20 @@ pub fn format_speed(bits_per_second: u64) -> String {
         format!("{:.1} Kbps", bits_per_second as f64 / 1_000.0)
     } else if bits_per_second < 1_000_000_000 {
         format!("{:.2} Mbps", bits_per_second as f64 / 1_000_000.0)
-    } else {
+    } else if bits_per_second < 1_000_000_000_000 {
         format!("{:.2} Gbps", bits_per_second as f64 / 1_000_000_000.0)
+    } else if bits_per_second < 1_000_000_000_000_000 {
+        format!("{:.2} Tbps", bits_per_second as f64 / 1_000_000_000_000.0)
+    } else if bits_per_second < 1_000_000_000_000_000_000 {
+        format!(
+            "{:.2} Pbps",
+            bits_per_second as f64 / 1_000_000_000_000_000.0
+        )
+    } else {
+        format!(
+            "{:.2} Ebps",
+            bits_per_second as f64 / 1_000_000_000_000_000_000.0
+        )
     }
 }
 
@@ -188,14 +200,76 @@ pub fn speed_to_style(ctx: &ThemeContext, speed_bps: u64) -> Style {
     }
 }
 
-pub fn truncate_with_ellipsis(s: &str, max_len: usize) -> String {
-    if s.chars().count() > max_len {
-        // Take `max_len - 3` characters to make room for "..."
-        let truncated: String = s.chars().take(max_len.saturating_sub(3)).collect();
-        format!("{}...", truncated)
-    } else {
-        s.to_string()
+pub fn terminal_text_width(input: &str) -> usize {
+    Line::from(input).width()
+}
+
+pub fn truncate_with_ellipsis(input: &str, max_width: usize) -> String {
+    if terminal_text_width(input) <= max_width {
+        return input.to_string();
     }
+    if max_width <= 3 {
+        return ".".repeat(max_width);
+    }
+
+    let prefix = terminal_width_prefix(input, max_width - 3);
+    format!("{prefix}...")
+}
+
+pub fn truncate_middle_with_ellipsis(input: &str, max_width: usize) -> String {
+    if terminal_text_width(input) <= max_width {
+        return input.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let remaining_width = max_width - 1;
+    let head_width = remaining_width.div_ceil(2);
+    let tail_width = remaining_width / 2;
+    let head = terminal_width_prefix(input, head_width);
+    let tail = terminal_width_suffix(input, tail_width);
+    format!("{head}…{tail}")
+}
+
+fn terminal_width_prefix(input: &str, max_width: usize) -> &str {
+    let mut end = 0;
+    for (index, character) in input.char_indices() {
+        let candidate_end = index + character.len_utf8();
+        if terminal_text_width(&input[..candidate_end]) > max_width {
+            break;
+        }
+        end = candidate_end;
+    }
+    &input[..end]
+}
+
+fn terminal_width_suffix(input: &str, max_width: usize) -> &str {
+    let mut start = input.len();
+    for (index, _) in input.char_indices().rev() {
+        if terminal_text_width(&input[index..]) > max_width {
+            break;
+        }
+        start = index;
+    }
+
+    // Avoid starting a suffix with a combining character whose base did not fit.
+    while start < input.len() {
+        let character = input[start..]
+            .chars()
+            .next()
+            .expect("start is within the string");
+        let character_end = start + character.len_utf8();
+        if terminal_text_width(&input[start..character_end]) > 0 {
+            break;
+        }
+        start = character_end;
+    }
+
+    &input[start..]
 }
 
 pub(crate) fn anonymize_preserving_shape(input: &str) -> String {
@@ -474,6 +548,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn end_truncation_respects_terminal_width_and_small_limits() {
+        assert_eq!(truncate_with_ellipsis("Wide 界界 name", 9), "Wide ...");
+        assert_eq!(truncate_with_ellipsis("abcdef", 2), "..");
+        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+    }
+
+    #[test]
+    fn middle_truncation_preserves_a_distinct_suffix_with_wide_text() {
+        let input = format!("{}alpha.bin", "界".repeat(12));
+        let truncated = truncate_middle_with_ellipsis(&input, 16);
+
+        assert!(terminal_text_width(&truncated) <= 16);
+        assert!(truncated.contains('…'));
+        assert!(truncated.ends_with("pha.bin"));
+    }
+
+    #[test]
     fn auto_download_limit_applied_detects_effective_auto_cap() {
         assert!(auto_download_limit_applied(0, 500_000_000));
         assert!(auto_download_limit_applied(800_000_000, 500_000_000));
@@ -483,5 +574,12 @@ mod tests {
     fn auto_download_limit_applied_keeps_unlimited_and_configured_caps_normal() {
         assert!(!auto_download_limit_applied(0, 0));
         assert!(!auto_download_limit_applied(500_000_000, 500_000_000));
+    }
+
+    #[test]
+    fn format_speed_scales_beyond_gigabits() {
+        assert_eq!(format_speed(1_000_000_000_000), "1.00 Tbps");
+        assert_eq!(format_speed(1_000_000_000_000_000), "1.00 Pbps");
+        assert_eq!(format_speed(1_000_000_000_000_000_000), "1.00 Ebps");
     }
 }

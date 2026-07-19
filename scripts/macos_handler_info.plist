@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>superseedr</string>
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeExtensions</key>
+            <array>
+                <string>torrent</string>
+            </array>
+            <key>CFBundleTypeName</key>
+            <string>BitTorrent File</string>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>LSHandlerRank</key>
+            <string>Owner</string>
+            <key>LSItemContentTypes</key>
+            <array>
+                <string>org.bittorrent.torrent</string>
+            </array>
+        </dict>
+    </array>
+    <key>CFBundleExecutable</key>
+    <string>superseedr-handler</string>
+    <key>CFBundleIconFile</key>
+    <string>appicon.icns</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.github.jagalite.superseedr</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>superseedr</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Viewer</string>
+            <key>CFBundleURLName</key>
+            <string>Magnet URI</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>magnet</string>
+            </array>
+        </dict>
+    </array>
+    <key>CFBundleVersion</key>
+    <string>0.0.0</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>10.13</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeConformsTo</key>
+            <array>
+                <string>public.data</string>
+            </array>
+            <key>UTTypeDescription</key>
+            <string>BitTorrent File</string>
+            <key>UTTypeIdentifier</key>
+            <string>org.bittorrent.torrent</string>
+            <key>UTTypeTagSpecification</key>
+            <dict>
+                <key>public.filename-extension</key>
+                <array>
+                    <string>torrent</string>
+                </array>
+                <key>public.mime-type</key>
+                <string>application/x-bittorrent</string>
+            </dict>
+        </dict>
+    </array>
+</dict>
+</plist>

@@ -1601,10 +1601,10 @@ impl Theme {
                 subtext1: Color::Rgb(147, 161, 161),
                 subtext0: Color::Rgb(101, 123, 131),
                 overlay0: Color::Rgb(88, 110, 117),
-                surface2: Color::Rgb(7, 54, 66),
-                surface1: Color::Rgb(0, 90, 110),
-                surface0: Color::Rgb(0, 33, 44),
-                border: Color::Rgb(0, 130, 160),
+                surface2: Color::Rgb(88, 110, 117),
+                surface1: Color::Rgb(7, 54, 66),
+                surface0: Color::Rgb(0, 43, 54),
+                border: Color::Rgb(88, 110, 117),
                 white: Color::White,
             },
             scale: ThemeScale {
@@ -1893,12 +1893,12 @@ impl Theme {
             effects: ThemeEffects::default(),
             semantic: ThemeSemantic {
                 text: Color::Rgb(88, 110, 117),
-                subtext1: Color::Rgb(88, 110, 117),
-                subtext0: Color::Rgb(131, 148, 150),
+                subtext1: Color::Rgb(101, 123, 131),
+                subtext0: Color::Rgb(101, 123, 131),
                 overlay0: Color::Rgb(147, 161, 161),
-                surface2: Color::Rgb(238, 232, 213),
-                surface1: Color::Rgb(253, 246, 227),
-                surface0: Color::Rgb(255, 255, 240),
+                surface2: Color::Rgb(147, 161, 161),
+                surface1: Color::Rgb(238, 232, 213),
+                surface0: Color::Rgb(253, 246, 227),
                 border: Color::Rgb(147, 161, 161),
                 white: Color::Black,
             },
@@ -3831,6 +3831,23 @@ mod tests {
             let deserialized: ThemeName = serde_json::from_str(&serialized).unwrap();
             assert_eq!(theme, deserialized);
         }
+    }
+
+    #[test]
+    fn test_solarized_themes_use_canonical_base_tones() {
+        let dark = Theme::builtin(ThemeName::SolarizedDark);
+        assert_eq!(dark.semantic.surface0, Color::Rgb(0, 43, 54));
+        assert_eq!(dark.semantic.surface1, Color::Rgb(7, 54, 66));
+        assert_eq!(dark.semantic.surface2, Color::Rgb(88, 110, 117));
+        assert_eq!(dark.semantic.border, Color::Rgb(88, 110, 117));
+        assert_eq!(dark.semantic.text, Color::Rgb(131, 148, 150));
+
+        let light = Theme::builtin(ThemeName::SolarizedLight);
+        assert_eq!(light.semantic.surface0, Color::Rgb(253, 246, 227));
+        assert_eq!(light.semantic.surface1, Color::Rgb(238, 232, 213));
+        assert_eq!(light.semantic.surface2, Color::Rgb(147, 161, 161));
+        assert_eq!(light.semantic.border, Color::Rgb(147, 161, 161));
+        assert_eq!(light.semantic.text, Color::Rgb(88, 110, 117));
     }
 
     #[test]

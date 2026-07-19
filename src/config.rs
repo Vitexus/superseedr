@@ -178,10 +178,10 @@ pub struct FeedSyncError {
 pub enum UiLayoutMode {
     #[default]
     Auto,
+    Horizontal,
     #[serde(alias = "veritical")]
     Vertical,
     Square,
-    Horizontal,
 }
 
 impl UiLayoutMode {
@@ -196,19 +196,19 @@ impl UiLayoutMode {
 
     pub fn next(self) -> Self {
         match self {
-            Self::Auto => Self::Vertical,
+            Self::Auto => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
             Self::Vertical => Self::Square,
-            Self::Square => Self::Horizontal,
-            Self::Horizontal => Self::Auto,
+            Self::Square => Self::Auto,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            Self::Auto => Self::Horizontal,
-            Self::Vertical => Self::Auto,
+            Self::Auto => Self::Square,
+            Self::Horizontal => Self::Auto,
+            Self::Vertical => Self::Horizontal,
             Self::Square => Self::Vertical,
-            Self::Horizontal => Self::Square,
         }
     }
 }

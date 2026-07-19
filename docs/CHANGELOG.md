@@ -1,5 +1,25 @@
 # Changelog
 
+## Release v1.0.12
+### New Features
+- **Redesigned Configuration Workspace**: Rebuilt the TUI configuration screen with grouped settings, responsive master-detail layouts, setting-specific guidance, exact-value editing, and clearer immediate-apply controls.
+- **Safe Offline Torrent Moves**: Added `superseedr move <INFO_HASH> <PATH>` for relocating torrent payloads while the client is stopped, including same-volume moves and cross-volume copy support.
+- **Inbound Transport Reachability**: Added TCP and uTP reachability visibility to the listen-port details so operators can see which protocol and address-family paths have accepted inbound peers.
+- **Expanded Linux Release Artifacts**: Added amd64 and arm64 Debian packages and GNU tarballs for normal and private builds, including checksums and install smoke-test coverage.
+
+### Improvements
+- **Torrent Management Review Workflow**: Redesigned the batch-action review modal with responsive layouts, scrollable large-batch summaries, live purge-size totals, clearer destructive-action guidance, and more predictable staged-action replacement and clearing.
+- **File Browser and Torrent Preview UX**: Improved search-aware cursor recovery, asynchronous fetch handling, visible error reporting, cached torrent previews, case-insensitive torrent-file selection, and navigation around filtered or delayed results.
+- **macOS Protocol Handler Diagnostics**: Replaced the generated script handler with a signed universal native handler, added registration verification and retry behavior, and introduced privacy-safe installer and handler logs for troubleshooting.
+- **Runtime and Release Maintenance**: Refreshed core dependencies, corrected the Solarized theme palettes, omitted direct-input logging from private builds, and added a comprehensive release-candidate validation runbook.
+
+### Bug Fixes
+- **Move Transaction Safety**: Hardened offline moves with destination-conflict and free-space preflights, staged cross-volume copies, metadata verification, rollback handling, and recoverable behavior when configuration persistence fails.
+- **Multi-File and v2 Storage Correctness**: Fixed torrent path resolution, file-tree and priority edge cases, storage allocation behavior, and v2/hybrid padding handling across preview, move, and management workflows.
+- **Configuration Input Consistency**: Standardized `Space` as the primary setting action, removed accidental pane switching through `Tab`, constrained controls to compatible setting types, and tightened listen-port validation.
+- **macOS Package Registration Reliability**: Fixed handler signing and packaging, empty build-flag handling, startup registration races, and default-handler verification after installation.
+- **Shared Status Scheduling**: Kept the status snapshot timer enabled at a five-second default for both shared leaders and followers when no explicit output interval is configured, while preserving disabled snapshots in standalone mode.
+
 ## Release v1.0.11
 ### New Features
 - **Configurable TUI Layout Modes**: Added a `ui_layout_mode` setting, with `layout` accepted as an alias, so the main TUI can stay in automatic mode or be forced into vertical or horizontal layouts.

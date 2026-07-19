@@ -55,14 +55,20 @@
   - `x` toggles anonymized torrent names.
   - `h`/`l` or `←`/`→` moves between visible columns; `s` sorts by the focused column.
   - `Space` multi-selects the focused torrent; `A` selects all visible torrents.
-  - `p`, `d`, and `D` queue pause/resume, remove, and purge actions for selected torrents.
-  - `Y` opens the draft-command confirmation when commands are queued; `Y` again submits confirmed draft commands.
-  - `u` clears draft commands for the current target set.
+  - `p`, `d`, and `D` queue pause/resume, remove, and purge actions while preserving the selected target set.
+  - `Y` opens the draft-command confirmation when commands are queued; `Enter` submits from review.
+  - `u` clears the current selection and any draft commands for that target set.
+  - Held shortcuts reported as key repeats cannot toggle actions repeatedly; deliberate Press events remain reusable on terminals without key-release reporting.
+  - Review mode supports `j`/`k`, arrows, Page Up/Down, Home, and End for scrolling large batches.
   - `Esc`/`q` returns to `Normal`.
 - `PowerSaving`: `z` -> `Normal`.
 - `Config`:
-  - `Esc`/`Q` applies edited settings and returns to `Normal`.
-  - `Enter` edits field or opens `FileBrowser` for path selection.
+  - `Space` shifts boolean and choice settings immediately, opens value editing for the listen port and global rate limits, or opens a path browser; `Left`/`Right` (or `h`/`l`) moves backward/forward through choices; `r` opens reset confirmation for the focused setting.
+  - In reset confirmation, `Y` restores the default and `Esc` cancels.
+  - While editing a value, `Enter` applies it and `Esc` cancels the current edit.
+  - Confirming a path in `FileBrowser` applies it and returns to Config.
+  - `Esc`/`q` closes Config immediately.
+  - In compact mode, `Space` opens the selected setting's details and activates its control; `Esc` returns to the settings list before closing Config.
 - `FileBrowser`:
   - `Y` confirms current action.
   - `Esc` returns to `Normal` or `Config` depending on browser mode.
@@ -81,13 +87,15 @@ This contract formalizes top-level screen transitions. Any transition behavior c
 | `Normal` | `z` | `PowerSaving` | Zen mode |
 | `PowerSaving` | `z` | `Normal` | Return from zen |
 | `Normal` | `c` | `Config` | Open settings |
-| `Config` | `Esc` or `Q` | `Normal` | Save + exit |
+| `Config` | completed control change | `Config` | Apply toggles, choices, confirmed resets, and value edits immediately |
+| `Config` | `Esc` or `q` | `Normal` or `Config` | Close immediately; compact details first returns to the settings list |
 | `Normal` | `M` | `TorrentManagement` | Batch torrent management |
 | `TorrentManagement` | `Esc` or `q` | `Normal` | Close management |
 | `Normal` | `d`/`D` | `DeleteConfirm` | Selected torrent only |
 | `DeleteConfirm` | `Y` or `Esc` | `Normal` | Confirm/cancel dialog |
 | `Normal` | `a` | `FileBrowser` | Add torrent path flow |
-| `Config` | `Enter` on path item | `FileBrowser` | Path picker flow |
+| `Config` | `Space` on path item | `FileBrowser` | Path picker flow; compact mode opens details |
+| `FileBrowser` config path picker | `Y` | `Config` | Apply the confirmed path immediately |
 | `FileBrowser` | `Esc` | `Normal` or `Config` | Depends on browser sub-mode |
 
 ### Forbidden/No-op examples
