@@ -5744,8 +5744,9 @@ impl App {
         }
     }
 
-    async fn apply_settings_update(&mut self, new_settings: Settings, persist: bool) {
+    async fn apply_settings_update(&mut self, mut new_settings: Settings, persist: bool) {
         let old_settings = self.client_configs.clone();
+        preserve_bound_random_client_port(&old_settings, &mut new_settings);
         self.client_configs = new_settings.clone();
         let _ = self.rss_settings_tx.send(self.client_configs.clone());
         let rss_changed = rss_settings_changed(&old_settings, &new_settings);
@@ -9027,6 +9028,12 @@ impl App {
     }
 }
 
+fn preserve_bound_random_client_port(old_settings: &Settings, new_settings: &mut Settings) {
+    if old_settings.randomize_client_port && new_settings.randomize_client_port {
+        new_settings.client_port = old_settings.client_port;
+    }
+}
+
 fn is_valid_incoming_bittorrent_handshake(buffer: &[u8]) -> bool {
     buffer.len() >= 48
         && buffer[0] as usize == BITTORRENT_PROTOCOL_STR.len()
@@ -12116,6 +12123,49 @@ mod tests {
 
         assert_ne!(app.client_configs.client_port, 0);
         assert!(app.client_configs.randomize_client_port);
+
+        let _ = app.shutdown_tx.send(());
+    }
+
+    #[test]
+    fn random_client_port_reload_normalization_preserves_the_bound_port() {
+        let current_settings = crate::config::Settings {
+            client_port: 49152,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut reloaded_settings = current_settings.clone();
+        reloaded_settings.client_port = 0;
+
+        super::preserve_bound_random_client_port(&current_settings, &mut reloaded_settings);
+
+        assert_eq!(reloaded_settings.client_port, current_settings.client_port);
+        assert!(reloaded_settings.randomize_client_port);
+    }
+
+    #[tokio::test]
+    async fn random_client_port_reload_preserves_the_bound_port() {
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let bound_port = app.client_configs.client_port;
+        let mut reloaded_settings = app.client_configs.clone();
+        reloaded_settings.client_port = 0;
+        reloaded_settings.output_status_interval += 1;
+
+        app.apply_settings_update(reloaded_settings, false).await;
+
+        assert_eq!(app.client_configs.client_port, bound_port);
+        assert!(app.client_configs.randomize_client_port);
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(bound_port)
+        );
 
         let _ = app.shutdown_tx.send(());
     }

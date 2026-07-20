@@ -1051,6 +1051,7 @@ impl HostConfig {
             settings.client_id = client_id.clone();
         }
         settings.client_port = self.client_port;
+        settings.randomize_client_port = self.client_port == 0;
         settings.watch_folder = self.watch_folder.clone();
         settings.always_show_add_location_prompt = self.always_show_add_location_prompt;
     }
@@ -6002,6 +6003,24 @@ mod tests {
         host_only.always_show_add_location_prompt = true;
         assert_eq!(
             classify_shared_mode_settings_change(&current, &host_only),
+            SettingsChangeScope::HostOnly
+        );
+
+        let mut random_port = current.clone();
+        random_port.randomize_client_port = true;
+        assert_eq!(
+            classify_shared_mode_settings_change(&current, &random_port),
+            SettingsChangeScope::HostOnly
+        );
+
+        let mut current_random_port = current.clone();
+        current_random_port.client_port = 49152;
+        current_random_port.randomize_client_port = true;
+        let mut fixed_port = current_random_port.clone();
+        fixed_port.client_port = 4300;
+        fixed_port.randomize_client_port = false;
+        assert_eq!(
+            classify_shared_mode_settings_change(&current_random_port, &fixed_port),
             SettingsChangeScope::HostOnly
         );
 
