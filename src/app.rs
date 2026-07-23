@@ -5776,10 +5776,21 @@ impl App {
         let port_changed = new_settings.randomize_client_port != old_settings.randomize_client_port
             || (!new_settings.randomize_client_port
                 && new_settings.client_port != old_settings.client_port);
+        let pinning_current_random_port = old_settings.randomize_client_port
+            && !new_settings.randomize_client_port
+            && self.listener.as_ref().and_then(ListenerSet::local_port)
+                == Some(new_settings.client_port);
         let bootstrap_changed = new_settings.bootstrap_nodes != old_settings.bootstrap_nodes;
         let mut config_error = None;
 
-        if port_changed {
+        if pinning_current_random_port {
+            tracing::info!(
+                "Config update: Pinned current random listen port {} without rebinding",
+                new_settings.client_port
+            );
+        }
+
+        if port_changed && !pinning_current_random_port {
             let requested_port = if new_settings.randomize_client_port {
                 0
             } else {
@@ -12169,6 +12180,46 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn pinning_current_random_port_preserves_listener_and_persists_fixed_mode() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let bound_port = app
+            .listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("random listener should expose its bound port");
+        let mut fixed_settings = app.client_configs.clone();
+        fixed_settings.client_port = bound_port;
+        fixed_settings.randomize_client_port = false;
+
+        app.apply_settings_update(fixed_settings, true).await;
+        app.flush_persistence_writer().await;
+
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(bound_port)
+        );
+        assert_eq!(app.client_configs.client_port, bound_port);
+        assert!(!app.client_configs.randomize_client_port);
+        assert!(app.app_state.system_error.is_none());
+
+        let persisted = crate::config::load_settings().expect("reload persisted settings");
+        assert_eq!(persisted.client_port, bound_port);
+        assert!(!persisted.randomize_client_port);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
