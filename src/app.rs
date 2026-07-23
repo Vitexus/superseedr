@@ -6885,6 +6885,7 @@ impl App {
                                 .and_then(ListenerSet::local_port)
                                 .unwrap_or(new_port);
                             self.client_configs.client_port = bound_port;
+                            self.client_configs.randomize_client_port = false;
 
                             tracing_event!(
                                 Level::INFO,
@@ -12168,6 +12169,47 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn forwarded_port_hot_reload_clears_random_mode_and_persists_fixed_port() {
+        let _guard = lock_shared_env();
+        let _temp_paths = configure_temp_app_paths_for_test();
+        let settings = crate::config::Settings {
+            client_port: 6681,
+            randomize_client_port: true,
+            ..Default::default()
+        };
+        let mut app = App::new(settings, AppRuntimeMode::Normal)
+            .await
+            .expect("create app");
+        let probe_listener = super::bind_peer_listener(0)
+            .await
+            .expect("reserve forwarded port");
+        let forwarded_port = probe_listener
+            .as_ref()
+            .and_then(ListenerSet::local_port)
+            .expect("forwarded listener should expose its port");
+        drop(probe_listener);
+        let port_file = _temp_paths.path().join("forwarded-port");
+        std::fs::write(&port_file, forwarded_port.to_string()).expect("write forwarded port file");
+
+        app.handle_port_change(port_file).await;
+        app.flush_persistence_writer().await;
+
+        assert_eq!(app.client_configs.client_port, forwarded_port);
+        assert!(!app.client_configs.randomize_client_port);
+        assert_eq!(
+            app.listener.as_ref().and_then(ListenerSet::local_port),
+            Some(forwarded_port)
+        );
+
+        let persisted = crate::config::load_settings().expect("reload persisted settings");
+        assert_eq!(persisted.client_port, forwarded_port);
+        assert!(!persisted.randomize_client_port);
+
+        let _ = app.shutdown_tx.send(());
+        set_app_paths_override_for_tests(None);
     }
 
     #[test]
