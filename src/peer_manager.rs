@@ -15,7 +15,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-#[cfg(test)]
 use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
@@ -711,6 +710,18 @@ impl PeerManagerHandle {
             .is_ok()
     }
 
+    pub async fn flush(&self) -> bool {
+        let (response_tx, response_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(PeerManagerCommand::Flush { response_tx })
+            .is_err()
+        {
+            return false;
+        }
+        response_rx.await.is_ok()
+    }
+
     #[cfg(test)]
     pub fn block_ip_until(&self, ip: IpAddr, until: SystemTime) -> bool {
         self.command_tx
@@ -879,6 +890,9 @@ enum PeerManagerCommand {
     UnregisterTorrent {
         info_hash: InfoHash,
     },
+    Flush {
+        response_tx: oneshot::Sender<()>,
+    },
     #[cfg(test)]
     Snapshot {
         response_tx: oneshot::Sender<PeerManagerSnapshot>,
@@ -906,6 +920,49 @@ fn publish_view(
         registered_torrents,
         metrics_updates,
     )));
+}
+
+fn drain_metrics_updates(
+    reducer: &mut PeerPolicyReducer,
+    metrics_rxs: &mut HashMap<InfoHash, watch::Receiver<TorrentMetrics>>,
+    latest_metrics: &mut HashMap<InfoHash, TorrentMetrics>,
+    metrics_updates: &mut u64,
+) -> (bool, bool) {
+    let now = SystemTime::now();
+    let mut policy_changed = false;
+    let mut view_changed = false;
+    let mut closed = Vec::new();
+
+    for (info_hash, metrics_rx) in metrics_rxs.iter_mut() {
+        match metrics_rx.has_changed() {
+            Ok(true) => {
+                let metrics = metrics_rx.borrow_and_update().clone();
+                policy_changed |= reducer.reduce_metrics(info_hash, &metrics, now);
+                latest_metrics.insert(info_hash.clone(), metrics);
+                *metrics_updates = metrics_updates.saturating_add(1);
+                view_changed = true;
+            }
+            Ok(false) => {}
+            Err(_) => {
+                // A sender may publish its final cumulative counters and drop before the
+                // polling interval observes the change. Reduce the terminal value before
+                // removing the registration; replaying an already-seen cumulative snapshot
+                // is harmless because the reducer records only deltas.
+                let metrics = metrics_rx.borrow_and_update().clone();
+                policy_changed |= reducer.reduce_metrics(info_hash, &metrics, now);
+                closed.push(info_hash.clone());
+            }
+        }
+    }
+
+    for info_hash in closed {
+        metrics_rxs.remove(&info_hash);
+        latest_metrics.remove(&info_hash);
+        reducer.remove_torrent(&info_hash);
+        view_changed = true;
+    }
+
+    (policy_changed, view_changed)
 }
 
 #[derive(Clone)]
@@ -1093,6 +1150,29 @@ async fn run_service(
                             &view_tx,
                         );
                     }
+                    PeerManagerCommand::Flush { response_tx } => {
+                        let (policy_changed, view_changed) = drain_metrics_updates(
+                            &mut reducer,
+                            &mut metrics_rxs,
+                            &mut latest_metrics,
+                            &mut metrics_updates,
+                        );
+                        if policy_changed {
+                            persistence_state.mark_dirty();
+                            publish_policy(&reducer, &policy_tx);
+                        }
+                        if view_changed {
+                            publish_view(
+                                &reducer,
+                                &latest_metrics,
+                                metrics_rxs.len(),
+                                metrics_updates,
+                                &view_tx,
+                            );
+                        }
+                        persistence_state.queue_if_dirty(&reducer);
+                        let _ = response_tx.send(());
+                    }
                     #[cfg(test)]
                     PeerManagerCommand::Snapshot { response_tx } => {
                         let _ = response_tx.send(PeerManagerSnapshot {
@@ -1111,29 +1191,12 @@ async fn run_service(
                 }
             }
             _ = metrics_poll.tick() => {
-                let now = SystemTime::now();
-                let mut policy_changed = false;
-                let mut view_changed = false;
-                let mut closed = Vec::new();
-                for (info_hash, metrics_rx) in &mut metrics_rxs {
-                    match metrics_rx.has_changed() {
-                        Ok(true) => {
-                            let metrics = metrics_rx.borrow_and_update().clone();
-                            policy_changed |= reducer.reduce_metrics(info_hash, &metrics, now);
-                            latest_metrics.insert(info_hash.clone(), metrics);
-                            metrics_updates = metrics_updates.saturating_add(1);
-                            view_changed = true;
-                        }
-                        Ok(false) => {}
-                        Err(_) => closed.push(info_hash.clone()),
-                    }
-                }
-                for info_hash in closed {
-                    metrics_rxs.remove(&info_hash);
-                    latest_metrics.remove(&info_hash);
-                    reducer.remove_torrent(&info_hash);
-                    view_changed = true;
-                }
+                let (policy_changed, view_changed) = drain_metrics_updates(
+                    &mut reducer,
+                    &mut metrics_rxs,
+                    &mut latest_metrics,
+                    &mut metrics_updates,
+                );
                 if policy_changed {
                     persistence_state.mark_dirty();
                     publish_policy(&reducer, &policy_tx);
@@ -1319,6 +1382,47 @@ mod tests {
         .await
         .expect("torrent should unregister");
         assert!(!snapshot.latest_metrics.contains_key(&info_hash));
+
+        let _ = shutdown_tx.send(());
+        service.join().await;
+    }
+
+    #[tokio::test]
+    async fn flush_reduces_terminal_metrics_after_sender_closes() {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = PeerManagerService::new(shutdown_tx.subscribe());
+        let handle = service.handle();
+        let policy_rx = handle.subscribe_policy();
+        let info_hash = vec![0x19; 20];
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 119));
+        let peer_address = format!("{peer_ip}:6881");
+        let (metrics_tx, metrics_rx) = watch::channel(TorrentMetrics::default());
+
+        assert!(handle.register_torrent(info_hash.clone(), metrics_rx));
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = handle.snapshot().await.expect("peer manager snapshot");
+                if snapshot.registered_torrents == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("torrent should register");
+
+        metrics_tx
+            .send(metrics_with_peer(
+                &info_hash,
+                1,
+                &peer_address,
+                MIN_TRANSFER_ABUSE_BYTES + 1,
+            ))
+            .expect("publish terminal peer metrics");
+        drop(metrics_tx);
+
+        assert!(handle.flush().await);
+        assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
 
         let _ = shutdown_tx.send(());
         service.join().await;

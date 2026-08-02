@@ -516,6 +516,21 @@ impl TorrentManager {
         self.apply_action(Action::PeerPolicyUpdated { policy });
     }
 
+    fn register_peer(
+        &mut self,
+        peer_id: String,
+        peer_addr: Option<SocketAddr>,
+        tx: Sender<TorrentCommand>,
+    ) -> bool {
+        let accepted = self.state.can_register_peer(&peer_id, peer_addr);
+        self.apply_action(Action::RegisterPeer {
+            peer_id,
+            peer_addr,
+            tx,
+        });
+        accepted
+    }
+
     #[cfg(feature = "dht")]
     fn current_dht_demand_state(&self) -> DhtDemandState {
         DhtDemandState {
@@ -1635,11 +1650,10 @@ impl TorrentManager {
 
                 let peer_id = full_url.clone();
 
-                self.apply_action(Action::RegisterPeer {
-                    peer_id: peer_id.clone(),
-                    peer_addr: None,
-                    tx: peer_tx,
-                });
+                if !self.register_peer(peer_id.clone(), None, peer_tx) {
+                    tracing::trace!(peer = %peer_id, "Web seed session registration was rejected");
+                    return;
+                }
 
                 let shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -2457,13 +2471,30 @@ impl TorrentManager {
                         );
                         let (peer_session_tx, peer_session_rx) =
                             mpsc::channel::<TorrentCommand>(1000);
-                        let _ = torrent_manager_tx_clone
+                        let (registration_result_tx, mut registration_result_rx) = mpsc::channel(1);
+                        if torrent_manager_tx_clone
                             .send(TorrentCommand::RegisterPeer {
                                 peer_id: peer_session_key.clone(),
                                 peer_addr,
                                 tx: peer_session_tx,
+                                registration_result_tx,
                             })
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let registration_accepted = tokio::select! {
+                            result = registration_result_rx.recv() => result.unwrap_or(false),
+                            _ = shutdown_rx_session.recv() => false,
+                        };
+                        if !registration_accepted {
+                            tracing::trace!(
+                                peer = %peer_session_key,
+                                "Peer session rejected by current admission policy"
+                            );
+                            return;
+                        }
                         let _ = torrent_manager_tx_clone
                             .send(TorrentCommand::PeerTransportSelected {
                                 peer_id: peer_session_key.clone(),
@@ -3343,11 +3374,17 @@ impl TorrentManager {
                             continue;
                         }
 
-                        self.apply_action(Action::RegisterPeer {
-                            peer_id: peer_ip_port.clone(),
-                            peer_addr: Some(connection.remote_addr),
-                            tx: peer_session_tx,
-                        });
+                        if !self.register_peer(
+                            peer_ip_port.clone(),
+                            Some(connection.remote_addr),
+                            peer_session_tx,
+                        ) {
+                            tracing::trace!(
+                                peer = %peer_ip_port,
+                                "Inbound peer session rejected by current admission policy"
+                            );
+                            continue;
+                        }
                         self.apply_action(Action::PeerTransportSelected {
                             peer_id: peer_ip_port.clone(),
                             transport: connection.endpoint.kind,
@@ -3454,8 +3491,14 @@ impl TorrentManager {
                             self.apply_action(Action::PeerSuccessfullyConnected { peer_id })
                         },
                         TorrentCommand::PeerId(addr, id) => self.apply_action(Action::UpdatePeerId { peer_addr: addr, new_id: id }),
-                        TorrentCommand::RegisterPeer { peer_id, peer_addr, tx } => {
-                            self.apply_action(Action::RegisterPeer { peer_id, peer_addr: Some(peer_addr), tx })
+                        TorrentCommand::RegisterPeer {
+                            peer_id,
+                            peer_addr,
+                            tx,
+                            registration_result_tx,
+                        } => {
+                            let accepted = self.register_peer(peer_id, Some(peer_addr), tx);
+                            let _ = registration_result_tx.try_send(accepted);
                         },
                         TorrentCommand::PeerTransportSelected { peer_id, transport } => {
                             self.apply_action(Action::PeerTransportSelected { peer_id, transport })
@@ -4240,6 +4283,30 @@ mod resource_tests {
         assert!(!manager
             .state
             .can_connect_to_peer(SocketAddr::new(blocked_ip, 1)));
+    }
+
+    #[tokio::test]
+    async fn register_peer_reports_policy_rejection_before_session_start() {
+        let mut manager =
+            TorrentManager::from_torrent(build_test_params(), create_dummy_torrent(1))
+                .expect("manager from torrent");
+        let peer_addr: SocketAddr = "203.0.113.47:6881".parse().expect("valid peer address");
+        manager.apply_action(Action::PeerPolicyUpdated {
+            policy: Arc::new(PeerPolicy::from_blocked_until(HashMap::from([(
+                peer_addr.ip(),
+                SystemTime::now() + Duration::from_secs(3_600),
+            )]))),
+        });
+        let (peer_tx, mut peer_rx) = mpsc::channel(1);
+
+        let accepted = manager.register_peer(peer_addr.to_string(), Some(peer_addr), peer_tx);
+
+        assert!(!accepted);
+        assert!(!manager.state.peers.contains_key(&peer_addr.to_string()));
+        assert!(matches!(
+            peer_rx.try_recv(),
+            Ok(TorrentCommand::Disconnect(peer_id)) if peer_id == peer_addr.to_string()
+        ));
     }
 
     #[tokio::test]

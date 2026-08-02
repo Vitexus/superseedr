@@ -40,6 +40,19 @@ shared mode without relying on shell environment variables.
 | `<config-dir>/launcher_shared_config.toml` | Persisted shared mount root from `superseedr set-shared-config`. |
 | `<config-dir>/launcher_host_id.toml` | Persisted shared host id from `superseedr set-host-id`. |
 
+## macOS Handler Diagnostics
+
+The signed macOS package keeps protocol-handler diagnostics under the always-local
+application log directory, including when Superseedr uses shared mode:
+
+| File | Purpose |
+| --- | --- |
+| `<data-dir>/logs/handler/installer.log` | Soft-failure-safe default-handler registration and verification results from package installation. |
+| `<data-dir>/logs/handler/handler.log` | Native magnet and `.torrent` handler launches, registration outcomes, and forwarding errors. |
+
+These logs record handler types, bundle identifiers, process IDs, and error codes.
+They do not record magnet URLs, torrent filenames, or source paths.
+
 ## Shared Mode
 
 Shared mode stores cluster-wide configuration under the shared mount root:

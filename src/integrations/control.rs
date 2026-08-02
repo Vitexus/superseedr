@@ -59,6 +59,10 @@ pub enum ControlRequest {
         target: ControlPriorityTarget,
         priority: FilePriority,
     },
+    MoveTorrent {
+        info_hash_hex: String,
+        download_path: PathBuf,
+    },
     SetTorrentConfig {
         info_hash_hex: String,
         download_path: Option<PathBuf>,
@@ -96,6 +100,7 @@ impl ControlRequest {
             Self::Resume { .. } => "resume",
             Self::Delete { .. } => "delete",
             Self::SetFilePriority { .. } => "set_file_priority",
+            Self::MoveTorrent { .. } => "move_torrent",
             Self::SetTorrentConfig { .. } => "set_torrent_config",
             Self::AddTorrentFile { .. } => "add_torrent_file",
             Self::AddMagnet { .. } => "add_magnet",
@@ -108,6 +113,7 @@ impl ControlRequest {
             | Self::Resume { info_hash_hex }
             | Self::Delete { info_hash_hex, .. }
             | Self::SetFilePriority { info_hash_hex, .. }
+            | Self::MoveTorrent { info_hash_hex, .. }
             | Self::SetTorrentConfig { info_hash_hex, .. } => Some(info_hash_hex.as_str()),
             Self::StatusNow
             | Self::StatusFollowStart { .. }

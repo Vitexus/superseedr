@@ -19,6 +19,7 @@ pub enum TorrentCommand {
         peer_id: String,
         peer_addr: SocketAddr,
         tx: Sender<TorrentCommand>,
+        registration_result_tx: Sender<bool>,
     },
     SuccessfullyConnected(String),
     PeerId(String, Vec<u8>),

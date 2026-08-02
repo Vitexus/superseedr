@@ -496,6 +496,11 @@ impl TorrentState {
         !self.peer_policy.blocks_ip(addr.ip(), SystemTime::now())
     }
 
+    pub fn can_register_peer(&self, peer_id: &str, peer_addr: Option<SocketAddr>) -> bool {
+        !self.peers.contains_key(peer_id)
+            && peer_addr.is_none_or(|addr| self.can_connect_to_peer(addr))
+    }
+
     fn get_piece_size(&self, piece_index: u32) -> usize {
         if let Some(torrent) = &self.torrent {
             let piece_len = torrent.info.piece_length as u64;
@@ -559,14 +564,21 @@ impl TorrentState {
             }
             Action::PeerPolicyUpdated { policy } => {
                 let now = SystemTime::now();
-                let effects = self
+                let blocked_peer_ids = self
                     .peers
                     .keys()
                     .filter(|peer_id| policy.blocks_peer_address(peer_id, now))
                     .cloned()
-                    .map(|peer_id| Effect::DisconnectPeer { peer_id })
-                    .collect();
+                    .collect::<Vec<_>>();
                 self.peer_policy = policy;
+
+                let mut effects = Vec::new();
+                for peer_id in blocked_peer_ids {
+                    effects.extend(self.update(Action::PeerDisconnected {
+                        peer_id,
+                        force: true,
+                    }));
+                }
                 effects
             }
             Action::Tick { dt_ms } => {
@@ -1135,21 +1147,19 @@ impl TorrentState {
                 peer_addr,
                 tx,
             } => {
-                if peer_addr.is_some_and(|addr| !self.can_connect_to_peer(addr)) {
+                if !self.can_register_peer(&peer_id, peer_addr) {
                     return vec![Effect::DisconnectPeerSession {
                         peer_id,
                         peer_tx: tx,
                     }];
                 }
-                if !self.peers.contains_key(&peer_id) {
-                    let mut peer_state = PeerState::new(peer_id.clone(), tx, self.now);
-                    peer_state.peer_id = peer_id.as_bytes().to_vec();
-                    self.peers.insert(peer_id, peer_state);
-                    // Admission pressure should react to discovered/registered peers immediately,
-                    // not only after handshake success.
-                    self.number_of_successfully_connected_peers = self.peers.len();
-                    self.refresh_peer_admission_guard();
-                }
+                let mut peer_state = PeerState::new(peer_id.clone(), tx, self.now);
+                peer_state.peer_id = peer_id.as_bytes().to_vec();
+                self.peers.insert(peer_id, peer_state);
+                // Admission pressure should react to discovered/registered peers immediately,
+                // not only after handshake success.
+                self.number_of_successfully_connected_peers = self.peers.len();
+                self.refresh_peer_admission_guard();
                 vec![Effect::DoNothing]
             }
 
@@ -2358,14 +2368,19 @@ impl TorrentState {
                 let uploaded = self.session_total_uploaded as usize;
                 let downloaded = self.session_total_downloaded as usize;
 
-                self.peers.clear();
-
-                vec![Effect::PrepareShutdown {
-                    tracker_urls,
-                    left,
-                    uploaded,
-                    downloaded,
-                }]
+                vec![
+                    Effect::EmitMetrics {
+                        bytes_dl: self.bytes_downloaded_in_interval,
+                        bytes_ul: self.bytes_uploaded_in_interval,
+                        file_activity_updates: self.drain_file_activity_updates(),
+                    },
+                    Effect::PrepareShutdown {
+                        tracker_urls,
+                        left,
+                        uploaded,
+                        downloaded,
+                    },
+                ]
             }
 
             Action::FatalError => self.update(Action::Pause),
@@ -2936,11 +2951,14 @@ mod tests {
         let disconnected = effects
             .into_iter()
             .filter_map(|effect| match effect {
-                Effect::DisconnectPeer { peer_id } => Some(peer_id),
+                Effect::DisconnectPeerSession { peer_id, .. } => Some(peer_id),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(disconnected, vec![blocked_peer.to_string()]);
+        assert!(!state.peers.contains_key(blocked_peer));
+        assert!(state.peers.contains_key(allowed_peer));
+        assert!(state.peers.contains_key(expired_peer));
     }
 
     #[test]
@@ -2965,6 +2983,30 @@ mod tests {
         assert!(matches!(
             effects.as_slice(),
             [Effect::DisconnectPeerSession { peer_id, .. }] if peer_id == &peer_addr.to_string()
+        ));
+    }
+
+    #[test]
+    fn shutdown_emits_final_metrics_before_peer_state_is_dropped() {
+        let mut state = create_empty_state();
+        add_peer(&mut state, "tcp://203.0.113.22:6881");
+        state.bytes_downloaded_in_interval = 17;
+        state.bytes_uploaded_in_interval = 29;
+
+        let effects = state.update(Action::Shutdown);
+
+        assert!(state.peers.contains_key("tcp://203.0.113.22:6881"));
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::EmitMetrics {
+                bytes_dl: 17,
+                bytes_ul: 29,
+                ..
+            })
+        ));
+        assert!(matches!(
+            effects.get(1),
+            Some(Effect::PrepareShutdown { .. })
         ));
     }
 
@@ -11091,7 +11133,6 @@ mod prop_tests {
                     }
                     Action::Shutdown => {
                         state.paused = true;
-                        state.connected_peers.clear();
                     }
                     Action::Delete => {
                         state.paused = true;
