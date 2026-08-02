@@ -1119,18 +1119,29 @@ fn calculate_help_layout(
     let panel = chrome[1];
     let density = help_density(panel);
     let inner = help_panel_inner(panel, density);
-    let hero_height = match density {
+    let mut hero_height = match density {
         HelpDensity::Compact => 1,
         HelpDensity::Standard | HelpDensity::Spacious => 3,
     };
-    let mut content_constraints = vec![Constraint::Length(hero_height)];
-    if let Some(warning_text) = warning_text {
-        content_constraints.push(Constraint::Length(warning_height(
-            warning_text,
-            inner.width,
-        )));
+    let warning_row_height = warning_text.map(|text| warning_height(text, inner.width));
+    let mut table_min_height = 1;
+    if matches!(density, HelpDensity::Compact) {
+        if let Some(warning_row_height) = warning_row_height {
+            hero_height = hero_height.min(
+                inner
+                    .height
+                    .saturating_sub(warning_row_height)
+                    .saturating_sub(1),
+            );
+            table_min_height =
+                u16::from(inner.height > warning_row_height.saturating_add(hero_height));
+        }
     }
-    content_constraints.push(Constraint::Min(1));
+    let mut content_constraints = vec![Constraint::Length(hero_height)];
+    if let Some(warning_row_height) = warning_row_height {
+        content_constraints.push(Constraint::Length(warning_row_height));
+    }
+    content_constraints.push(Constraint::Min(table_min_height));
     let content_rows = Layout::vertical(content_constraints).split(inner);
     let table_index = 1 + usize::from(warning_text.is_some());
 
@@ -1777,6 +1788,43 @@ mod tests {
                 layout.table.bottom() <= help_panel_inner(layout.panel, layout.density).bottom()
             );
             assert!(layout.panel.bottom() <= layout.controls.y);
+        }
+    }
+
+    #[test]
+    fn compact_search_prioritizes_warning_over_optional_rows() {
+        let warning_text = "Open file limit is low";
+
+        for (height, expected_table_height) in [(10, 1), (9, 0)] {
+            let layout =
+                calculate_help_layout(Rect::new(0, 0, 40, height), true, Some(warning_text));
+            let inner = help_panel_inner(layout.panel, layout.density);
+            let warning = layout.warning.expect("visible warning row");
+
+            assert_eq!(layout.density, HelpDensity::Compact);
+            assert_eq!(layout.hero.height, 0);
+            assert_eq!(warning.height, warning_height(warning_text, inner.width));
+            assert_eq!(layout.table.height, expected_table_height);
+            assert!(warning.bottom() <= layout.table.y);
+            assert!(layout.table.bottom() <= inner.bottom());
+        }
+    }
+
+    #[test]
+    fn compact_search_render_preserves_system_warning() {
+        for height in [10, 9] {
+            let mut app_state = AppState {
+                system_warning: Some("Open file limit is low".to_string()),
+                ..Default::default()
+            };
+            app_state.ui.help.is_searching = true;
+
+            let rendered = render_help_screen(40, height, app_state);
+
+            assert!(
+                rendered.contains("Open file limit is low"),
+                "missing warning at 40x{height}:\n{rendered}"
+            );
         }
     }
 
