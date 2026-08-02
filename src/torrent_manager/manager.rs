@@ -2924,6 +2924,7 @@ impl TorrentManager {
             session_total_downloaded: self.state.session_total_downloaded,
             session_total_uploaded: self.state.session_total_uploaded,
             peers,
+            peer_reconnect_counts: self.state.peer_reconnect_counts.clone(),
             activity_message: self.generate_activity_message(download_speed_bps, upload_speed_bps),
             ..Default::default()
         }

@@ -1255,6 +1255,9 @@ pub struct TorrentMetrics {
 
     #[serde(skip)]
     pub peers: Vec<PeerInfo>,
+    /// Cumulative reconnects after an IP has no remaining active peer for this manager lifetime.
+    #[serde(skip)]
+    pub peer_reconnect_counts: HashMap<IpAddr, u64>,
     pub activity_message: String,
     pub next_announce_in: Duration,
     pub total_size: u64,
@@ -1303,6 +1306,7 @@ impl Default for TorrentMetrics {
             session_total_uploaded: 0,
             eta: Duration::default(),
             peers: Vec::new(),
+            peer_reconnect_counts: HashMap::new(),
             activity_message: String::new(),
             next_announce_in: Duration::default(),
             total_size: 0,

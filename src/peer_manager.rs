@@ -36,7 +36,7 @@ const PERSISTENCE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(20 * 60);
 
 type InfoHash = Vec<u8>;
 
-fn normalize_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4),
         IpAddr::V4(_) => ip,
@@ -260,6 +260,7 @@ struct EndpointTransferTotals {
 struct PeerTorrentHistory {
     seen: bool,
     present: bool,
+    reconnect_events_seen: u64,
     endpoint_transfers: HashMap<String, EndpointTransferTotals>,
     downloaded_bytes: u64,
     uploaded_bytes: u64,
@@ -305,6 +306,7 @@ impl PeerTorrentHistory {
         endpoint_transfers: HashMap<String, EndpointTransferTotals>,
         clients: BTreeSet<String>,
         now: SystemTime,
+        infer_reconnect: bool,
     ) {
         let endpoints_replaced = self.present
             && !self.endpoint_transfers.is_empty()
@@ -322,7 +324,7 @@ impl PeerTorrentHistory {
                             || totals.uploaded < previous.uploaded
                     })
             });
-        if self.seen && (!self.present || endpoints_replaced || counter_reset) {
+        if infer_reconnect && self.seen && (!self.present || endpoints_replaced || counter_reset) {
             self.reconnects.push_back(now);
         }
         self.seen = true;
@@ -352,6 +354,27 @@ impl PeerTorrentHistory {
         self.endpoint_transfers = endpoint_transfers;
         if !clients.is_empty() {
             self.clients = clients;
+        }
+    }
+
+    fn observe_reconnect_count(&mut self, cumulative_reconnects: u64, now: SystemTime) {
+        self.prune_reconnects(now);
+        let new_reconnects = if cumulative_reconnects >= self.reconnect_events_seen {
+            cumulative_reconnects - self.reconnect_events_seen
+        } else {
+            // A torrent manager restarted and its cumulative counter reset. Every
+            // reconnect in the new generation is new evidence for this retained history.
+            cumulative_reconnects
+        };
+        let available = RECONNECT_LIMIT.saturating_sub(self.reconnects.len()) as u64;
+        self.reconnects.extend(std::iter::repeat_n(
+            now,
+            new_reconnects.min(available) as usize,
+        ));
+        self.reconnect_events_seen = cumulative_reconnects;
+        if cumulative_reconnects > 0 {
+            self.seen = true;
+            self.last_seen = Some(now);
         }
     }
 
@@ -403,6 +426,12 @@ impl PeerPolicyReducer {
         let mut changed = false;
         let mut observed = HashMap::<IpAddr, HashMap<String, EndpointTransferTotals>>::new();
         let mut observed_clients = HashMap::<IpAddr, BTreeSet<String>>::new();
+        let mut reconnect_counts = HashMap::<IpAddr, u64>::new();
+
+        for (ip, count) in &metrics.peer_reconnect_counts {
+            let total = reconnect_counts.entry(normalize_ip(*ip)).or_default();
+            *total = total.saturating_add(*count);
+        }
 
         for peer in &metrics.peers {
             let Some(ip) = parse_peer_ip(&peer.address) else {
@@ -431,14 +460,24 @@ impl PeerPolicyReducer {
                 }
             }
 
+            for (ip, cumulative_reconnects) in &reconnect_counts {
+                torrent_histories
+                    .entry(*ip)
+                    .or_default()
+                    .observe_reconnect_count(*cumulative_reconnects, now);
+            }
+
             for (ip, endpoint_transfers) in observed {
                 let history = torrent_histories.entry(ip).or_default();
                 history.observe_presence(
                     endpoint_transfers,
                     observed_clients.remove(&ip).unwrap_or_default(),
                     now,
+                    !reconnect_counts.contains_key(&ip),
                 );
+            }
 
+            for (ip, history) in torrent_histories.iter_mut() {
                 let reason = if history.uploaded_bytes > transfer_limit {
                     Some(PeerRestrictionReason::ExcessiveUpload {
                         uploaded_bytes: history.uploaded_bytes,
@@ -460,7 +499,7 @@ impl PeerPolicyReducer {
                 };
                 if let Some(reason) = reason {
                     history.consume_triggering_evidence();
-                    restrictions.push((ip, reason));
+                    restrictions.push((*ip, reason));
                 }
             }
         }
@@ -1139,7 +1178,22 @@ async fn run_service(
                         );
                     }
                     PeerManagerCommand::UnregisterTorrent { info_hash } => {
-                        metrics_rxs.remove(&info_hash);
+                        if let Some(mut metrics_rx) = metrics_rxs.remove(&info_hash) {
+                            let had_pending_update = metrics_rx.has_changed().unwrap_or(false);
+                            let terminal_metrics = metrics_rx.borrow_and_update().clone();
+                            if reducer.reduce_metrics(
+                                &info_hash,
+                                &terminal_metrics,
+                                SystemTime::now(),
+                            ) {
+                                persistence_state.mark_dirty();
+                                publish_policy(&reducer, &policy_tx);
+                                persistence_state.queue_if_dirty(&reducer);
+                            }
+                            if had_pending_update {
+                                metrics_updates = metrics_updates.saturating_add(1);
+                            }
+                        }
                         latest_metrics.remove(&info_hash);
                         reducer.remove_torrent(&info_hash);
                         publish_view(
@@ -1250,6 +1304,20 @@ mod tests {
         total_uploaded: u64,
     ) -> TorrentMetrics {
         metrics_with_peers(info_hash, total_size, &[(address, total_uploaded)])
+    }
+
+    fn metrics_with_reconnect_count(
+        info_hash: &[u8],
+        total_size: u64,
+        address: &str,
+        cumulative_reconnects: u64,
+    ) -> TorrentMetrics {
+        let mut metrics = metrics_with_peer(info_hash, total_size, address, 0);
+        let ip = parse_peer_ip(address).expect("peer address should contain a valid IP");
+        metrics
+            .peer_reconnect_counts
+            .insert(ip, cumulative_reconnects);
+        metrics
     }
 
     fn metrics_with_peer_transfer(
@@ -1382,6 +1450,48 @@ mod tests {
         .await
         .expect("torrent should unregister");
         assert!(!snapshot.latest_metrics.contains_key(&info_hash));
+
+        let _ = shutdown_tx.send(());
+        service.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unregister_reduces_pending_terminal_metrics_before_dropping_history() {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = PeerManagerService::new(shutdown_tx.subscribe());
+        let handle = service.handle();
+        let policy_rx = handle.subscribe_policy();
+        let info_hash = vec![0x18; 20];
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 118));
+        let peer_address = format!("{peer_ip}:6881");
+        let (metrics_tx, metrics_rx) = watch::channel(TorrentMetrics::default());
+
+        assert!(handle.register_torrent(info_hash.clone(), metrics_rx));
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = handle.snapshot().await.expect("peer manager snapshot");
+                if snapshot.registered_torrents == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("torrent should register");
+
+        metrics_tx
+            .send(metrics_with_peer(
+                &info_hash,
+                1,
+                &peer_address,
+                MIN_TRANSFER_ABUSE_BYTES + 1,
+            ))
+            .expect("publish terminal peer metrics");
+        assert!(handle.unregister_torrent(info_hash.clone()));
+
+        let snapshot = handle.snapshot().await.expect("peer manager snapshot");
+        assert_eq!(snapshot.registered_torrents, 0);
+        assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
 
         let _ = shutdown_tx.send(());
         service.join().await;
@@ -2090,6 +2200,41 @@ mod tests {
             now + Duration::from_secs(RECONNECT_LIMIT as u64),
         ));
         assert!(reducer.policy().restrictions.contains_key(&ip));
+    }
+
+    #[test]
+    fn cumulative_reconnect_count_captures_lifecycle_events_between_snapshots() {
+        let mut reducer = PeerPolicyReducer::default();
+        let info_hash = vec![0x71; 20];
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 71));
+        let address = "tcp://192.0.2.71:6000";
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(7_100_000);
+        let torrent_size = 4 * 1024 * 1024 * 1024;
+
+        assert!(!reducer.reduce_metrics(
+            &info_hash,
+            &metrics_with_peer(&info_hash, torrent_size, address, 0),
+            now,
+        ));
+        assert!(reducer.reduce_metrics(
+            &info_hash,
+            &metrics_with_reconnect_count(
+                &info_hash,
+                torrent_size,
+                address,
+                RECONNECT_LIMIT as u64,
+            ),
+            now + Duration::from_secs(1),
+        ));
+
+        assert!(matches!(
+            reducer.policy().restrictions.get(&ip).map(|restriction| &restriction.reason),
+            Some(PeerRestrictionReason::ReconnectChurn {
+                reconnects,
+                threshold,
+                ..
+            }) if *reconnects == RECONNECT_LIMIT as u32 && *threshold == RECONNECT_LIMIT as u32
+        ));
     }
 
     #[tokio::test]
