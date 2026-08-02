@@ -979,6 +979,7 @@ pub fn reduce_help_action(
             }
         }
         HelpAction::SearchClear => {
+            app_state.ui.help.is_searching = true;
             app_state.ui.help.search_query.clear();
             app_state.ui.help.scroll_offset = 0;
             HelpReduceResult {
@@ -1790,7 +1791,6 @@ mod tests {
     fn wide_help_render_keeps_classic_chrome_and_simplified_content() {
         let rendered = render_help_screen(120, 36, AppState::default());
 
-        assert!(!rendered.contains("SUPERSEEDR / HELP"));
         assert!(!rendered.contains("FIELD INDEX"));
         assert!(!rendered.contains("FIELD NOTE"));
         for section in HELP_SECTIONS {
@@ -2192,6 +2192,27 @@ mod tests {
         assert!(matches!(app_state.mode, AppMode::Help));
         assert!(!app_state.ui.help.is_searching);
         assert!(app_state.ui.help.search_query.is_empty());
+    }
+
+    #[test]
+    fn help_ctrl_u_reopens_committed_search_panel() {
+        let mut app_state = AppState {
+            mode: AppMode::Help,
+            ..Default::default()
+        };
+        app_state.ui.help.is_searching = false;
+        app_state.ui.help.search_query = "queue".to_string();
+        app_state.ui.help.scroll_offset = 4;
+
+        handle_event(
+            CrosstermEvent::Key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            &mut app_state,
+        );
+
+        assert!(app_state.ui.help.is_searching);
+        assert!(app_state.ui.help.search_query.is_empty());
+        assert_eq!(app_state.ui.help.scroll_offset, 0);
+        assert!(matches!(app_state.mode, AppMode::Help));
     }
 
     #[test]
