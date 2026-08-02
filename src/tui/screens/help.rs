@@ -58,13 +58,6 @@ impl HelpSection {
         HELP_SECTIONS[(idx + HELP_SECTIONS.len() - 1) % HELP_SECTIONS.len()]
     }
 
-    fn index(self) -> usize {
-        HELP_SECTIONS
-            .iter()
-            .position(|section| *section == self)
-            .unwrap_or(0)
-    }
-
     fn description(self) -> &'static str {
         match self {
             Self::General => {
@@ -799,11 +792,7 @@ fn filter_help_items_for_view(all_items: Vec<HelpItem>, app_state: &AppState) ->
 
 enum HelpDisplayRow<'a> {
     Spacer,
-    Heading {
-        section: HelpSection,
-        title: String,
-        item_count: usize,
-    },
+    Heading { section: HelpSection, title: String },
     Item(&'a HelpItem),
 }
 
@@ -836,7 +825,6 @@ fn help_display_rows(items: &[HelpItem], search_view: bool) -> Vec<HelpDisplayRo
         rows.push(HelpDisplayRow::Heading {
             section: item.section,
             title: heading,
-            item_count,
         });
         rows.extend(
             items[index..index + item_count]
@@ -1079,7 +1067,6 @@ struct HelpLayout {
     hero: Rect,
     warning: Option<Rect>,
     table: Rect,
-    position: Rect,
     controls: Rect,
     density: HelpDensity,
 }
@@ -1098,7 +1085,7 @@ fn help_panel_inner(panel: Rect, density: HelpDensity) -> Rect {
     let vertical_padding = u16::from(matches!(density, HelpDensity::Spacious));
     Block::default()
         .borders(Borders::ALL)
-        .padding(Padding::new(2, 2, vertical_padding, vertical_padding))
+        .padding(Padding::new(1, 1, vertical_padding, vertical_padding))
         .inner(panel)
 }
 
@@ -1143,7 +1130,6 @@ fn calculate_help_layout(
         )));
     }
     content_constraints.push(Constraint::Min(1));
-    content_constraints.push(Constraint::Length(1));
     let content_rows = Layout::vertical(content_constraints).split(inner);
     let table_index = 1 + usize::from(warning_text.is_some());
 
@@ -1155,7 +1141,6 @@ fn calculate_help_layout(
         hero: content_rows[0],
         warning: warning_text.map(|_| content_rows[1]),
         table: content_rows[table_index],
-        position: content_rows[table_index + 1],
         controls: chrome[2],
         density,
     }
@@ -1191,7 +1176,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         .borders(Borders::ALL)
         .border_style(ctx.apply(Style::default().fg(ctx.theme.semantic.border)))
         .title_top(panel_title)
-        .padding(Padding::new(2, 2, vertical_padding, vertical_padding));
+        .padding(Padding::new(1, 1, vertical_padding, vertical_padding));
     f.render_widget(outer_block, layout.panel);
 
     draw_help_hero(
@@ -1211,14 +1196,6 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     if layout.table.height > 0 && layout.table.width > 0 {
         draw_help_table(f, layout.table, app_state, &items, ctx);
     }
-    draw_help_position(
-        f,
-        layout.position,
-        app_state,
-        &items,
-        help_table_capacity(layout.table),
-        ctx,
-    );
     draw_help_controls(f, layout.controls, app_state, ctx);
 }
 
@@ -1512,7 +1489,6 @@ fn help_marker_key_cell(
     ctx: &ThemeContext,
 ) -> Cell<'static> {
     Cell::from(Line::from(vec![
-        Span::raw("  "),
         Span::styled(marker, ctx.apply(Style::default().fg(marker_color).bold())),
         Span::styled(
             format!(" {label}"),
@@ -1524,13 +1500,7 @@ fn help_marker_key_cell(
 fn help_item_key_cell(item: &HelpItem, key_width: u16, ctx: &ThemeContext) -> Cell<'static> {
     match item.key_style {
         HelpKeyStyle::Plain => Cell::from(Span::styled(
-            format!(
-                "  {}",
-                truncate_with_ellipsis(
-                    &format!("[{}]", item.key),
-                    key_width.saturating_sub(2) as usize,
-                )
-            ),
+            truncate_with_ellipsis(&format!("[{}]", item.key), key_width as usize),
             help_key_style(ctx, item.action_tone).bold(),
         )),
         HelpKeyStyle::PeerDownloadOpportunity => {
@@ -1608,18 +1578,11 @@ fn draw_help_table(
             .into_iter()
             .map(|row| match row {
                 HelpDisplayRow::Spacer => Row::new(vec![Cell::from(""), Cell::from("")]),
-                HelpDisplayRow::Heading {
-                    section,
-                    title,
-                    item_count,
-                } => Row::new(vec![
+                HelpDisplayRow::Heading { section, title } => Row::new(vec![
                     Cell::from(Span::styled(
-                        format!(
-                            "  {}",
-                            truncate_with_ellipsis(
-                                &format!("◆ {}", title.to_uppercase()),
-                                key_width.saturating_sub(2) as usize,
-                            )
+                        truncate_with_ellipsis(
+                            &format!("◆ {}", title.to_uppercase()),
+                            key_width as usize,
                         ),
                         ctx.apply(
                             Style::default()
@@ -1627,13 +1590,7 @@ fn draw_help_table(
                                 .bold(),
                         ),
                     )),
-                    Cell::from(Span::styled(
-                        format!(
-                            "  {item_count} {}",
-                            if *item_count == 1 { "entry" } else { "entries" }
-                        ),
-                        ctx.apply(Style::default().fg(ctx.theme.semantic.overlay0)),
-                    )),
+                    Cell::from(""),
                 ]),
                 HelpDisplayRow::Item(item) => Row::new(vec![
                     help_item_key_cell(item, key_width, ctx),
@@ -1650,112 +1607,6 @@ fn draw_help_table(
         .column_spacing(column_spacing);
 
     f.render_widget(table, area);
-}
-
-fn draw_help_position(
-    f: &mut Frame,
-    area: Rect,
-    app_state: &AppState,
-    items: &[HelpItem],
-    visible_count: usize,
-    ctx: &ThemeContext,
-) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-
-    let search_view = app_state.ui.help.is_searching || !app_state.ui.help.search_query.is_empty();
-    let display_rows = help_display_rows(items, search_view);
-    let scroll = clamped_scroll_offset(
-        app_state.ui.help.scroll_offset,
-        display_rows.len(),
-        visible_count,
-    );
-    let first = usize::from(!display_rows.is_empty()) * (scroll + 1);
-    let last = (scroll + visible_count).min(display_rows.len());
-    let progress_width = if area.width >= 72 { 12 } else { 6 };
-    let filled = if display_rows.is_empty() {
-        0
-    } else if display_rows.len() <= visible_count {
-        progress_width
-    } else {
-        (((last as f64 / display_rows.len() as f64) * progress_width as f64).ceil() as usize)
-            .clamp(1, progress_width)
-    };
-    let progress = format!(
-        "{}{}",
-        "━".repeat(filled),
-        "─".repeat(progress_width.saturating_sub(filled))
-    );
-    let active_color = help_section_color(app_state.ui.help.active_section, ctx);
-    let scope = if search_view {
-        format!("{} MATCHES", items.len())
-    } else {
-        format!(
-            "{:02}/{:02}  {} ENTRIES",
-            app_state.ui.help.active_section.index() + 1,
-            HELP_SECTIONS.len(),
-            items.len()
-        )
-    };
-    let range = if display_rows.is_empty() {
-        "NO VISIBLE ROWS".to_string()
-    } else {
-        format!("ROWS {first}-{last} / {}", display_rows.len())
-    };
-
-    let line = if area.width < 48 {
-        let tight_scope = if search_view {
-            format!("{} HITS", items.len())
-        } else {
-            format!(
-                "{:02}/{:02}",
-                app_state.ui.help.active_section.index() + 1,
-                HELP_SECTIONS.len()
-            )
-        };
-        let tight_range = if display_rows.is_empty() {
-            "0/0".to_string()
-        } else {
-            format!("{first}-{last}/{}", display_rows.len())
-        };
-        Line::from(vec![
-            Span::styled(
-                tight_scope,
-                ctx.apply(Style::default().fg(active_color).bold()),
-            ),
-            Span::styled(
-                "  •  ",
-                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
-            ),
-            Span::styled(
-                tight_range,
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-            ),
-            Span::styled(
-                format!("  {progress}"),
-                ctx.apply(Style::default().fg(active_color)),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(scope, ctx.apply(Style::default().fg(active_color).bold())),
-            Span::styled(
-                "  •  ",
-                ctx.apply(Style::default().fg(ctx.theme.semantic.surface2)),
-            ),
-            Span::styled(
-                range,
-                ctx.apply(Style::default().fg(ctx.theme.semantic.subtext0)),
-            ),
-            Span::styled(
-                format!("  {progress}"),
-                ctx.apply(Style::default().fg(active_color)),
-            ),
-        ])
-    };
-
-    f.render_widget(Paragraph::new(line).alignment(Alignment::Center), area);
 }
 
 fn draw_help_controls(f: &mut Frame, area: Rect, app_state: &AppState, ctx: &ThemeContext) {
@@ -1891,6 +1742,9 @@ mod tests {
             assert!(layout.panel.bottom() <= layout.controls.y);
             assert!(layout.controls.bottom() <= layout.popup.bottom());
             assert!(layout.table.height > 0);
+            let inner = help_panel_inner(layout.panel, layout.density);
+            assert_eq!(inner.x, layout.panel.x + 2);
+            assert_eq!(inner.right(), layout.panel.right() - 2);
         }
     }
 
@@ -1918,8 +1772,9 @@ mod tests {
             assert!(layout.tabs.bottom() <= layout.panel.y);
             assert!(layout.hero.bottom() <= warning.y);
             assert!(warning.bottom() <= layout.table.y);
-            assert!(layout.table.bottom() <= layout.position.y);
-            assert!(layout.position.bottom() <= layout.panel.bottom());
+            assert!(
+                layout.table.bottom() <= help_panel_inner(layout.panel, layout.density).bottom()
+            );
             assert!(layout.panel.bottom() <= layout.controls.y);
         }
     }
@@ -1943,7 +1798,7 @@ mod tests {
         }
         assert!(rendered.contains("search the manual"));
         assert!(rendered.contains("HELP NAVIGATION"));
-        assert!(rendered.contains("ROWS 1-"));
+        assert!(!rendered.contains("ROWS 1-"));
     }
 
     #[test]
@@ -2124,8 +1979,7 @@ mod tests {
         assert!(layout.tabs.bottom() <= layout.panel.y);
         assert!(layout.hero.bottom() <= warning.y);
         assert!(warning.bottom() <= layout.table.y);
-        assert!(layout.table.bottom() <= layout.position.y);
-        assert!(layout.position.bottom() <= layout.panel.bottom());
+        assert!(layout.table.bottom() <= help_panel_inner(layout.panel, layout.density).bottom());
         assert!(layout.panel.bottom() <= layout.controls.y);
     }
 
