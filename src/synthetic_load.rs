@@ -2001,7 +2001,6 @@ fn build_manager_with_rx(
     let params = TorrentParameters {
         dht_handle: crate::dht_service::DhtHandle::disabled(),
         incoming_peer_rx: incoming_rx,
-        peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
         metrics_tx,
         peer_policy_rx,
         torrent_validation_status: validated,

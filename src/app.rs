@@ -1255,6 +1255,10 @@ pub struct TorrentMetrics {
 
     #[serde(skip)]
     pub peers: Vec<PeerInfo>,
+    /// Recently departed peers retained long enough for background consumers to observe
+    /// their final cumulative transfer counters. UI telemetry does not display these rows.
+    #[serde(skip)]
+    pub departed_peers: Vec<PeerInfo>,
     /// Cumulative reconnects after an IP has no remaining active peer for this manager lifetime.
     #[serde(skip)]
     pub peer_reconnect_counts: HashMap<IpAddr, u64>,
@@ -1306,6 +1310,7 @@ impl Default for TorrentMetrics {
             session_total_uploaded: 0,
             eta: Duration::default(),
             peers: Vec::new(),
+            departed_peers: Vec::new(),
             peer_reconnect_counts: HashMap::new(),
             activity_message: String::new(),
             next_announce_in: Duration::default(),
@@ -7869,9 +7874,8 @@ impl App {
             .insert(info_hash.clone(), manager_command_tx);
 
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
-        let (peer_metrics_tx, peer_metrics_rx) = watch::channel(TorrentMetrics::default());
         self.torrent_metric_watch_rxs
-            .insert(info_hash.clone(), torrent_metrics_rx);
+            .insert(info_hash.clone(), torrent_metrics_rx.clone());
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -7883,7 +7887,6 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
-            peer_metrics_tx,
             peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path,
@@ -7906,7 +7909,7 @@ impl App {
                 if !self
                     .peer_manager
                     .handle()
-                    .register_torrent(info_hash.clone(), peer_metrics_rx)
+                    .register_torrent(info_hash.clone(), torrent_metrics_rx)
                 {
                     tracing_event!(
                         Level::WARN,
@@ -8066,9 +8069,8 @@ impl App {
 
         let dht_handle = self.dht_service.handle();
         let (torrent_metrics_tx, torrent_metrics_rx) = watch::channel(TorrentMetrics::default());
-        let (peer_metrics_tx, peer_metrics_rx) = watch::channel(TorrentMetrics::default());
         self.torrent_metric_watch_rxs
-            .insert(info_hash.clone(), torrent_metrics_rx);
+            .insert(info_hash.clone(), torrent_metrics_rx.clone());
         let manager_event_tx_clone = self.manager_event_tx.clone();
         let resource_manager_clone = self.resource_manager.clone();
         let global_dl_bucket_clone = self.global_dl_bucket.clone();
@@ -8077,7 +8079,6 @@ impl App {
             dht_handle,
             incoming_peer_rx,
             metrics_tx: torrent_metrics_tx,
-            peer_metrics_tx,
             peer_policy_rx: self.peer_manager.handle().subscribe_policy(),
             torrent_validation_status: is_validated,
             torrent_data_path: download_path.clone(),
@@ -8100,7 +8101,7 @@ impl App {
                 if !self
                     .peer_manager
                     .handle()
-                    .register_torrent(info_hash.clone(), peer_metrics_rx)
+                    .register_torrent(info_hash.clone(), torrent_metrics_rx)
                 {
                     tracing_event!(
                         Level::WARN,

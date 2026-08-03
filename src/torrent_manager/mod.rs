@@ -41,7 +41,6 @@ pub struct TorrentParameters {
     pub dht_handle: DhtHandle,
     pub incoming_peer_rx: Receiver<IncomingPeerSession>,
     pub metrics_tx: watch::Sender<TorrentMetrics>,
-    pub peer_metrics_tx: watch::Sender<TorrentMetrics>,
     pub peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
     pub torrent_validation_status: bool,
     pub torrent_data_path: Option<PathBuf>,

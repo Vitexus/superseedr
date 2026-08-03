@@ -333,12 +333,13 @@ struct FileActivityInterval {
     end: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DepartedPeerTransfer {
     pub address: String,
     pub peer_id: Vec<u8>,
     pub total_downloaded: u64,
     pub total_uploaded: u64,
+    departed_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -504,6 +505,24 @@ impl TorrentState {
         self.peer_reconnect_counts.retain(|ip, _| {
             self.peer_active_counts.contains_key(ip) || self.peer_inactive_since.contains_key(ip)
         });
+
+        self.pending_departed_peer_transfers.retain(|_, transfer| {
+            now.saturating_duration_since(transfer.departed_at) < RECONNECT_WINDOW
+        });
+        if self.pending_departed_peer_transfers.len() > MAX_INACTIVE_PEER_BASELINES {
+            let mut oldest = self
+                .pending_departed_peer_transfers
+                .iter()
+                .map(|(address, transfer)| (transfer.departed_at, address.clone()))
+                .collect::<Vec<_>>();
+            oldest.sort_unstable();
+            for (_, address) in oldest
+                .into_iter()
+                .take(self.pending_departed_peer_transfers.len() - MAX_INACTIVE_PEER_BASELINES)
+            {
+                self.pending_departed_peer_transfers.remove(&address);
+            }
+        }
     }
 
     fn record_departed_peer_transfer(&mut self, peer: &PeerState) {
@@ -513,6 +532,7 @@ impl TorrentState {
         let total_uploaded = peer
             .transfer_base_uploaded
             .saturating_add(peer.total_bytes_uploaded);
+        let departed_at = self.now;
         let pending = self
             .pending_departed_peer_transfers
             .entry(peer.ip_port.clone())
@@ -521,18 +541,19 @@ impl TorrentState {
                 peer_id: peer.peer_id.clone(),
                 total_downloaded: 0,
                 total_uploaded: 0,
+                departed_at,
             });
         if !peer.peer_id.is_empty() {
             pending.peer_id.clone_from(&peer.peer_id);
         }
         pending.total_downloaded = pending.total_downloaded.max(total_downloaded);
         pending.total_uploaded = pending.total_uploaded.max(total_uploaded);
+        pending.departed_at = departed_at;
+        self.maintain_peer_reconnect_baselines();
     }
 
-    pub(crate) fn take_departed_peer_transfers(&mut self) -> Vec<DepartedPeerTransfer> {
-        std::mem::take(&mut self.pending_departed_peer_transfers)
-            .into_values()
-            .collect()
+    pub(crate) fn departed_peer_transfers(&self) -> impl Iterator<Item = &DepartedPeerTransfer> {
+        self.pending_departed_peer_transfers.values()
     }
 
     pub fn new(
@@ -3227,6 +3248,7 @@ mod tests {
             tx: second_tx,
         });
         assert!(!state.peer_reconnect_counts.contains_key(&peer_addr.ip()));
+        assert!(state.pending_departed_peer_transfers.is_empty());
     }
 
     #[test]
@@ -3238,6 +3260,17 @@ mod tests {
             ));
             state.peer_inactive_since.insert(ip, state.now);
             state.peer_reconnect_counts.insert(ip, 1);
+            let address = format!("[{ip}]:6881");
+            state.pending_departed_peer_transfers.insert(
+                address.clone(),
+                DepartedPeerTransfer {
+                    address,
+                    peer_id: Vec::new(),
+                    total_downloaded: 0,
+                    total_uploaded: 0,
+                    departed_at: state.now,
+                },
+            );
         }
 
         state.maintain_peer_reconnect_baselines();
@@ -3245,6 +3278,10 @@ mod tests {
         assert_eq!(state.peer_inactive_since.len(), MAX_INACTIVE_PEER_BASELINES);
         assert_eq!(
             state.peer_reconnect_counts.len(),
+            MAX_INACTIVE_PEER_BASELINES
+        );
+        assert_eq!(
+            state.pending_departed_peer_transfers.len(),
             MAX_INACTIVE_PEER_BASELINES
         );
     }
@@ -11753,7 +11790,6 @@ mod integration_tests {
         let params = TorrentParameters {
             dht_handle: crate::dht_service::DhtHandle::disabled(),
             incoming_peer_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,

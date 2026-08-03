@@ -8,7 +8,7 @@ use crate::fs_atomic::{
     deserialize_versioned_toml, serialize_versioned_toml, write_string_atomically,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -19,8 +19,7 @@ use tokio::sync::oneshot;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
-const METRICS_NOTIFICATION_CAPACITY: usize = 1_024;
-const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+const METRICS_REDUCTION_INTERVAL: Duration = Duration::from_secs(1);
 const MIN_TRANSFER_ABUSE_BYTES: u64 = 256 * 1024 * 1024;
 const TRANSFER_ABUSE_MULTIPLIER: u64 = 2;
 const RECONNECT_LIMIT: usize = 10;
@@ -302,12 +301,13 @@ pub struct PeerManagerView {
 }
 
 impl PeerTorrentHistory {
-    fn observe_presence(
+    fn observe_snapshot(
         &mut self,
         endpoint_transfers: HashMap<String, EndpointTransferTotals>,
         clients: BTreeSet<String>,
         now: SystemTime,
         infer_reconnect: bool,
+        is_present: bool,
     ) {
         let endpoints_replaced = self.present
             && !self.endpoint_transfers.is_empty()
@@ -325,11 +325,15 @@ impl PeerTorrentHistory {
                             || totals.uploaded < previous.uploaded
                     })
             });
-        if infer_reconnect && self.seen && (!self.present || endpoints_replaced || counter_reset) {
+        if is_present
+            && infer_reconnect
+            && self.seen
+            && (!self.present || endpoints_replaced || counter_reset)
+        {
             self.reconnects.push_back(now);
         }
         self.seen = true;
-        self.present = true;
+        self.present = is_present;
         self.last_seen = Some(now);
         self.prune_reconnects(now);
 
@@ -432,16 +436,25 @@ impl PeerPolicyReducer {
         let mut observed = HashMap::<IpAddr, HashMap<String, EndpointTransferTotals>>::new();
         let mut observed_clients = HashMap::<IpAddr, BTreeSet<String>>::new();
         let mut reconnect_counts = HashMap::<IpAddr, u64>::new();
+        let mut active_ips = HashSet::<IpAddr>::new();
 
         for (ip, count) in &metrics.peer_reconnect_counts {
             let total = reconnect_counts.entry(normalize_ip(*ip)).or_default();
             *total = total.saturating_add(*count);
         }
 
-        for peer in &metrics.peers {
+        for (peer, is_active) in metrics
+            .peers
+            .iter()
+            .map(|peer| (peer, true))
+            .chain(metrics.departed_peers.iter().map(|peer| (peer, false)))
+        {
             let Some(ip) = parse_peer_ip(&peer.address) else {
                 continue;
             };
+            if is_active {
+                active_ips.insert(ip);
+            }
             if !peer.peer_id.is_empty() {
                 observed_clients
                     .entry(ip)
@@ -463,7 +476,7 @@ impl PeerPolicyReducer {
                 if !reconnect_counts.contains_key(ip) {
                     history.reset_reconnect_count_baseline();
                 }
-                if !observed.contains_key(ip) {
+                if !active_ips.contains(ip) && !observed.contains_key(ip) {
                     history.observe_absence(now);
                 }
             }
@@ -477,11 +490,12 @@ impl PeerPolicyReducer {
 
             for (ip, endpoint_transfers) in observed {
                 let history = torrent_histories.entry(ip).or_default();
-                history.observe_presence(
+                history.observe_snapshot(
                     endpoint_transfers,
                     observed_clients.remove(&ip).unwrap_or_default(),
                     now,
                     !reconnect_counts.contains_key(&ip),
+                    active_ips.contains(&ip),
                 );
             }
 
@@ -552,15 +566,19 @@ impl PeerPolicyReducer {
                 .unwrap_or(MIN_TRANSFER_ABUSE_BYTES);
 
             for (ip, history) in histories {
-                let mut endpoints = history
-                    .endpoint_transfers
-                    .iter()
-                    .map(|(address, totals)| PeerManagerEndpointView {
-                        address: address.clone(),
-                        total_downloaded: totals.downloaded,
-                        total_uploaded: totals.uploaded,
-                    })
-                    .collect::<Vec<_>>();
+                let mut endpoints = if history.present {
+                    history
+                        .endpoint_transfers
+                        .iter()
+                        .map(|(address, totals)| PeerManagerEndpointView {
+                            address: address.clone(),
+                            total_downloaded: totals.downloaded,
+                            total_uploaded: totals.uploaded,
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
                 endpoints.sort_unstable_by(|left, right| left.address.cmp(&right.address));
 
                 tracked_peers.push(PeerManagerTrackedPeer {
@@ -969,39 +987,6 @@ fn publish_view(
     )));
 }
 
-struct MetricsRegistration {
-    receiver: watch::Receiver<TorrentMetrics>,
-    notification_task: JoinHandle<()>,
-}
-
-impl Drop for MetricsRegistration {
-    fn drop(&mut self) {
-        self.notification_task.abort();
-    }
-}
-
-fn spawn_metrics_notification_task(
-    info_hash: InfoHash,
-    mut metrics_rx: watch::Receiver<TorrentMetrics>,
-    metrics_notification_tx: mpsc::Sender<InfoHash>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let sender_is_open = metrics_rx.changed().await.is_ok();
-            if metrics_notification_tx
-                .send(info_hash.clone())
-                .await
-                .is_err()
-            {
-                break;
-            }
-            if !sender_is_open {
-                break;
-            }
-        }
-    })
-}
-
 #[derive(Default)]
 struct MetricsDrainResult {
     policy_changed: bool,
@@ -1047,7 +1032,7 @@ fn drain_metrics_update(
 
 fn drain_metrics_updates(
     reducer: &mut PeerPolicyReducer,
-    metrics_registrations: &mut HashMap<InfoHash, MetricsRegistration>,
+    metrics_rxs: &mut HashMap<InfoHash, watch::Receiver<TorrentMetrics>>,
     latest_metrics: &mut HashMap<InfoHash, TorrentMetrics>,
     metrics_updates: &mut u64,
 ) -> (bool, bool) {
@@ -1056,11 +1041,11 @@ fn drain_metrics_updates(
     let mut view_changed = false;
     let mut closed = Vec::new();
 
-    for (info_hash, registration) in metrics_registrations.iter_mut() {
+    for (info_hash, metrics_rx) in metrics_rxs.iter_mut() {
         let result = drain_metrics_update(
             reducer,
             info_hash,
-            &mut registration.receiver,
+            metrics_rx,
             latest_metrics,
             metrics_updates,
             now,
@@ -1073,7 +1058,7 @@ fn drain_metrics_updates(
     }
 
     for info_hash in closed {
-        metrics_registrations.remove(&info_hash);
+        metrics_rxs.remove(&info_hash);
         latest_metrics.remove(&info_hash);
         reducer.remove_torrent(&info_hash);
     }
@@ -1204,15 +1189,13 @@ async fn run_service(
     let mut persistence_state = persistence.state;
     let mut persistence_result_rx = persistence.result_rx;
     let checkpoint_interval = persistence.checkpoint_interval;
-    let mut metrics_registrations = HashMap::<InfoHash, MetricsRegistration>::new();
-    let (metrics_notification_tx, mut metrics_notification_rx) =
-        mpsc::channel::<InfoHash>(METRICS_NOTIFICATION_CAPACITY);
+    let mut metrics_rxs = HashMap::<InfoHash, watch::Receiver<TorrentMetrics>>::new();
     let mut latest_metrics = HashMap::<InfoHash, TorrentMetrics>::new();
     let mut metrics_updates = 0_u64;
-    let first_view_publish = tokio::time::Instant::now() + VIEW_PUBLISH_INTERVAL;
-    let mut view_publish = tokio::time::interval_at(first_view_publish, VIEW_PUBLISH_INTERVAL);
-    view_publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut view_dirty = false;
+    let first_metrics_reduction = tokio::time::Instant::now() + METRICS_REDUCTION_INTERVAL;
+    let mut metrics_reduction =
+        tokio::time::interval_at(first_metrics_reduction, METRICS_REDUCTION_INTERVAL);
+    metrics_reduction.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let first_checkpoint = tokio::time::Instant::now() + checkpoint_interval;
     let mut policy_checkpoint = tokio::time::interval_at(first_checkpoint, checkpoint_interval);
     policy_checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1249,33 +1232,19 @@ async fn run_service(
                             metrics_updates = metrics_updates.saturating_add(1);
                         }
                         latest_metrics.insert(info_hash.clone(), metrics);
-                        let notification_task = spawn_metrics_notification_task(
-                            info_hash.clone(),
-                            metrics_rx.clone(),
-                            metrics_notification_tx.clone(),
-                        );
-                        metrics_registrations.insert(
-                            info_hash,
-                            MetricsRegistration {
-                                receiver: metrics_rx,
-                                notification_task,
-                            },
-                        );
+                        metrics_rxs.insert(info_hash, metrics_rx);
                         publish_view(
                             &reducer,
                             &latest_metrics,
-                            metrics_registrations.len(),
+                            metrics_rxs.len(),
                             metrics_updates,
                             &view_tx,
                         );
-                        view_dirty = false;
                     }
                     PeerManagerCommand::UnregisterTorrent { info_hash } => {
-                        if let Some(mut registration) = metrics_registrations.remove(&info_hash) {
-                            let had_pending_update =
-                                registration.receiver.has_changed().unwrap_or(false);
-                            let terminal_metrics =
-                                registration.receiver.borrow_and_update().clone();
+                        if let Some(mut metrics_rx) = metrics_rxs.remove(&info_hash) {
+                            let had_pending_update = metrics_rx.has_changed().unwrap_or(false);
+                            let terminal_metrics = metrics_rx.borrow_and_update().clone();
                             if reducer.reduce_metrics(
                                 &info_hash,
                                 &terminal_metrics,
@@ -1294,16 +1263,15 @@ async fn run_service(
                         publish_view(
                             &reducer,
                             &latest_metrics,
-                            metrics_registrations.len(),
+                            metrics_rxs.len(),
                             metrics_updates,
                             &view_tx,
                         );
-                        view_dirty = false;
                     }
                     PeerManagerCommand::Flush { response_tx } => {
                         let (policy_changed, view_changed) = drain_metrics_updates(
                             &mut reducer,
-                            &mut metrics_registrations,
+                            &mut metrics_rxs,
                             &mut latest_metrics,
                             &mut metrics_updates,
                         );
@@ -1315,11 +1283,10 @@ async fn run_service(
                             publish_view(
                                 &reducer,
                                 &latest_metrics,
-                                metrics_registrations.len(),
+                                metrics_rxs.len(),
                                 metrics_updates,
                                 &view_tx,
                             );
-                            view_dirty = false;
                         }
                         persistence_state.queue_if_dirty(&reducer);
                         let _ = response_tx.send(());
@@ -1327,7 +1294,7 @@ async fn run_service(
                     #[cfg(test)]
                     PeerManagerCommand::Snapshot { response_tx } => {
                         let _ = response_tx.send(PeerManagerSnapshot {
-                            registered_torrents: metrics_registrations.len(),
+                            registered_torrents: metrics_rxs.len(),
                             metrics_updates,
                             latest_metrics: latest_metrics.clone(),
                         });
@@ -1341,43 +1308,26 @@ async fn run_service(
                     }
                 }
             }
-            Some(info_hash) = metrics_notification_rx.recv() => {
-                let result = metrics_registrations
-                    .get_mut(&info_hash)
-                    .map(|registration| {
-                        drain_metrics_update(
-                            &mut reducer,
-                            &info_hash,
-                            &mut registration.receiver,
-                            &mut latest_metrics,
-                            &mut metrics_updates,
-                            SystemTime::now(),
-                        )
-                    });
-                if let Some(result) = result {
-                    if result.receiver_closed {
-                        metrics_registrations.remove(&info_hash);
-                        latest_metrics.remove(&info_hash);
-                        reducer.remove_torrent(&info_hash);
-                    }
-                    if result.policy_changed {
-                        persistence_state.mark_dirty();
-                        publish_policy(&reducer, &policy_tx);
-                    }
-                    if result.view_changed {
-                        view_dirty = true;
-                    }
-                }
-            }
-            _ = view_publish.tick(), if view_dirty => {
-                publish_view(
-                    &reducer,
-                    &latest_metrics,
-                    metrics_registrations.len(),
-                    metrics_updates,
-                    &view_tx,
+            _ = metrics_reduction.tick() => {
+                let (policy_changed, view_changed) = drain_metrics_updates(
+                    &mut reducer,
+                    &mut metrics_rxs,
+                    &mut latest_metrics,
+                    &mut metrics_updates,
                 );
-                view_dirty = false;
+                if policy_changed {
+                    persistence_state.mark_dirty();
+                    publish_policy(&reducer, &policy_tx);
+                }
+                if view_changed {
+                    publish_view(
+                        &reducer,
+                        &latest_metrics,
+                        metrics_rxs.len(),
+                        metrics_updates,
+                        &view_tx,
+                    );
+                }
             }
             _ = policy_checkpoint.tick() => {
                 let history_count = reducer.history_count();
@@ -1389,11 +1339,10 @@ async fn run_service(
                     publish_view(
                         &reducer,
                         &latest_metrics,
-                        metrics_registrations.len(),
+                        metrics_rxs.len(),
                         metrics_updates,
                         &view_tx,
                     );
-                    view_dirty = false;
                 }
                 persistence_state.queue_if_dirty(&reducer);
             }
@@ -1487,7 +1436,7 @@ mod tests {
         handle: &PeerManagerHandle,
         expected_updates: u64,
     ) -> PeerManagerSnapshot {
-        timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_secs(2), async {
             loop {
                 let snapshot = handle.snapshot().await.expect("peer manager snapshot");
                 if snapshot.metrics_updates >= expected_updates {
@@ -1963,7 +1912,7 @@ mod tests {
             .send(metrics)
             .expect("view subscriber should keep metrics receiver open");
 
-        let active_view = timeout(Duration::from_secs(1), async {
+        let active_view = timeout(Duration::from_secs(2), async {
             loop {
                 view_rx
                     .changed()
@@ -1989,7 +1938,7 @@ mod tests {
         metrics_tx
             .send(absent_metrics)
             .expect("view subscriber should keep metrics receiver open");
-        let absent_view = timeout(Duration::from_secs(1), async {
+        let absent_view = timeout(Duration::from_secs(2), async {
             loop {
                 view_rx
                     .changed()
@@ -2015,7 +1964,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn metrics_policy_updates_are_event_driven_and_view_rebuilds_on_cadence() {
+    async fn metrics_policy_and_view_updates_follow_background_cadence() {
         let (shutdown_tx, _) = broadcast::channel(1);
         let service = PeerManagerService::new(shutdown_tx.subscribe());
         let handle = service.handle();
@@ -2044,18 +1993,19 @@ mod tests {
                 MIN_TRANSFER_ABUSE_BYTES + 1,
             ))
             .expect("publish abusive metrics");
+        assert!(matches!(policy_rx.has_changed(), Ok(false)));
+        assert!(matches!(view_rx.has_changed(), Ok(false)));
+
+        tokio::time::advance(METRICS_REDUCTION_INTERVAL).await;
         policy_rx
             .changed()
             .await
             .expect("policy should remain published");
         assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
-        assert!(matches!(view_rx.has_changed(), Ok(false)));
-
-        tokio::time::advance(VIEW_PUBLISH_INTERVAL).await;
         view_rx
             .changed()
             .await
-            .expect("view should publish on its slower cadence");
+            .expect("view should publish on the background cadence");
 
         let _ = shutdown_tx.send(());
         service.join().await;
@@ -2092,6 +2042,30 @@ mod tests {
                 threshold_bytes: threshold,
             }
         );
+    }
+
+    #[test]
+    fn departed_peer_metrics_are_counted_without_remaining_active() {
+        let info_hash = vec![0x36; 20];
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 86));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(36_000);
+        let mut metrics = metrics_without_peers(&info_hash, 1);
+        metrics.departed_peers.push(PeerInfo {
+            address: format!("{ip}:6881"),
+            total_uploaded: MIN_TRANSFER_ABUSE_BYTES + 1,
+            last_action: "Disconnected".to_string(),
+            ..PeerInfo::default()
+        });
+        let mut reducer = PeerPolicyReducer::default();
+
+        assert!(reducer.reduce_metrics(&info_hash, &metrics, now));
+        assert!(!reducer.reduce_metrics(&info_hash, &metrics, now + Duration::from_secs(1)));
+        assert!(reducer.policy().restrictions.contains_key(&ip));
+        let view = reducer.build_view(&HashMap::from([(info_hash.clone(), metrics)]), 1, 1);
+        let departed = view.tracked_peers.first().expect("tracked departed peer");
+        assert_eq!(departed.ip, ip);
+        assert!(!departed.is_active);
+        assert!(departed.endpoints.is_empty());
     }
 
     #[test]
@@ -2420,7 +2394,7 @@ mod tests {
         assert!(snapshot.latest_metrics.contains_key(&info_hash));
         drop(metrics_tx);
 
-        let snapshot = timeout(Duration::from_secs(1), async {
+        let snapshot = timeout(Duration::from_secs(2), async {
             loop {
                 let snapshot = handle.snapshot().await.expect("peer manager snapshot");
                 if snapshot.registered_torrents == 0 {
@@ -3160,7 +3134,7 @@ mod tests {
         let mut policy_rx = handle.subscribe_policy();
 
         assert!(handle.register_torrent(info_hash, metrics_rx));
-        timeout(Duration::from_secs(1), policy_rx.changed())
+        timeout(Duration::from_secs(2), policy_rx.changed())
             .await
             .expect("registration should publish policy")
             .expect("policy publisher should remain open");
@@ -3223,7 +3197,7 @@ mod tests {
             ))
             .expect("metrics receiver should remain open");
 
-        timeout(Duration::from_secs(1), policy_rx.changed())
+        timeout(Duration::from_secs(2), policy_rx.changed())
             .await
             .expect("latest cumulative metrics should publish policy")
             .expect("policy publisher should remain open");

@@ -455,7 +455,6 @@ pub struct TorrentManager {
     dht_tx: Sender<()>,
 
     metrics_tx: watch::Sender<TorrentMetrics>,
-    peer_metrics_tx: watch::Sender<TorrentMetrics>,
     peer_policy_rx: watch::Receiver<Arc<PeerPolicy>>,
     peer_policy_open: bool,
     manager_event_tx: Sender<ManagerEvent>,
@@ -501,7 +500,6 @@ pub struct TorrentManager {
     global_dl_bucket: Arc<TokenBucket>,
     global_ul_bucket: Arc<TokenBucket>,
     telemetry: ManagerTelemetry,
-    peer_telemetry: ManagerTelemetry,
     data_rate_ms: u64,
     run_loop_started: bool,
 }
@@ -648,7 +646,6 @@ impl TorrentManager {
             dht_handle,
             incoming_peer_rx,
             metrics_tx,
-            peer_metrics_tx,
             peer_policy_rx,
             torrent_data_path: _,
             container_name,
@@ -713,7 +710,6 @@ impl TorrentManager {
             shutdown_tx,
             incoming_peer_rx,
             metrics_tx,
-            peer_metrics_tx,
             peer_policy_rx,
             peer_policy_open: true,
             manager_command_rx,
@@ -725,7 +721,6 @@ impl TorrentManager {
             global_dl_bucket,
             global_ul_bucket,
             telemetry: ManagerTelemetry::default(),
-            peer_telemetry: ManagerTelemetry::default(),
             data_rate_ms,
             run_loop_started: false,
         }
@@ -2786,17 +2781,15 @@ impl TorrentManager {
         bytes_ul: u64,
         file_activity_updates: Vec<crate::torrent_manager::FileActivityUpdate>,
     ) {
-        let mut torrent_state = self.build_peer_metrics_snapshot(bytes_dl, bytes_ul);
-        let live_peer_count = torrent_state.peers.len();
+        let mut torrent_state = self.build_metrics_snapshot(bytes_dl, bytes_ul);
         torrent_state
-            .peers
+            .departed_peers
             .extend(
                 self.state
-                    .take_departed_peer_transfers()
-                    .into_iter()
+                    .departed_peer_transfers()
                     .map(|departed| PeerInfo {
-                        address: departed.address,
-                        peer_id: departed.peer_id,
+                        address: departed.address.clone(),
+                        peer_id: departed.peer_id.clone(),
                         total_downloaded: departed.total_downloaded,
                         total_uploaded: departed.total_uploaded,
                         last_action: "Disconnected".to_string(),
@@ -2804,14 +2797,14 @@ impl TorrentManager {
                     }),
             );
         let Some(torrent) = self.state.torrent.as_ref() else {
-            if self.peer_telemetry.should_emit(&torrent_state) {
-                let _ = self.peer_metrics_tx.send(torrent_state);
+            if self.telemetry.should_emit(&torrent_state) {
+                let _ = self.metrics_tx.send(torrent_state);
             }
             return;
         };
         let Some(multi_file_info) = self.state.multi_file_info.as_ref() else {
-            if self.peer_telemetry.should_emit(&torrent_state) {
-                let _ = self.peer_metrics_tx.send(torrent_state);
+            if self.telemetry.should_emit(&torrent_state) {
+                let _ = self.metrics_tx.send(torrent_state);
             }
             event!(
                 Level::DEBUG,
@@ -2873,16 +2866,12 @@ impl TorrentManager {
         torrent_state.file_priorities = self.state.file_priorities.clone();
         torrent_state.file_activity_updates = file_activity_updates;
 
-        if self.peer_telemetry.should_emit(&torrent_state) {
-            let _ = self.peer_metrics_tx.send(torrent_state.clone());
-        }
-        torrent_state.peers.truncate(live_peer_count);
         if self.telemetry.should_emit(&torrent_state) {
             let _ = self.metrics_tx.send(torrent_state);
         }
     }
 
-    fn build_peer_metrics_snapshot(&self, bytes_dl: u64, bytes_ul: u64) -> TorrentMetrics {
+    fn build_metrics_snapshot(&self, bytes_dl: u64, bytes_ul: u64) -> TorrentMetrics {
         let download_speed_bps = self.state.total_dl_prev_avg_ema as u64;
         let upload_speed_bps = self.state.total_ul_prev_avg_ema as u64;
         let transport_counts = count_peers_by_transport(self.state.peers.values());
@@ -4052,7 +4041,6 @@ mod tests {
         let params = TorrentParameters {
             dht_handle,
             incoming_peer_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
@@ -4265,7 +4253,6 @@ mod resource_tests {
         TorrentParameters {
             dht_handle,
             incoming_peer_rx: incoming_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
@@ -4388,8 +4375,8 @@ mod resource_tests {
     #[tokio::test]
     async fn disconnected_peer_totals_are_published_before_the_peer_disappears() {
         let mut params = build_test_params();
-        let (peer_metrics_tx, mut peer_metrics_rx) = watch::channel(TorrentMetrics::default());
-        params.peer_metrics_tx = peer_metrics_tx;
+        let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
+        params.metrics_tx = metrics_tx;
         let mut manager = TorrentManager::from_torrent(params, create_dummy_torrent(1))
             .expect("manager from torrent");
         let peer_addr: SocketAddr = "203.0.113.48:6881".parse().expect("valid peer address");
@@ -4416,23 +4403,24 @@ mod resource_tests {
         });
         manager.send_metrics(0, 0, Vec::new());
 
-        peer_metrics_rx
+        metrics_rx
             .changed()
             .await
             .expect("terminal peer totals should be published");
-        let metrics = peer_metrics_rx.borrow_and_update().clone();
+        let metrics = metrics_rx.borrow_and_update().clone();
         assert!(!manager.state.peers.contains_key(&peer_key));
-        assert_eq!(metrics.peers.len(), 1);
-        assert_eq!(metrics.peers[0].address, peer_key);
-        assert_eq!(metrics.peers[0].total_downloaded, 12_345);
-        assert_eq!(metrics.peers[0].total_uploaded, 678);
+        assert!(metrics.peers.is_empty());
+        assert_eq!(metrics.departed_peers.len(), 1);
+        assert_eq!(metrics.departed_peers[0].address, peer_key);
+        assert_eq!(metrics.departed_peers[0].total_downloaded, 12_345);
+        assert_eq!(metrics.departed_peers[0].total_uploaded, 678);
     }
 
     #[tokio::test]
     async fn deletion_emits_terminal_peer_totals_before_clearing_sessions() {
         let mut params = build_test_params();
-        let (peer_metrics_tx, mut peer_metrics_rx) = watch::channel(TorrentMetrics::default());
-        params.peer_metrics_tx = peer_metrics_tx;
+        let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
+        params.metrics_tx = metrics_tx;
         let mut manager = TorrentManager::from_torrent(params, create_dummy_torrent(1))
             .expect("manager from torrent");
         manager.state.torrent_data_path = None;
@@ -4456,16 +4444,17 @@ mod resource_tests {
 
         manager.apply_action(Action::Delete);
 
-        peer_metrics_rx
+        metrics_rx
             .changed()
             .await
             .expect("deletion should publish terminal peer totals");
-        let metrics = peer_metrics_rx.borrow_and_update().clone();
+        let metrics = metrics_rx.borrow_and_update().clone();
         assert!(manager.state.peers.is_empty());
-        assert_eq!(metrics.peers.len(), 1);
-        assert_eq!(metrics.peers[0].address, peer_key);
-        assert_eq!(metrics.peers[0].total_downloaded, 4_096);
-        assert_eq!(metrics.peers[0].total_uploaded, 2_048);
+        assert!(metrics.peers.is_empty());
+        assert_eq!(metrics.departed_peers.len(), 1);
+        assert_eq!(metrics.departed_peers[0].address, peer_key);
+        assert_eq!(metrics.departed_peers[0].total_downloaded, 4_096);
+        assert_eq!(metrics.departed_peers[0].total_uploaded, 2_048);
     }
 
     #[tokio::test]
@@ -4494,12 +4483,10 @@ mod resource_tests {
     }
 
     #[tokio::test]
-    async fn awaiting_metadata_publishes_peer_observations_without_ui_metrics() {
+    async fn awaiting_metadata_publishes_complete_metrics_snapshot() {
         let mut params = build_test_params();
-        let (ui_metrics_tx, ui_metrics_rx) = watch::channel(TorrentMetrics::default());
-        let (peer_metrics_tx, mut peer_metrics_rx) = watch::channel(TorrentMetrics::default());
-        params.metrics_tx = ui_metrics_tx;
-        params.peer_metrics_tx = peer_metrics_tx;
+        let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
+        params.metrics_tx = metrics_tx;
         let magnet_link = "magnet:?xt=urn:btih:4040404040404040404040404040404040404040";
         let magnet = Magnet::new(magnet_link).expect("valid magnet link");
         let mut manager =
@@ -4514,15 +4501,14 @@ mod resource_tests {
         });
         manager.send_metrics(0, 0, Vec::new());
 
-        peer_metrics_rx
+        metrics_rx
             .changed()
             .await
             .expect("peer observation should be published");
-        let peer_metrics = peer_metrics_rx.borrow_and_update().clone();
-        assert_eq!(peer_metrics.info_hash, manager.state.info_hash);
-        assert_eq!(peer_metrics.peers.len(), 1);
-        assert_eq!(peer_metrics.peers[0].address, peer_addr.to_string());
-        assert!(matches!(ui_metrics_rx.has_changed(), Ok(false)));
+        let metrics = metrics_rx.borrow_and_update().clone();
+        assert_eq!(metrics.info_hash, manager.state.info_hash);
+        assert_eq!(metrics.peers.len(), 1);
+        assert_eq!(metrics.peers[0].address, peer_addr.to_string());
     }
 
     #[tokio::test]
@@ -4549,7 +4535,6 @@ mod resource_tests {
         let params = TorrentParameters {
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
@@ -4836,7 +4821,6 @@ mod resource_tests {
         let params = TorrentParameters {
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
@@ -4918,7 +4902,6 @@ mod resource_tests {
         let params = TorrentParameters {
             dht_handle, // FIX: Pass the conditional handle, not ()
             incoming_peer_rx: _incoming_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
@@ -5203,7 +5186,6 @@ mod resource_tests {
         let params = TorrentParameters {
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
@@ -5490,7 +5472,6 @@ mod resource_tests {
         let params = TorrentParameters {
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx: incoming_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
@@ -5733,7 +5714,6 @@ mod resource_tests {
         let params = TorrentParameters {
             dht_handle: build_test_dht_handle(),
             incoming_peer_rx: incoming_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
@@ -6328,7 +6308,6 @@ mod resource_tests {
         let params = TorrentParameters {
             dht_handle,
             incoming_peer_rx: _incoming_rx,
-            peer_metrics_tx: watch::channel(TorrentMetrics::default()).0,
             metrics_tx,
             peer_policy_rx: crate::peer_manager::default_policy_receiver(),
             torrent_validation_status: false,
