@@ -743,27 +743,42 @@ impl PeerSearchMatcher {
 }
 
 fn peer_search_text(row: &PeerRowModel<'_>, app_state: &AppState) -> String {
+    let privacy = app_state.anonymize_torrent_names;
     let mut fields = vec![
-        row.ip.to_string(),
+        display_ip(row.ip, privacy),
         row.state_label().to_string(),
         row.client_label.clone(),
     ];
     for tracked in &row.tracked {
-        fields.push(tracked.torrent_name.clone());
-        fields.push(hex::encode(&tracked.torrent_info_hash));
-        fields.extend(
-            tracked
-                .endpoints
-                .iter()
-                .map(|endpoint| endpoint.address.clone()),
-        );
+        fields.push(if privacy {
+            display_torrent_name(&tracked.torrent_name, true)
+        } else {
+            tracked.torrent_name.clone()
+        });
+        fields.push(if privacy {
+            short_info_hash(&tracked.torrent_info_hash, true)
+        } else {
+            hex::encode(&tracked.torrent_info_hash)
+        });
+        fields.extend(tracked.endpoints.iter().map(|endpoint| {
+            if privacy {
+                display_endpoint(&endpoint.address, true)
+            } else {
+                endpoint.address.clone()
+            }
+        }));
     }
     if let Some(restriction) = &row.restriction {
         fields.push(restriction_reason_search_text(&restriction.reason).to_string());
         if let Some(hash) = &restriction.torrent_info_hash {
-            fields.push(hex::encode(hash));
-            if let Some(torrent) = app_state.torrents.get(hash) {
-                fields.push(torrent.latest_state.torrent_name.clone());
+            if privacy {
+                fields.push(short_info_hash(hash, true));
+                fields.push(torrent_label_for_hash(app_state, row, hash));
+            } else {
+                fields.push(hex::encode(hash));
+                if let Some(torrent) = app_state.torrents.get(hash) {
+                    fields.push(torrent.latest_state.torrent_name.clone());
+                }
             }
         }
     }
@@ -1269,7 +1284,12 @@ fn matching_detail_torrents<'peer>(
     row.tracked
         .iter()
         .copied()
-        .filter(|peer| matcher.matches(&peer.torrent_name))
+        .filter(|peer| {
+            matcher.matches(&display_torrent_name(
+                &peer.torrent_name,
+                app_state.anonymize_torrent_names,
+            ))
+        })
         .collect()
 }
 
@@ -2187,23 +2207,23 @@ fn display_ip(ip: IpAddr, privacy: bool) -> String {
     if !privacy {
         return ip.to_string();
     }
-    format!("peer-{:04x}", stable_mask_id(&ip.to_string()))
+    format!("peer-{:016x}", stable_mask_id(&ip.to_string()))
 }
 
 fn display_endpoint(address: &str, privacy: bool) -> String {
     if !privacy {
         return sanitize_text(address);
     }
-    format!("endpoint-{:04x}", stable_mask_id(address))
+    format!("endpoint-{:016x}", stable_mask_id(address))
 }
 
-fn stable_mask_id(value: &str) -> u16 {
+fn stable_mask_id(value: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in value.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    (hash ^ (hash >> 32)) as u16
+    hash
 }
 
 fn short_info_hash(hash: &[u8], privacy: bool) -> String {
@@ -2846,6 +2866,56 @@ mod tests {
         assert!(state.anonymize_torrent_names);
         assert!(state.ui.peer_management.search_query.is_empty());
         assert!(!state.ui.peer_management.is_searching);
+    }
+
+    #[test]
+    fn privacy_pseudonyms_preserve_the_full_stable_hash() {
+        let pseudonyms = (0..4_096_u128)
+            .map(|index| {
+                let ip = IpAddr::V6(std::net::Ipv6Addr::from(
+                    0x2001_0db8_0000_0000_0000_0000_0000_0000_u128 + index,
+                ));
+                display_ip(ip, true)
+            })
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(pseudonyms.len(), 4_096);
+        assert!(pseudonyms
+            .iter()
+            .all(|pseudonym| pseudonym.len() == "peer-".len() + 16));
+    }
+
+    #[test]
+    fn privacy_search_matches_the_values_displayed_to_the_user() {
+        let mut peer = tracked_peer("192.0.2.61", "Quartz Archive", 61);
+        peer.endpoints.push(PeerManagerEndpointView {
+            address: "192.0.2.61:6881".to_string(),
+            total_downloaded: 10,
+            total_uploaded: 20,
+        });
+        let displayed_ip = display_ip(peer.ip, true);
+        let displayed_endpoint = display_endpoint(&peer.endpoints[0].address, true);
+        let displayed_torrent = display_torrent_name(&peer.torrent_name, true);
+        let mut state = state_with_peers(vec![peer]);
+        state.anonymize_torrent_names = true;
+
+        for query in [&displayed_ip, &displayed_endpoint, &displayed_torrent] {
+            state.ui.peer_management.search_query.clone_from(query);
+            assert_eq!(build_peer_rows_at(&state, test_now()).len(), 1);
+        }
+
+        state.ui.peer_management.search_query.clear();
+        state
+            .ui
+            .peer_management
+            .details_search_query
+            .clone_from(&displayed_torrent);
+        let rows = build_peer_rows_at(&state, test_now());
+        assert_eq!(matching_detail_torrents(&state, &rows[0]).len(), 1);
+
+        state.ui.peer_management.details_search_query.clear();
+        state.ui.peer_management.search_query = "192.0.2.61".to_string();
+        assert!(build_peer_rows_at(&state, test_now()).is_empty());
     }
 
     #[test]

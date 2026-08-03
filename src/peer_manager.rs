@@ -379,6 +379,10 @@ impl PeerTorrentHistory {
         }
     }
 
+    fn reset_reconnect_count_baseline(&mut self) {
+        self.reconnect_events_seen = 0;
+    }
+
     fn observe_absence(&mut self, now: SystemTime) {
         self.present = false;
         self.endpoint_transfers.clear();
@@ -456,6 +460,9 @@ impl PeerPolicyReducer {
         {
             let torrent_histories = self.histories.entry(info_hash.to_vec()).or_default();
             for (ip, history) in torrent_histories.iter_mut() {
+                if !reconnect_counts.contains_key(ip) {
+                    history.reset_reconnect_count_baseline();
+                }
                 if !observed.contains_key(ip) {
                     history.observe_absence(now);
                 }
@@ -3012,6 +3019,35 @@ mod tests {
 
         assert!(!reducer.expire(now + HISTORY_RETENTION));
         assert!(!reducer.has_history(&info_hash, ip));
+    }
+
+    #[test]
+    fn reconnect_counter_restarts_after_source_baseline_disappears() {
+        let mut reducer = PeerPolicyReducer::default();
+        let info_hash = vec![0x35; 20];
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 85));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(35_000_000);
+        let mut metrics = metrics_without_peers(&info_hash, 1024 * MIB);
+        metrics.peer_reconnect_counts.insert(ip, 1);
+
+        assert!(!reducer.reduce_metrics(&info_hash, &metrics, now));
+        assert!(!reducer.reduce_metrics(
+            &info_hash,
+            &metrics_without_peers(&info_hash, 1024 * MIB),
+            now + RECONNECT_WINDOW,
+        ));
+
+        for reconnect_count in 1..=RECONNECT_LIMIT as u64 {
+            metrics.peer_reconnect_counts.insert(ip, reconnect_count);
+            let changed = reducer.reduce_metrics(
+                &info_hash,
+                &metrics,
+                now + RECONNECT_WINDOW + Duration::from_secs(reconnect_count),
+            );
+            assert_eq!(changed, reconnect_count == RECONNECT_LIMIT as u64);
+        }
+
+        assert!(reducer.policy().restrictions.contains_key(&ip));
     }
 
     #[tokio::test]
