@@ -521,14 +521,22 @@ impl TorrentManager {
         peer_id: String,
         peer_addr: Option<SocketAddr>,
         tx: Sender<TorrentCommand>,
-    ) -> bool {
+    ) -> Option<watch::Receiver<bool>> {
         let accepted = self.state.can_register_peer(&peer_id, peer_addr);
+        let registered_peer_id = peer_id.clone();
         self.apply_action(Action::RegisterPeer {
             peer_id,
             peer_addr,
             tx,
         });
-        accepted
+        accepted.then(|| {
+            self.state
+                .peers
+                .get(&registered_peer_id)
+                .expect("accepted peer must be present in torrent state")
+                .session_cancel
+                .subscribe()
+        })
     }
 
     #[cfg(feature = "dht")]
@@ -922,7 +930,12 @@ impl TorrentManager {
                 });
             }
 
-            Effect::DisconnectPeerSession { peer_id, peer_tx } => {
+            Effect::DisconnectPeerSession {
+                peer_id,
+                peer_tx,
+                session_cancel,
+            } => {
+                session_cancel.send_replace(true);
                 let _ = peer_tx.try_send(TorrentCommand::Disconnect(peer_id.clone()));
                 if let Some(handles) = self.in_flight_uploads.remove(&peer_id) {
                     for handle in handles.values() {
@@ -1650,7 +1663,7 @@ impl TorrentManager {
 
                 let peer_id = full_url.clone();
 
-                if !self.register_peer(peer_id.clone(), None, peer_tx) {
+                if self.register_peer(peer_id.clone(), None, peer_tx).is_none() {
                     tracing::trace!(peer = %peer_id, "Web seed session registration was rejected");
                     return;
                 }
@@ -2484,17 +2497,17 @@ impl TorrentManager {
                         {
                             return;
                         }
-                        let registration_accepted = tokio::select! {
-                            result = registration_result_rx.recv() => result.unwrap_or(false),
-                            _ = shutdown_rx_session.recv() => false,
+                        let session_cancel = tokio::select! {
+                            result = registration_result_rx.recv() => result.flatten(),
+                            _ = shutdown_rx_session.recv() => None,
                         };
-                        if !registration_accepted {
+                        let Some(session_cancel) = session_cancel else {
                             tracing::trace!(
                                 peer = %peer_session_key,
                                 "Peer session rejected by current admission policy"
                             );
                             return;
-                        }
+                        };
                         let _ = torrent_manager_tx_clone
                             .send(TorrentCommand::PeerTransportSelected {
                                 peer_id: peer_session_key.clone(),
@@ -2520,6 +2533,7 @@ impl TorrentManager {
                             global_dl_bucket: global_dl_bucket_clone,
                             global_ul_bucket: global_ul_bucket_clone,
                             shutdown_tx,
+                            session_cancel,
                         });
 
                         tokio::select! {
@@ -2773,6 +2787,22 @@ impl TorrentManager {
         file_activity_updates: Vec<crate::torrent_manager::FileActivityUpdate>,
     ) {
         let mut torrent_state = self.build_peer_metrics_snapshot(bytes_dl, bytes_ul);
+        let live_peer_count = torrent_state.peers.len();
+        torrent_state
+            .peers
+            .extend(
+                self.state
+                    .take_departed_peer_transfers()
+                    .into_iter()
+                    .map(|departed| PeerInfo {
+                        address: departed.address,
+                        peer_id: departed.peer_id,
+                        total_downloaded: departed.total_downloaded,
+                        total_uploaded: departed.total_uploaded,
+                        last_action: "Disconnected".to_string(),
+                        ..Default::default()
+                    }),
+            );
         let Some(torrent) = self.state.torrent.as_ref() else {
             if self.peer_telemetry.should_emit(&torrent_state) {
                 let _ = self.peer_metrics_tx.send(torrent_state);
@@ -2846,6 +2876,7 @@ impl TorrentManager {
         if self.peer_telemetry.should_emit(&torrent_state) {
             let _ = self.peer_metrics_tx.send(torrent_state.clone());
         }
+        torrent_state.peers.truncate(live_peer_count);
         if self.telemetry.should_emit(&torrent_state) {
             let _ = self.metrics_tx.send(torrent_state);
         }
@@ -2893,8 +2924,12 @@ impl TorrentManager {
                     bitfield: peer.bitfield.clone(),
                     download_speed_bps: peer.download_speed_bps,
                     upload_speed_bps: peer.upload_speed_bps,
-                    total_downloaded: peer.total_bytes_downloaded,
-                    total_uploaded: peer.total_bytes_uploaded,
+                    total_downloaded: peer
+                        .transfer_base_downloaded
+                        .saturating_add(peer.total_bytes_downloaded),
+                    total_uploaded: peer
+                        .transfer_base_uploaded
+                        .saturating_add(peer.total_bytes_uploaded),
                     last_action,
                 }
             })
@@ -3375,17 +3410,17 @@ impl TorrentManager {
                             continue;
                         }
 
-                        if !self.register_peer(
+                        let Some(session_cancel) = self.register_peer(
                             peer_ip_port.clone(),
                             Some(connection.remote_addr),
                             peer_session_tx,
-                        ) {
+                        ) else {
                             tracing::trace!(
                                 peer = %peer_ip_port,
                                 "Inbound peer session rejected by current admission policy"
                             );
                             continue;
-                        }
+                        };
                         self.apply_action(Action::PeerTransportSelected {
                             peer_id: peer_ip_port.clone(),
                             transport: connection.endpoint.kind,
@@ -3426,6 +3461,7 @@ impl TorrentManager {
                                 global_dl_bucket: global_dl_bucket_clone,
                                 global_ul_bucket: global_ul_bucket_clone,
                                 shutdown_tx,
+                                session_cancel,
                             });
 
                             tokio::select! {
@@ -3498,8 +3534,8 @@ impl TorrentManager {
                             tx,
                             registration_result_tx,
                         } => {
-                            let accepted = self.register_peer(peer_id, Some(peer_addr), tx);
-                            let _ = registration_result_tx.try_send(accepted);
+                            let session_cancel = self.register_peer(peer_id, Some(peer_addr), tx);
+                            let _ = registration_result_tx.try_send(session_cancel);
                         },
                         TorrentCommand::PeerTransportSelected { peer_id, transport } => {
                             self.apply_action(Action::PeerTransportSelected { peer_id, transport })
@@ -4302,7 +4338,7 @@ mod resource_tests {
 
         let accepted = manager.register_peer(peer_addr.to_string(), Some(peer_addr), peer_tx);
 
-        assert!(!accepted);
+        assert!(accepted.is_none());
         assert!(!manager.state.peers.contains_key(&peer_addr.to_string()));
         assert!(matches!(
             peer_rx.try_recv(),
@@ -4324,6 +4360,13 @@ mod resource_tests {
             peer_addr: Some(peer_addr),
             tx: peer_tx.clone(),
         });
+        let session_cancel = manager
+            .state
+            .peers
+            .get(&peer_id)
+            .expect("registered peer")
+            .session_cancel
+            .subscribe();
         peer_tx
             .try_send(TorrentCommand::Disconnect(peer_id.clone()))
             .expect("prefill peer command channel");
@@ -4336,6 +4379,93 @@ mod resource_tests {
             !manager.state.peers.contains_key(&peer_id),
             "a blocked peer must leave authoritative state even when its channel is full"
         );
+        assert!(
+            *session_cancel.borrow(),
+            "the live session must be cancelled even when its command channel is full"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnected_peer_totals_are_published_before_the_peer_disappears() {
+        let mut params = build_test_params();
+        let (peer_metrics_tx, mut peer_metrics_rx) = watch::channel(TorrentMetrics::default());
+        params.peer_metrics_tx = peer_metrics_tx;
+        let mut manager = TorrentManager::from_torrent(params, create_dummy_torrent(1))
+            .expect("manager from torrent");
+        let peer_addr: SocketAddr = "203.0.113.48:6881".parse().expect("valid peer address");
+        let peer_key = peer_addr.to_string();
+        let (session_tx, _session_rx) = mpsc::channel(1);
+
+        manager.apply_action(Action::RegisterPeer {
+            peer_id: peer_key.clone(),
+            peer_addr: Some(peer_addr),
+            tx: session_tx,
+        });
+        let peer = manager
+            .state
+            .peers
+            .get_mut(&peer_key)
+            .expect("registered peer");
+        peer.peer_id = b"metrics-peer".to_vec();
+        peer.total_bytes_downloaded = 12_345;
+        peer.total_bytes_uploaded = 678;
+
+        manager.apply_action(Action::PeerDisconnected {
+            peer_id: peer_key.clone(),
+            force: true,
+        });
+        manager.send_metrics(0, 0, Vec::new());
+
+        peer_metrics_rx
+            .changed()
+            .await
+            .expect("terminal peer totals should be published");
+        let metrics = peer_metrics_rx.borrow_and_update().clone();
+        assert!(!manager.state.peers.contains_key(&peer_key));
+        assert_eq!(metrics.peers.len(), 1);
+        assert_eq!(metrics.peers[0].address, peer_key);
+        assert_eq!(metrics.peers[0].total_downloaded, 12_345);
+        assert_eq!(metrics.peers[0].total_uploaded, 678);
+    }
+
+    #[tokio::test]
+    async fn deletion_emits_terminal_peer_totals_before_clearing_sessions() {
+        let mut params = build_test_params();
+        let (peer_metrics_tx, mut peer_metrics_rx) = watch::channel(TorrentMetrics::default());
+        params.peer_metrics_tx = peer_metrics_tx;
+        let mut manager = TorrentManager::from_torrent(params, create_dummy_torrent(1))
+            .expect("manager from torrent");
+        manager.state.torrent_data_path = None;
+        let peer_addr: SocketAddr = "203.0.113.49:6881".parse().expect("valid peer address");
+        let peer_key = peer_addr.to_string();
+        let (session_tx, _session_rx) = mpsc::channel(1);
+
+        manager.apply_action(Action::RegisterPeer {
+            peer_id: peer_key.clone(),
+            peer_addr: Some(peer_addr),
+            tx: session_tx,
+        });
+        let peer = manager
+            .state
+            .peers
+            .get_mut(&peer_key)
+            .expect("registered peer");
+        peer.peer_id = b"deletion-peer".to_vec();
+        peer.total_bytes_downloaded = 4_096;
+        peer.total_bytes_uploaded = 2_048;
+
+        manager.apply_action(Action::Delete);
+
+        peer_metrics_rx
+            .changed()
+            .await
+            .expect("deletion should publish terminal peer totals");
+        let metrics = peer_metrics_rx.borrow_and_update().clone();
+        assert!(manager.state.peers.is_empty());
+        assert_eq!(metrics.peers.len(), 1);
+        assert_eq!(metrics.peers[0].address, peer_key);
+        assert_eq!(metrics.peers[0].total_downloaded, 4_096);
+        assert_eq!(metrics.peers[0].total_uploaded, 2_048);
     }
 
     #[tokio::test]

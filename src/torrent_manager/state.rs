@@ -7,7 +7,7 @@ use tracing::Level;
 use crate::command::TorrentCommand;
 use crate::networking::transport::PeerTransportKind;
 use crate::networking::BlockInfo;
-use crate::peer_manager::{normalize_ip, PeerPolicy};
+use crate::peer_manager::{normalize_ip, PeerPolicy, RECONNECT_WINDOW};
 use crate::storage::MultiFileInfo;
 use crate::torrent_manager::FileActivityDirection;
 use crate::torrent_manager::ManagerEvent;
@@ -17,6 +17,7 @@ use crate::app::FilePriority;
 
 use rand::seq::SliceRandom;
 use tokio::sync::mpsc::Sender;
+use tokio::sync::watch;
 use tokio::sync::Semaphore;
 
 use std::mem::Discriminant;
@@ -43,6 +44,7 @@ const UPLOAD_SLOTS_DEFAULT: usize = 4;
 const DEFAULT_ANNOUNCE_INTERVAL_SECS: u64 = 60;
 pub const MAX_PIPELINE_DEPTH: usize = 512;
 const KNOWN_SEEDER_TTL: Duration = Duration::from_secs(60 * 60);
+const MAX_INACTIVE_PEER_BASELINES: usize = 4_096;
 // Quality gate: once we have this many connected peers, pause admitting new peers
 // to avoid churn storms. This is intentionally independent of resource-manager limits.
 const PEER_ADMISSION_QUALITY_THRESHOLD: usize = 400;
@@ -205,6 +207,7 @@ pub enum Effect {
     DisconnectPeerSession {
         peer_id: String,
         peer_tx: Sender<TorrentCommand>,
+        session_cancel: watch::Sender<bool>,
     },
     DisconnectPeer {
         peer_id: String,
@@ -330,6 +333,14 @@ struct FileActivityInterval {
     end: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DepartedPeerTransfer {
+    pub address: String,
+    pub peer_id: Vec<u8>,
+    pub total_downloaded: u64,
+    pub total_uploaded: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TorrentState {
     pub info_hash: Vec<u8>,
@@ -351,7 +362,8 @@ pub struct TorrentState {
     pub peer_reconnect_counts: HashMap<IpAddr, u64>,
     peer_active_counts: HashMap<IpAddr, usize>,
     peer_ip_by_id: HashMap<String, IpAddr>,
-    peer_ips_seen: HashSet<IpAddr>,
+    peer_inactive_since: HashMap<IpAddr, Instant>,
+    pending_departed_peer_transfers: HashMap<String, DepartedPeerTransfer>,
     pub piece_manager: PieceManager,
     pub trackers: HashMap<String, TrackerState>,
     pub timed_out_peers: HashMap<String, (u32, Instant)>,
@@ -400,7 +412,8 @@ impl Default for TorrentState {
             peer_reconnect_counts: HashMap::new(),
             peer_active_counts: HashMap::new(),
             peer_ip_by_id: HashMap::new(),
-            peer_ips_seen: HashSet::new(),
+            peer_inactive_since: HashMap::new(),
+            pending_departed_peer_transfers: HashMap::new(),
             piece_manager: PieceManager::new(),
             trackers: HashMap::new(),
             timed_out_peers: HashMap::new(),
@@ -434,9 +447,19 @@ impl TorrentState {
     fn record_peer_registration(&mut self, peer_id: &str, peer_addr: SocketAddr) {
         let ip = normalize_ip(peer_addr.ip());
         let active_count = self.peer_active_counts.entry(ip).or_default();
-        if *active_count == 0 && !self.peer_ips_seen.insert(ip) {
-            let reconnect_count = self.peer_reconnect_counts.entry(ip).or_default();
-            *reconnect_count = reconnect_count.saturating_add(1);
+        if *active_count == 0 {
+            if self
+                .peer_inactive_since
+                .remove(&ip)
+                .is_some_and(|inactive_since| {
+                    self.now.saturating_duration_since(inactive_since) < RECONNECT_WINDOW
+                })
+            {
+                let reconnect_count = self.peer_reconnect_counts.entry(ip).or_default();
+                *reconnect_count = reconnect_count.saturating_add(1);
+            } else {
+                self.peer_reconnect_counts.remove(&ip);
+            }
         }
         *active_count = active_count.saturating_add(1);
         self.peer_ip_by_id.insert(peer_id.to_string(), ip);
@@ -452,7 +475,64 @@ impl TorrentState {
         *active_count = active_count.saturating_sub(1);
         if *active_count == 0 {
             self.peer_active_counts.remove(&ip);
+            self.peer_inactive_since.insert(ip, self.now);
+            self.maintain_peer_reconnect_baselines();
         }
+    }
+
+    fn maintain_peer_reconnect_baselines(&mut self) {
+        let now = self.now;
+        self.peer_inactive_since.retain(|_, inactive_since| {
+            now.saturating_duration_since(*inactive_since) < RECONNECT_WINDOW
+        });
+
+        if self.peer_inactive_since.len() > MAX_INACTIVE_PEER_BASELINES {
+            let mut oldest = self
+                .peer_inactive_since
+                .iter()
+                .map(|(ip, inactive_since)| (*inactive_since, *ip))
+                .collect::<Vec<_>>();
+            oldest.sort_unstable();
+            for (_, ip) in oldest
+                .into_iter()
+                .take(self.peer_inactive_since.len() - MAX_INACTIVE_PEER_BASELINES)
+            {
+                self.peer_inactive_since.remove(&ip);
+            }
+        }
+
+        self.peer_reconnect_counts.retain(|ip, _| {
+            self.peer_active_counts.contains_key(ip) || self.peer_inactive_since.contains_key(ip)
+        });
+    }
+
+    fn record_departed_peer_transfer(&mut self, peer: &PeerState) {
+        let total_downloaded = peer
+            .transfer_base_downloaded
+            .saturating_add(peer.total_bytes_downloaded);
+        let total_uploaded = peer
+            .transfer_base_uploaded
+            .saturating_add(peer.total_bytes_uploaded);
+        let pending = self
+            .pending_departed_peer_transfers
+            .entry(peer.ip_port.clone())
+            .or_insert_with(|| DepartedPeerTransfer {
+                address: peer.ip_port.clone(),
+                peer_id: peer.peer_id.clone(),
+                total_downloaded: 0,
+                total_uploaded: 0,
+            });
+        if !peer.peer_id.is_empty() {
+            pending.peer_id.clone_from(&peer.peer_id);
+        }
+        pending.total_downloaded = pending.total_downloaded.max(total_downloaded);
+        pending.total_uploaded = pending.total_uploaded.max(total_uploaded);
+    }
+
+    pub(crate) fn take_departed_peer_transfers(&mut self) -> Vec<DepartedPeerTransfer> {
+        std::mem::take(&mut self.pending_departed_peer_transfers)
+            .into_values()
+            .collect()
     }
 
     pub fn new(
@@ -615,6 +695,7 @@ impl TorrentState {
             }
             Action::Tick { dt_ms } => {
                 self.now += Duration::from_millis(dt_ms);
+                self.maintain_peer_reconnect_baselines();
                 self.refresh_peer_admission_guard();
                 let scaling_factor = if dt_ms > 0 {
                     1000.0 / dt_ms as f64
@@ -1183,10 +1264,15 @@ impl TorrentState {
                     return vec![Effect::DisconnectPeerSession {
                         peer_id,
                         peer_tx: tx,
+                        session_cancel: watch::channel(false).0,
                     }];
                 }
                 let mut peer_state = PeerState::new(peer_id.clone(), tx, self.now);
                 peer_state.peer_id = peer_id.as_bytes().to_vec();
+                if let Some(pending) = self.pending_departed_peer_transfers.remove(&peer_id) {
+                    peer_state.transfer_base_downloaded = pending.total_downloaded;
+                    peer_state.transfer_base_uploaded = pending.total_uploaded;
+                }
                 if let Some(peer_addr) = peer_addr {
                     self.record_peer_registration(&peer_id, peer_addr);
                 }
@@ -1242,6 +1328,7 @@ impl TorrentState {
                 for pid in batch {
                     if let Some(removed_peer) = self.peers.remove(&pid) {
                         self.record_peer_removal(&pid);
+                        self.record_departed_peer_transfer(&removed_peer);
                         for piece_index in removed_peer.pending_requests {
                             if self.piece_manager.bitfield.get(piece_index as usize)
                                 != Some(&PieceStatus::Done)
@@ -1253,6 +1340,7 @@ impl TorrentState {
                         effects.push(Effect::DisconnectPeerSession {
                             peer_id: pid,
                             peer_tx: removed_peer.peer_tx,
+                            session_cancel: removed_peer.session_cancel,
                         });
                         effects.push(Effect::EmitManagerEvent(ManagerEvent::PeerDisconnected {
                             info_hash: self.info_hash.clone(),
@@ -2185,6 +2273,7 @@ impl TorrentState {
                 for peer_id in peer_ids {
                     if let Some(removed_peer) = self.peers.remove(&peer_id) {
                         self.record_peer_removal(&peer_id);
+                        self.record_departed_peer_transfer(&removed_peer);
                         for piece_index in removed_peer.pending_requests {
                             if self.piece_manager.bitfield.get(piece_index as usize)
                                 != Some(&PieceStatus::Done)
@@ -2196,6 +2285,7 @@ impl TorrentState {
                         peer_disconnects.push(Effect::DisconnectPeerSession {
                             peer_id: peer_id.clone(),
                             peer_tx: removed_peer.peer_tx,
+                            session_cancel: removed_peer.session_cancel,
                         });
                         peer_disconnects.push(Effect::EmitManagerEvent(
                             ManagerEvent::PeerDisconnected {
@@ -2207,6 +2297,8 @@ impl TorrentState {
 
                 self.number_of_successfully_connected_peers = self.peers.len();
 
+                let bytes_downloaded_in_interval = self.bytes_downloaded_in_interval;
+                let bytes_uploaded_in_interval = self.bytes_uploaded_in_interval;
                 self.bytes_downloaded_in_interval = 0;
                 self.bytes_uploaded_in_interval = 0;
                 self.total_dl_prev_avg_ema = 0.0;
@@ -2214,8 +2306,8 @@ impl TorrentState {
 
                 let mut effects = vec![
                     Effect::EmitMetrics {
-                        bytes_dl: self.bytes_downloaded_in_interval,
-                        bytes_ul: self.bytes_uploaded_in_interval,
+                        bytes_dl: bytes_downloaded_in_interval,
+                        bytes_ul: bytes_uploaded_in_interval,
                         file_activity_updates: self.drain_file_activity_updates(),
                     },
                     Effect::ClearAllUploads,
@@ -2254,7 +2346,17 @@ impl TorrentState {
             }
 
             Action::Delete => {
-                self.peers.clear();
+                let bytes_downloaded_in_interval = self.bytes_downloaded_in_interval;
+                let bytes_uploaded_in_interval = self.bytes_uploaded_in_interval;
+                let mut peer_disconnects = Vec::new();
+                for (peer_id, removed_peer) in std::mem::take(&mut self.peers) {
+                    self.record_departed_peer_transfer(&removed_peer);
+                    peer_disconnects.push(Effect::DisconnectPeerSession {
+                        peer_id,
+                        peer_tx: removed_peer.peer_tx,
+                        session_cancel: removed_peer.session_cancel,
+                    });
+                }
                 self.peer_active_counts.clear();
                 self.peer_ip_by_id.clear();
                 self.last_known_peers.clear();
@@ -2296,7 +2398,12 @@ impl TorrentState {
                 };
                 self.last_activity = TorrentActivity::Initializing;
 
-                let mut effects = Vec::new();
+                let mut effects = vec![Effect::EmitMetrics {
+                    bytes_dl: bytes_downloaded_in_interval,
+                    bytes_ul: bytes_uploaded_in_interval,
+                    file_activity_updates: self.drain_file_activity_updates(),
+                }];
+                effects.extend(peer_disconnects);
                 if let (Some(path), Some(mfi)) = (&self.torrent_data_path, &self.multi_file_info) {
                     let container = self.container_name.as_deref();
                     let (files, directories) = calculate_deletion_lists(mfi, path, container);
@@ -2843,6 +2950,7 @@ pub struct PeerState {
     pub am_choking: ChokeStatus,
     pub peer_choking: ChokeStatus,
     pub peer_tx: Sender<TorrentCommand>,
+    pub session_cancel: watch::Sender<bool>,
     pub am_interested: bool,
     pub pending_requests: HashSet<u32>,
     pub peer_is_interested_in_us: bool,
@@ -2854,6 +2962,8 @@ pub struct PeerState {
     pub prev_avg_ul_ema: f64,
     pub total_bytes_downloaded: u64,
     pub total_bytes_uploaded: u64,
+    pub transfer_base_downloaded: u64,
+    pub transfer_base_uploaded: u64,
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
     pub upload_slots_semaphore: Arc<Semaphore>,
@@ -2866,6 +2976,7 @@ pub struct PeerState {
 
 impl PeerState {
     pub fn new(ip_port: String, peer_tx: Sender<TorrentCommand>, created_at: Instant) -> Self {
+        let (session_cancel, _) = watch::channel(false);
         Self {
             ip_port,
             transport_kind: PeerTransportKind::Tcp,
@@ -2874,6 +2985,7 @@ impl PeerState {
             am_choking: ChokeStatus::Choke,
             peer_choking: ChokeStatus::Choke,
             peer_tx,
+            session_cancel,
             am_interested: false,
             pending_requests: HashSet::new(),
             peer_is_interested_in_us: false,
@@ -2883,6 +2995,8 @@ impl PeerState {
             bytes_uploaded_in_tick: 0,
             total_bytes_downloaded: 0,
             total_bytes_uploaded: 0,
+            transfer_base_downloaded: 0,
+            transfer_base_uploaded: 0,
             prev_avg_dl_ema: 0.0,
             prev_avg_ul_ema: 0.0,
             download_speed_bps: 0,
@@ -3051,6 +3165,88 @@ mod tests {
         });
 
         assert_eq!(state.peer_reconnect_counts.get(&peer_addr.ip()), Some(&1));
+    }
+
+    #[test]
+    fn reconnect_before_metrics_publish_carries_departed_transfer_baseline() {
+        let mut state = create_empty_state();
+        let peer_addr: SocketAddr = "203.0.113.25:6881".parse().expect("valid peer address");
+        let peer_id = peer_addr.to_string();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+
+        state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: Some(peer_addr),
+            tx: first_tx,
+        });
+        state
+            .peers
+            .get_mut(&peer_id)
+            .expect("registered peer")
+            .total_bytes_uploaded = 11;
+        state.update(Action::PeerDisconnected {
+            peer_id: peer_id.clone(),
+            force: true,
+        });
+
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: Some(peer_addr),
+            tx: second_tx,
+        });
+        let reconnected = state.peers.get(&peer_id).expect("reconnected peer");
+        assert_eq!(reconnected.transfer_base_uploaded, 11);
+        assert!(state.pending_departed_peer_transfers.is_empty());
+    }
+
+    #[test]
+    fn expired_inactive_baseline_does_not_count_as_reconnect() {
+        let mut state = create_empty_state();
+        let peer_addr: SocketAddr = "203.0.113.26:6881".parse().expect("valid peer address");
+        let peer_id = peer_addr.to_string();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+
+        state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: Some(peer_addr),
+            tx: first_tx,
+        });
+        state.update(Action::PeerDisconnected {
+            peer_id: peer_id.clone(),
+            force: true,
+        });
+        state.update(Action::Tick {
+            dt_ms: RECONNECT_WINDOW.as_millis() as u64,
+        });
+
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        state.update(Action::RegisterPeer {
+            peer_id,
+            peer_addr: Some(peer_addr),
+            tx: second_tx,
+        });
+        assert!(!state.peer_reconnect_counts.contains_key(&peer_addr.ip()));
+    }
+
+    #[test]
+    fn inactive_reconnect_baselines_are_hard_bounded() {
+        let mut state = create_empty_state();
+        for index in 0..(MAX_INACTIVE_PEER_BASELINES + 32) {
+            let ip = IpAddr::V6(std::net::Ipv6Addr::from(
+                0x2001_0db8_0000_0000_0000_0000_0000_0000_u128 + index as u128,
+            ));
+            state.peer_inactive_since.insert(ip, state.now);
+            state.peer_reconnect_counts.insert(ip, 1);
+        }
+
+        state.maintain_peer_reconnect_baselines();
+
+        assert_eq!(state.peer_inactive_since.len(), MAX_INACTIVE_PEER_BASELINES);
+        assert_eq!(
+            state.peer_reconnect_counts.len(),
+            MAX_INACTIVE_PEER_BASELINES
+        );
     }
 
     #[test]

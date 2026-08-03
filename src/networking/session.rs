@@ -32,6 +32,7 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -125,6 +126,7 @@ pub struct PeerSessionParameters {
     pub global_dl_bucket: Arc<TokenBucket>,
     pub global_ul_bucket: Arc<TokenBucket>,
     pub shutdown_tx: broadcast::Sender<()>,
+    pub session_cancel: watch::Receiver<bool>,
 }
 
 pub struct PeerSession {
@@ -152,6 +154,7 @@ pub struct PeerSession {
     global_ul_bucket: Arc<TokenBucket>,
 
     shutdown_tx: broadcast::Sender<()>,
+    session_cancel: watch::Receiver<bool>,
 
     current_window_size: usize,
     blocks_received_interval: usize,
@@ -166,6 +169,20 @@ pub struct PeerSession {
 
     #[cfg(test)]
     testing_window_events: Option<mpsc::UnboundedSender<WindowAdaptationEvent>>,
+}
+
+async fn wait_for_session_cancel(session_cancel: &mut watch::Receiver<bool>) {
+    if *session_cancel.borrow() {
+        return;
+    }
+    loop {
+        if session_cancel.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        if *session_cancel.borrow_and_update() {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +220,7 @@ impl PeerSession {
             global_dl_bucket: params.global_dl_bucket,
             global_ul_bucket: params.global_ul_bucket,
             shutdown_tx: params.shutdown_tx,
+            session_cancel: params.session_cancel,
 
             current_window_size: PEER_BLOCK_IN_FLIGHT_LIMIT,
             blocks_received_interval: 0,
@@ -234,6 +252,7 @@ impl PeerSession {
             peer_ip_port: self.peer_ip_port.clone(),
             manager_tx: self.torrent_manager_tx.clone(),
         };
+        let mut session_cancel = self.session_cancel.clone();
 
         let (mut stream_read_half, stream_write_half) = split(stream);
         let (error_tx, mut error_rx) = oneshot::channel();
@@ -259,7 +278,12 @@ impl PeerSession {
                     self.client_id.clone(),
                 ));
                 let mut buffer = vec![0u8; 68];
-                stream_read_half.read_exact(&mut buffer).await?;
+                tokio::select! {
+                    result = stream_read_half.read_exact(&mut buffer) => {
+                        result?;
+                    }
+                    _ = wait_for_session_cancel(&mut session_cancel) => return Ok(()),
+                }
                 buffer
             }
             ConnectionType::Incoming => {
@@ -389,6 +413,7 @@ impl PeerSession {
                                                 break 'session Ok(());
                                             }
                                         },
+                                        _ = wait_for_session_cancel(&mut session_cancel) => break 'session Ok(()),
                                         _ = shutdown_rx.recv() => break 'session Ok(()),
                                     }
                                 }
@@ -475,6 +500,8 @@ impl PeerSession {
                 Some(cmd) = self.torrent_manager_rx.recv() => {
                     if !self.process_manager_command(cmd)? { break 'session Ok(()); }
                 },
+
+                _ = wait_for_session_cancel(&mut session_cancel) => break 'session Ok(()),
 
                 // WRITER ERRORS
                 writer_res = &mut error_rx => {
@@ -1007,7 +1034,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::{broadcast, mpsc, watch};
 
     async fn parse_message<R>(stream: &mut R) -> Result<Message, std::io::Error>
     where
@@ -1069,6 +1096,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket.clone(),
             shutdown_tx,
+            session_cancel: watch::channel(false).1,
         };
 
         // Create the Atomic Monitor
@@ -1095,6 +1123,39 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn session_cancel_interrupts_an_outgoing_handshake() {
+        let (client_socket, _mock_peer_socket) = duplex(1024);
+        let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let (manager_tx, _manager_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let (session_cancel_tx, session_cancel_rx) = watch::channel(false);
+
+        let session = PeerSession::new(PeerSessionParameters {
+            info_hash: [0u8; 20].to_vec(),
+            torrent_metadata_length: None,
+            connection_type: ConnectionType::Outgoing,
+            torrent_manager_rx: cmd_rx,
+            torrent_manager_tx: manager_tx,
+            peer_ip_port: "cancellation-peer:1337".to_string(),
+            client_id: b"-SS1000-CANCELTEST00".to_vec(),
+            global_dl_bucket: infinite_bucket.clone(),
+            global_ul_bucket: infinite_bucket,
+            shutdown_tx,
+            session_cancel: session_cancel_rx,
+        });
+        let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
+
+        session_cancel_tx.send_replace(true);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("session cancellation should not wait for peer I/O")
+            .expect("session task should not panic");
+        assert!(result.is_ok());
+    }
+
     fn build_session_for_extended_message_tests() -> (PeerSession, mpsc::Receiver<TorrentCommand>) {
         let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let (manager_tx, manager_rx) = mpsc::channel(16);
@@ -1112,6 +1173,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
+            session_cancel: watch::channel(false).1,
         };
 
         (PeerSession::new(params), manager_rx)
@@ -1135,6 +1197,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket,
             shutdown_tx,
+            session_cancel: watch::channel(false).1,
         };
 
         PeerSession::new(params)
@@ -1824,6 +1887,7 @@ mod tests {
             global_dl_bucket: infinite_bucket.clone(),
             global_ul_bucket: infinite_bucket.clone(),
             shutdown_tx,
+            session_cancel: watch::channel(false).1,
         };
 
         let handle = tokio::spawn(async move {

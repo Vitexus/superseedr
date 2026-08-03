@@ -20,10 +20,11 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
 const METRICS_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const MIN_TRANSFER_ABUSE_BYTES: u64 = 256 * 1024 * 1024;
 const TRANSFER_ABUSE_MULTIPLIER: u64 = 2;
 const RECONNECT_LIMIT: usize = 10;
-const RECONNECT_WINDOW: Duration = Duration::from_secs(10);
+pub(crate) const RECONNECT_WINDOW: Duration = Duration::from_secs(10);
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
@@ -372,7 +373,7 @@ impl PeerTorrentHistory {
             new_reconnects.min(available) as usize,
         ));
         self.reconnect_events_seen = cumulative_reconnects;
-        if cumulative_reconnects > 0 {
+        if new_reconnects > 0 {
             self.seen = true;
             self.last_seen = Some(now);
         }
@@ -1132,6 +1133,10 @@ async fn run_service(
     let mut metrics_updates = 0_u64;
     let mut metrics_poll = tokio::time::interval(METRICS_POLL_INTERVAL);
     metrics_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let first_view_publish = tokio::time::Instant::now() + VIEW_PUBLISH_INTERVAL;
+    let mut view_publish = tokio::time::interval_at(first_view_publish, VIEW_PUBLISH_INTERVAL);
+    view_publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut view_dirty = false;
     let first_checkpoint = tokio::time::Instant::now() + checkpoint_interval;
     let mut policy_checkpoint = tokio::time::interval_at(first_checkpoint, checkpoint_interval);
     policy_checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1176,6 +1181,7 @@ async fn run_service(
                             metrics_updates,
                             &view_tx,
                         );
+                        view_dirty = false;
                     }
                     PeerManagerCommand::UnregisterTorrent { info_hash } => {
                         if let Some(mut metrics_rx) = metrics_rxs.remove(&info_hash) {
@@ -1203,6 +1209,7 @@ async fn run_service(
                             metrics_updates,
                             &view_tx,
                         );
+                        view_dirty = false;
                     }
                     PeerManagerCommand::Flush { response_tx } => {
                         let (policy_changed, view_changed) = drain_metrics_updates(
@@ -1223,6 +1230,7 @@ async fn run_service(
                                 metrics_updates,
                                 &view_tx,
                             );
+                            view_dirty = false;
                         }
                         persistence_state.queue_if_dirty(&reducer);
                         let _ = response_tx.send(());
@@ -1256,14 +1264,18 @@ async fn run_service(
                     publish_policy(&reducer, &policy_tx);
                 }
                 if view_changed {
-                    publish_view(
-                        &reducer,
-                        &latest_metrics,
-                        metrics_rxs.len(),
-                        metrics_updates,
-                        &view_tx,
-                    );
+                    view_dirty = true;
                 }
+            }
+            _ = view_publish.tick(), if view_dirty => {
+                publish_view(
+                    &reducer,
+                    &latest_metrics,
+                    metrics_rxs.len(),
+                    metrics_updates,
+                    &view_tx,
+                );
+                view_dirty = false;
             }
             _ = policy_checkpoint.tick() => {
                 let history_count = reducer.history_count();
@@ -1279,6 +1291,7 @@ async fn run_service(
                         metrics_updates,
                         &view_tx,
                     );
+                    view_dirty = false;
                 }
                 persistence_state.queue_if_dirty(&reducer);
             }
@@ -1894,6 +1907,54 @@ mod tests {
         .expect("recently absent tracked peer view");
         assert_eq!(absent_view.tracked_peers.len(), 1);
         assert!(absent_view.tracked_peers[0].endpoints.is_empty());
+
+        let _ = shutdown_tx.send(());
+        service.join().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metrics_policy_updates_do_not_rebuild_view_before_view_cadence() {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let service = PeerManagerService::new(shutdown_tx.subscribe());
+        let handle = service.handle();
+        let info_hash = vec![0x33; 20];
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 83));
+        let peer_address = format!("{peer_ip}:6881");
+        let (metrics_tx, metrics_rx) = watch::channel(TorrentMetrics::default());
+        let mut policy_rx = handle.subscribe_policy();
+        let mut view_rx = handle.subscribe_view();
+
+        assert!(handle.register_torrent(info_hash.clone(), metrics_rx));
+        loop {
+            let snapshot = handle.snapshot().await.expect("peer manager snapshot");
+            if snapshot.registered_torrents == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        view_rx.borrow_and_update();
+
+        metrics_tx
+            .send(metrics_with_peer(
+                &info_hash,
+                1,
+                &peer_address,
+                MIN_TRANSFER_ABUSE_BYTES + 1,
+            ))
+            .expect("publish abusive metrics");
+        tokio::time::advance(METRICS_POLL_INTERVAL).await;
+        policy_rx
+            .changed()
+            .await
+            .expect("policy should remain published");
+        assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
+        assert!(matches!(view_rx.has_changed(), Ok(false)));
+
+        tokio::time::advance(VIEW_PUBLISH_INTERVAL).await;
+        view_rx
+            .changed()
+            .await
+            .expect("view should publish on its slower cadence");
 
         let _ = shutdown_tx.send(());
         service.join().await;
@@ -2934,6 +2995,23 @@ mod tests {
 
         assert!(!reducer.expire(now + HISTORY_RETENTION));
         assert!(reducer.histories.is_empty());
+    }
+
+    #[test]
+    fn repeated_cumulative_reconnect_count_does_not_refresh_last_seen() {
+        let mut reducer = PeerPolicyReducer::default();
+        let info_hash = vec![0x34; 20];
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 84));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(34_000_000);
+        let mut metrics = metrics_without_peers(&info_hash, 1024 * MIB);
+        metrics.peer_reconnect_counts.insert(ip, 1);
+
+        assert!(!reducer.reduce_metrics(&info_hash, &metrics, now));
+        assert!(!reducer.reduce_metrics(&info_hash, &metrics, now + HISTORY_RETENTION / 2,));
+        assert_eq!(reducer.histories[&info_hash][&ip].last_seen, Some(now),);
+
+        assert!(!reducer.expire(now + HISTORY_RETENTION));
+        assert!(!reducer.has_history(&info_hash, ip));
     }
 
     #[tokio::test]
