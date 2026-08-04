@@ -253,6 +253,9 @@ impl PeerSession {
             manager_tx: self.torrent_manager_tx.clone(),
         };
         let mut session_cancel = self.session_cancel.clone();
+        if *session_cancel.borrow_and_update() {
+            return Ok(());
+        }
 
         let (mut stream_read_half, stream_write_half) = split(stream);
         let (error_tx, mut error_rx) = oneshot::channel();
@@ -1125,7 +1128,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_cancel_interrupts_an_outgoing_handshake() {
-        let (client_socket, _mock_peer_socket) = duplex(1024);
+        let (client_socket, mut mock_peer_socket) = duplex(1024);
         let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
         let (manager_tx, _manager_rx) = mpsc::channel(16);
         let (_cmd_tx, cmd_rx) = mpsc::channel(16);
@@ -1145,15 +1148,22 @@ mod tests {
             shutdown_tx,
             session_cancel: session_cancel_rx,
         });
-        let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
-
         session_cancel_tx.send_replace(true);
+        let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
 
         let result = tokio::time::timeout(Duration::from_secs(1), session_task)
             .await
             .expect("session cancellation should not wait for peer I/O")
             .expect("session task should not panic");
         assert!(result.is_ok());
+
+        let mut byte = [0_u8; 1];
+        let bytes_read =
+            tokio::time::timeout(Duration::from_secs(1), mock_peer_socket.read(&mut byte))
+                .await
+                .expect("cancelled session should close without peer I/O")
+                .expect("read cancelled session output");
+        assert_eq!(bytes_read, 0, "cancelled session must not send a handshake");
     }
 
     fn build_session_for_extended_message_tests() -> (PeerSession, mpsc::Receiver<TorrentCommand>) {

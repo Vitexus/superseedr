@@ -434,6 +434,7 @@ impl PeerTorrentHistory {
 struct PeerPolicyReducer {
     histories: HashMap<InfoHash, HashMap<IpAddr, PeerTorrentHistory>>,
     policy: PeerPolicy,
+    next_reconnect_expiry: Option<SystemTime>,
 }
 
 impl PeerPolicyReducer {
@@ -484,6 +485,7 @@ impl PeerPolicyReducer {
 
         let transfer_limit = transfer_abuse_limit(metrics.total_size);
         let mut restrictions = Vec::new();
+        let mut next_reconnect_expiry = None;
 
         {
             let torrent_histories = self.histories.entry(info_hash.to_vec()).or_default();
@@ -538,6 +540,17 @@ impl PeerPolicyReducer {
                     history.consume_triggering_evidence();
                     restrictions.push((*ip, reason));
                 }
+                if let Some(expires_at) = history
+                    .reconnects
+                    .front()
+                    .and_then(|seen_at| seen_at.checked_add(RECONNECT_WINDOW))
+                {
+                    next_reconnect_expiry = Some(
+                        next_reconnect_expiry.map_or(expires_at, |scheduled: SystemTime| {
+                            scheduled.min(expires_at)
+                        }),
+                    );
+                }
             }
         }
 
@@ -559,6 +572,12 @@ impl PeerPolicyReducer {
                     torrent_info_hash: Some(info_hash.to_vec()),
                     reason,
                 },
+            );
+        }
+        if let Some(expires_at) = next_reconnect_expiry {
+            self.next_reconnect_expiry = Some(
+                self.next_reconnect_expiry
+                    .map_or(expires_at, |scheduled| scheduled.min(expires_at)),
             );
         }
         changed
@@ -666,6 +685,34 @@ impl PeerPolicyReducer {
         self.policy.restrictions.len() != before
     }
 
+    fn prune_reconnect_evidence(&mut self, now: SystemTime) -> bool {
+        let mut changed = false;
+        for histories in self.histories.values_mut() {
+            for history in histories.values_mut() {
+                let reconnect_count = history.reconnects.len();
+                history.prune_reconnects(now);
+                changed |= history.reconnects.len() != reconnect_count;
+            }
+        }
+        self.refresh_next_reconnect_expiry();
+        changed
+    }
+
+    fn refresh_next_reconnect_expiry(&mut self) {
+        self.next_reconnect_expiry = self
+            .histories
+            .values()
+            .flat_map(HashMap::values)
+            .flat_map(|history| history.reconnects.iter())
+            .filter_map(|seen_at| seen_at.checked_add(RECONNECT_WINDOW))
+            .min();
+    }
+
+    fn next_reconnect_expiry_delay(&self, now: SystemTime) -> Option<Duration> {
+        self.next_reconnect_expiry
+            .map(|expires_at| expires_at.duration_since(now).unwrap_or(Duration::ZERO))
+    }
+
     fn history_count(&self) -> usize {
         self.histories.values().map(HashMap::len).sum()
     }
@@ -727,6 +774,7 @@ impl PeerPolicyReducer {
 
     fn remove_torrent(&mut self, info_hash: &[u8]) {
         self.histories.remove(info_hash);
+        self.refresh_next_reconnect_expiry();
     }
 }
 
@@ -901,6 +949,7 @@ impl PeerManagerService {
         let reducer = PeerPolicyReducer {
             policy: initial_policy.clone(),
             histories: HashMap::new(),
+            next_reconnect_expiry: None,
         };
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let (metrics_notification_tx, metrics_notification_rx) = mpsc::unbounded_channel();
@@ -1292,6 +1341,7 @@ async fn run_service(
     policy_checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
+        let reconnect_expiry_delay = reducer.next_reconnect_expiry_delay(SystemTime::now());
         tokio::select! {
             _ = shutdown_rx.recv() => break,
             persistence_result = async {
@@ -1470,13 +1520,30 @@ async fn run_service(
                     let _ = processed_tx.send(());
                 }
             }
+            _ = async {
+                match reconnect_expiry_delay {
+                    Some(delay) => tokio::time::sleep(delay).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if reducer.prune_reconnect_evidence(SystemTime::now()) {
+                    publish_view(
+                        &reducer,
+                        &latest_metrics,
+                        metrics_rxs.len(),
+                        metrics_updates,
+                        &view_tx,
+                    );
+                }
+            }
             _ = policy_checkpoint.tick() => {
+                let reconnects_changed = reducer.prune_reconnect_evidence(SystemTime::now());
                 let history_count = reducer.history_count();
                 if reducer.maintain_to(SystemTime::now(), MAX_PEER_HISTORIES) {
                     persistence_state.mark_dirty();
                     publish_policy(&reducer, &policy_tx);
                 }
-                if reducer.history_count() != history_count {
+                if reconnects_changed || reducer.history_count() != history_count {
                     publish_view(
                         &reducer,
                         &latest_metrics,
@@ -3093,6 +3160,30 @@ mod tests {
             ));
         }
         assert!(!reducer.policy().restrictions.contains_key(&ip));
+    }
+
+    #[test]
+    fn reconnect_evidence_expires_without_another_metrics_snapshot() {
+        let mut reducer = PeerPolicyReducer::default();
+        let info_hash = vec![0x3a; 20];
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 58));
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(58_000_000);
+        let mut metrics = metrics_without_peers(&info_hash, 1024 * MIB);
+        metrics.peer_reconnect_counts.insert(ip, 1);
+
+        assert!(!reducer.reduce_metrics(&info_hash, &metrics, now));
+        assert_eq!(
+            reducer.next_reconnect_expiry_delay(now),
+            Some(RECONNECT_WINDOW)
+        );
+        assert!(
+            !reducer.prune_reconnect_evidence(now + RECONNECT_WINDOW - Duration::from_millis(1))
+        );
+        assert!(reducer.prune_reconnect_evidence(now + RECONNECT_WINDOW));
+        assert_eq!(reducer.next_reconnect_expiry_delay(now), None);
+
+        let view = reducer.build_view(&HashMap::from([(info_hash, metrics)]), 1, 1);
+        assert_eq!(view.tracked_peers[0].reconnect_count, 0);
     }
 
     #[test]
