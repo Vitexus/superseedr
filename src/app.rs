@@ -2887,6 +2887,15 @@ pub struct App {
     probe_available_log_cooldowns: HashMap<Vec<u8>, LogCooldown>,
 }
 
+#[cfg(test)]
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(task) = self.persistence_task.take() {
+            task.abort();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct NetworkHistoryPersistRequest {
     pub request_id: u64,
@@ -10538,15 +10547,30 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
-    fn configure_temp_app_paths_for_test() -> tempfile::TempDir {
+    struct TempAppPaths {
+        dir: tempfile::TempDir,
+    }
+
+    impl TempAppPaths {
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for TempAppPaths {
+        fn drop(&mut self) {
+            set_app_paths_override_for_tests(None);
+        }
+    }
+
+    fn configure_temp_app_paths_for_test() -> TempAppPaths {
         let dir = tempfile::tempdir().expect("create tempdir");
         let config_dir = dir.path().join("config");
         let data_dir = dir.path().join("data");
         set_app_paths_override_for_tests(Some((config_dir, data_dir)));
-        dir
+        TempAppPaths { dir }
     }
 
     fn mark_startup_roll_in_responsiveness_ready(app: &mut App) {
@@ -12708,7 +12732,6 @@ mod tests {
         assert!(!persisted.randomize_client_port);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -12749,7 +12772,6 @@ mod tests {
         assert!(!persisted.randomize_client_port);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[test]
@@ -13725,7 +13747,6 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -13808,7 +13829,6 @@ mod tests {
         );
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -14922,7 +14942,6 @@ mod tests {
         assert!(!stale_archived_path.exists());
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -15177,7 +15196,6 @@ mod tests {
             .contains_key(&source_path));
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -17165,7 +17183,6 @@ mod tests {
         assert_eq!(completion_entries, 1);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -17223,7 +17240,6 @@ mod tests {
         assert_eq!(completion_entries, 0);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -17296,7 +17312,6 @@ mod tests {
         assert_eq!(completion_entries, 1);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
@@ -17406,7 +17421,6 @@ mod tests {
         assert_eq!(completion_entries, 1);
 
         let _ = app.shutdown_tx.send(());
-        set_app_paths_override_for_tests(None);
     }
 
     #[tokio::test]
