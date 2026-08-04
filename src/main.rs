@@ -17,6 +17,7 @@ mod integrations;
 mod integrity_scheduler;
 mod logging;
 mod networking;
+mod peer_manager;
 mod persistence;
 mod resource_manager;
 mod storage;
