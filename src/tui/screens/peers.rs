@@ -895,7 +895,7 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
             header: "Address",
             min_width: 20,
             priority: 0,
-            constraint: Constraint::Length(24),
+            constraint: Constraint::Fill(1),
         },
         PeerColumnDefinition {
             id: PeerColumnId::Torrents,
@@ -2953,7 +2953,7 @@ mod tests {
     }
 
     #[test]
-    fn wide_table_caps_address_and_gives_remaining_space_to_client() {
+    fn wide_table_splits_remaining_space_evenly_between_address_and_client() {
         let (constraints, visible) = compute_visible_peer_management_columns(140);
         let columns = peer_columns();
         let constraint_for = |column_id| {
@@ -2965,7 +2965,7 @@ mod tests {
 
         assert_eq!(
             constraint_for(PeerColumnId::Address),
-            Some(Constraint::Length(24))
+            Some(Constraint::Fill(1))
         );
         assert_eq!(
             constraint_for(PeerColumnId::Client),
