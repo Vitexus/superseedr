@@ -895,7 +895,7 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
             header: "Address",
             min_width: 20,
             priority: 0,
-            constraint: Constraint::Fill(2),
+            constraint: Constraint::Length(24),
         },
         PeerColumnDefinition {
             id: PeerColumnId::Torrents,
@@ -909,7 +909,7 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
             header: "Client",
             min_width: 18,
             priority: 2,
-            constraint: Constraint::Length(18),
+            constraint: Constraint::Fill(1),
         },
         PeerColumnDefinition {
             id: PeerColumnId::Evidence,
@@ -2662,7 +2662,7 @@ mod tests {
     }
 
     #[test]
-    fn torrents_are_numeric_and_state_sort_is_default() {
+    fn torrents_are_numeric_and_torrent_count_sort_is_default() {
         let mut two_first = tracked_peer("192.0.2.21", "Zephyr Notebook", 9);
         two_first.uploaded_evidence_bytes = 90;
         let mut one = tracked_peer("192.0.2.22", "Amber Notebook", 10);
@@ -2671,18 +2671,18 @@ mod tests {
         two_second.uploaded_evidence_bytes = 80;
         let state = state_with_peers(vec![two_first, one, two_second]);
 
-        assert_eq!(state.ui.peer_management.selected_column_index, 0);
-        assert_eq!(state.ui.peer_management.sort_column_index, Some(0));
+        assert_eq!(state.ui.peer_management.selected_column_index, 2);
+        assert_eq!(state.ui.peer_management.sort_column_index, Some(2));
         assert_eq!(
             state.ui.peer_management.sort_direction,
             SortDirection::Descending
         );
         let rows = build_peer_rows_at(&state, test_now());
-        assert!(rows[0].is_active());
-        assert_eq!(rows[0].torrent_count, 1);
-        assert_eq!(rows[1].torrent_count, 2);
-        assert_eq!(peer_torrents_label(&rows[0]), "1");
-        assert_eq!(peer_torrents_label(&rows[1]), "2");
+        assert_eq!(rows[0].torrent_count, 2);
+        assert_eq!(rows[1].torrent_count, 1);
+        assert!(rows[1].is_active());
+        assert_eq!(peer_torrents_label(&rows[0]), "2");
+        assert_eq!(peer_torrents_label(&rows[1]), "1");
     }
 
     #[test]
@@ -2950,6 +2950,27 @@ mod tests {
         assert!(ids.contains(&PeerColumnId::Evidence));
         assert!(!ids.contains(&PeerColumnId::Torrents));
         assert!(!ids.contains(&PeerColumnId::Client));
+    }
+
+    #[test]
+    fn wide_table_caps_address_and_gives_remaining_space_to_client() {
+        let (constraints, visible) = compute_visible_peer_management_columns(140);
+        let columns = peer_columns();
+        let constraint_for = |column_id| {
+            visible
+                .iter()
+                .position(|index| columns[*index].id == column_id)
+                .map(|position| constraints[position])
+        };
+
+        assert_eq!(
+            constraint_for(PeerColumnId::Address),
+            Some(Constraint::Length(24))
+        );
+        assert_eq!(
+            constraint_for(PeerColumnId::Client),
+            Some(Constraint::Fill(1))
+        );
     }
 
     #[test]
