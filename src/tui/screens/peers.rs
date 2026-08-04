@@ -87,6 +87,12 @@ enum PeerColumnId {
     Restriction,
 }
 
+const STATE_COLUMN_WIDTH: u16 = 10;
+const TORRENTS_COLUMN_WIDTH: u16 = 10;
+const EVIDENCE_COLUMN_WIDTH: u16 = 15;
+const LAST_SEEN_COLUMN_WIDTH: u16 = 12;
+const RESTRICTION_COLUMN_WIDTH: u16 = 12;
+
 #[derive(Clone, Debug)]
 struct PeerColumnDefinition {
     id: PeerColumnId,
@@ -114,13 +120,27 @@ struct PeerEvidence {
 
 impl PeerEvidence {
     fn compact_label(&self) -> String {
-        match self.kind {
+        let label = match self.kind {
             EvidenceKind::Upload => format!("UL {:.0}%", self.percent()),
             EvidenceKind::Download => format!("DL {:.0}%", self.percent()),
             EvidenceKind::Reconnect => {
                 format!("Reconnect {}/{}", self.observed, self.threshold)
             }
             EvidenceKind::Manual => "MANUAL".to_string(),
+        };
+        if fits_column(&label, EVIDENCE_COLUMN_WIDTH) {
+            return label;
+        }
+
+        match self.kind {
+            EvidenceKind::Upload => format!("UL {}%", compact_magnitude(self.percent())),
+            EvidenceKind::Download => format!("DL {}%", compact_magnitude(self.percent())),
+            EvidenceKind::Reconnect => format!(
+                "R {}/{}",
+                compact_count(self.observed),
+                compact_count(self.threshold)
+            ),
+            EvidenceKind::Manual => label,
         }
     }
 
@@ -130,6 +150,54 @@ impl PeerEvidence {
         } else {
             self.observed as f64 * 100.0 / self.threshold as f64
         }
+    }
+}
+
+fn fits_column(label: &str, width: u16) -> bool {
+    label.chars().count() <= usize::from(width)
+}
+
+fn compact_count(value: u64) -> String {
+    const UNITS: [(u64, &str); 6] = [
+        (1_000_000_000_000_000_000, "E"),
+        (1_000_000_000_000_000, "P"),
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "G"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ];
+    for (threshold, unit) in UNITS {
+        if value >= threshold {
+            return format_compact_scaled(value as f64 / threshold as f64, unit);
+        }
+    }
+    value.to_string()
+}
+
+fn compact_magnitude(value: f64) -> String {
+    const UNITS: [(f64, &str); 8] = [
+        (1e24, "Y"),
+        (1e21, "Z"),
+        (1e18, "E"),
+        (1e15, "P"),
+        (1e12, "T"),
+        (1e9, "G"),
+        (1e6, "M"),
+        (1e3, "K"),
+    ];
+    for (threshold, unit) in UNITS {
+        if value >= threshold {
+            return format_compact_scaled(value / threshold, unit);
+        }
+    }
+    format!("{value:.0}")
+}
+
+fn format_compact_scaled(value: f64, unit: &str) -> String {
+    if value < 10.0 {
+        format!("{value:.1}{unit}")
+    } else {
+        format!("{value:.0}{unit}")
     }
 }
 
@@ -886,9 +954,9 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
         PeerColumnDefinition {
             id: PeerColumnId::State,
             header: "State",
-            min_width: 10,
+            min_width: STATE_COLUMN_WIDTH,
             priority: 0,
-            constraint: Constraint::Length(10),
+            constraint: Constraint::Length(STATE_COLUMN_WIDTH),
         },
         PeerColumnDefinition {
             id: PeerColumnId::Address,
@@ -900,9 +968,9 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
         PeerColumnDefinition {
             id: PeerColumnId::Torrents,
             header: "Torrents",
-            min_width: 10,
+            min_width: TORRENTS_COLUMN_WIDTH,
             priority: 2,
-            constraint: Constraint::Length(10),
+            constraint: Constraint::Length(TORRENTS_COLUMN_WIDTH),
         },
         PeerColumnDefinition {
             id: PeerColumnId::Client,
@@ -914,23 +982,23 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
         PeerColumnDefinition {
             id: PeerColumnId::Evidence,
             header: "Evidence",
-            min_width: 15,
+            min_width: EVIDENCE_COLUMN_WIDTH,
             priority: 0,
-            constraint: Constraint::Length(15),
+            constraint: Constraint::Length(EVIDENCE_COLUMN_WIDTH),
         },
         PeerColumnDefinition {
             id: PeerColumnId::LastSeen,
             header: "Last Seen",
-            min_width: 12,
+            min_width: LAST_SEEN_COLUMN_WIDTH,
             priority: 1,
-            constraint: Constraint::Length(12),
+            constraint: Constraint::Length(LAST_SEEN_COLUMN_WIDTH),
         },
         PeerColumnDefinition {
             id: PeerColumnId::Restriction,
             header: "Restricted",
-            min_width: 12,
+            min_width: RESTRICTION_COLUMN_WIDTH,
             priority: 1,
-            constraint: Constraint::Length(12),
+            constraint: Constraint::Length(RESTRICTION_COLUMN_WIDTH),
         },
     ];
     &COLUMNS
@@ -1727,7 +1795,15 @@ fn peer_sort_arrow(direction: SortDirection) -> &'static str {
 }
 
 fn peer_torrents_label(row: &PeerRowModel<'_>) -> String {
-    row.torrent_count.to_string()
+    let label = row.torrent_count.to_string();
+    if fits_column(&label, TORRENTS_COLUMN_WIDTH) {
+        label
+    } else {
+        format!(
+            "{}+",
+            "9".repeat(usize::from(TORRENTS_COLUMN_WIDTH.saturating_sub(1)))
+        )
+    }
 }
 
 fn torrent_name_for_hash<'a>(
@@ -2247,7 +2323,12 @@ fn format_elapsed(now: SystemTime, time: SystemTime) -> String {
     if elapsed < Duration::from_secs(5) {
         "now".to_string()
     } else {
-        format!("{} ago", compact_duration(elapsed))
+        let label = format!("{} ago", compact_duration(elapsed));
+        if fits_column(&label, LAST_SEEN_COLUMN_WIDTH) {
+            label
+        } else {
+            ">999d ago".to_string()
+        }
     }
 }
 
@@ -2256,7 +2337,12 @@ fn format_remaining(now: SystemTime, deadline: SystemTime) -> String {
     if remaining.is_zero() {
         "expired".to_string()
     } else {
-        format!("{} left", compact_duration(remaining))
+        let label = format!("{} left", compact_duration(remaining));
+        if fits_column(&label, RESTRICTION_COLUMN_WIDTH) {
+            label
+        } else {
+            ">99d left".to_string()
+        }
     }
 }
 
@@ -2721,6 +2807,59 @@ mod tests {
             from_policy: false,
         };
         assert_eq!(evidence.compact_label(), "Reconnect 3/10");
+    }
+
+    #[test]
+    fn fixed_peer_column_labels_stay_within_declared_widths() {
+        for state in ["ACTIVE", "RECENT", "BLOCKED"] {
+            assert!(fits_column(state, STATE_COLUMN_WIDTH));
+        }
+
+        let state = state_with_peers(vec![tracked_peer("192.0.2.90", "Cinder Atlas", 90)]);
+        let mut rows = build_peer_rows_at(&state, test_now());
+        rows[0].torrent_count = usize::MAX;
+        let torrents = peer_torrents_label(&rows[0]);
+        assert!(fits_column(&torrents, TORRENTS_COLUMN_WIDTH));
+        if usize::BITS > 32 {
+            assert_eq!(torrents, "999999999+");
+        }
+
+        let reconnect = PeerEvidence {
+            kind: EvidenceKind::Reconnect,
+            observed: u64::MAX,
+            threshold: u64::MAX,
+            from_policy: false,
+        }
+        .compact_label();
+        assert_eq!(reconnect, "R 18E/18E");
+        assert!(fits_column(&reconnect, EVIDENCE_COLUMN_WIDTH));
+
+        let upload = PeerEvidence {
+            kind: EvidenceKind::Upload,
+            observed: u64::MAX,
+            threshold: 1,
+            from_policy: false,
+        }
+        .compact_label();
+        assert_eq!(upload, "UL 1.8Z%");
+        assert!(fits_column(&upload, EVIDENCE_COLUMN_WIDTH));
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 * 86_400);
+        let last_seen = format_elapsed(now, SystemTime::UNIX_EPOCH);
+        assert_eq!(last_seen, ">999d ago");
+        assert!(fits_column(&last_seen, LAST_SEEN_COLUMN_WIDTH));
+
+        let restricted = format_remaining(now, now + Duration::from_secs(1_000_000 * 86_400));
+        assert_eq!(restricted, ">99d left");
+        assert!(fits_column(&restricted, RESTRICTION_COLUMN_WIDTH));
+
+        for column in peer_columns()
+            .iter()
+            .filter(|column| !matches!(column.id, PeerColumnId::Address | PeerColumnId::Client))
+        {
+            let header = format!("{} ▼", column.header);
+            assert!(fits_column(&header, column.min_width), "{header}");
+        }
     }
 
     #[test]
