@@ -89,7 +89,8 @@ enum PeerColumnId {
 
 const STATE_COLUMN_WIDTH: u16 = 10;
 const TORRENTS_COLUMN_WIDTH: u16 = 10;
-const EVIDENCE_COLUMN_WIDTH: u16 = 15;
+const EVIDENCE_COLUMN_WIDTH: u16 = 18;
+const EVIDENCE_CONTENT_WIDTH: u16 = EVIDENCE_COLUMN_WIDTH - 1;
 const LAST_SEEN_COLUMN_WIDTH: u16 = 12;
 const RESTRICTION_COLUMN_WIDTH: u16 = 12;
 
@@ -128,11 +129,11 @@ impl PeerEvidence {
             }
             EvidenceKind::Manual => "MANUAL".to_string(),
         };
-        if fits_column(&label, EVIDENCE_COLUMN_WIDTH) {
+        if fits_column(&label, EVIDENCE_CONTENT_WIDTH) {
             return label;
         }
 
-        match self.kind {
+        let compact = match self.kind {
             EvidenceKind::Upload => format!("UL {}%", compact_magnitude(self.percent())),
             EvidenceKind::Download => format!("DL {}%", compact_magnitude(self.percent())),
             EvidenceKind::Reconnect => format!(
@@ -141,7 +142,8 @@ impl PeerEvidence {
                 compact_count(self.threshold)
             ),
             EvidenceKind::Manual => label,
-        }
+        };
+        truncate_with_ellipsis(&compact, usize::from(EVIDENCE_CONTENT_WIDTH))
     }
 
     fn percent(&self) -> f64 {
@@ -2644,6 +2646,32 @@ mod tests {
     }
 
     #[test]
+    fn restricted_reconnect_evidence_leaves_a_column_gutter() {
+        let ip: IpAddr = "192.0.2.46".parse().unwrap();
+        let mut state = state_with_peers(Vec::new());
+        state.ui.peer_management.filter = PeerManagementFilter::Restricted;
+        state.peer_policy = Arc::new(PeerPolicy {
+            restrictions: HashMap::from([(
+                ip,
+                restriction(
+                    test_now() + Duration::from_secs(600),
+                    PeerRestrictionReason::ReconnectChurn {
+                        reconnects: 10,
+                        threshold: 10,
+                        window_secs: 10,
+                    },
+                ),
+            )]),
+        });
+
+        let rows = build_peer_rows_at(&state, test_now());
+        let evidence = rows[0].strongest_evidence().compact_label();
+
+        assert_eq!(evidence, "Reconnect 10/10");
+        assert!(fits_column(&evidence, EVIDENCE_CONTENT_WIDTH));
+    }
+
+    #[test]
     fn state_filters_keep_restricted_peers_out_of_active() {
         let ip: IpAddr = "192.0.2.45".parse().unwrap();
         let mut peer = tracked_peer("192.0.2.45", "Ember Field Notes", 8);
@@ -3008,7 +3036,7 @@ mod tests {
         }
         .compact_label();
         assert_eq!(reconnect, "R 18E/18E");
-        assert!(fits_column(&reconnect, EVIDENCE_COLUMN_WIDTH));
+        assert!(fits_column(&reconnect, EVIDENCE_CONTENT_WIDTH));
 
         let upload = PeerEvidence {
             kind: EvidenceKind::Upload,
@@ -3018,7 +3046,7 @@ mod tests {
         }
         .compact_label();
         assert_eq!(upload, "UL 1.8Z%");
-        assert!(fits_column(&upload, EVIDENCE_COLUMN_WIDTH));
+        assert!(fits_column(&upload, EVIDENCE_CONTENT_WIDTH));
 
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 * 86_400);
         let last_seen = format_elapsed(now, SystemTime::UNIX_EPOCH);
