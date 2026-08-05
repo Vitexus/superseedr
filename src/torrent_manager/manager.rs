@@ -2904,7 +2904,7 @@ impl TorrentManager {
                 };
 
                 PeerInfo {
-                    address: peer.ip_port.clone(),
+                    address: peer.network_address(),
                     peer_id: peer.peer_id.clone(),
                     am_choking: peer.am_choking != ChokeStatus::Unchoke,
                     peer_choking: peer.peer_choking != ChokeStatus::Unchoke,
@@ -4509,6 +4509,53 @@ mod resource_tests {
         assert_eq!(metrics.info_hash, manager.state.info_hash);
         assert_eq!(metrics.peers.len(), 1);
         assert_eq!(metrics.peers[0].address, peer_addr.to_string());
+    }
+
+    #[tokio::test]
+    async fn opaque_session_keys_publish_registered_network_addresses() {
+        let mut params = build_test_params();
+        let (metrics_tx, mut metrics_rx) = watch::channel(TorrentMetrics::default());
+        params.metrics_tx = metrics_tx;
+        let magnet_link = "magnet:?xt=urn:btih:4141414141414141414141414141414141414141";
+        let magnet = Magnet::new(magnet_link).expect("valid magnet link");
+        let mut manager =
+            TorrentManager::from_magnet(params, magnet, magnet_link).expect("manager from magnet");
+        let peer_addr: SocketAddr = "203.0.113.30:6881".parse().expect("valid peer address");
+        let peer_id = "opaque-session-key".to_string();
+        let (session_tx, _session_rx) = mpsc::channel(1);
+
+        manager.apply_action(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: Some(peer_addr),
+            tx: session_tx,
+        });
+        manager.send_metrics(0, 0, Vec::new());
+
+        metrics_rx
+            .changed()
+            .await
+            .expect("active peer observation should be published");
+        let active_metrics = metrics_rx.borrow_and_update().clone();
+        assert_eq!(active_metrics.peers.len(), 1);
+        assert_eq!(active_metrics.peers[0].address, peer_addr.to_string());
+
+        manager.apply_action(Action::PeerDisconnected {
+            peer_id,
+            force: true,
+        });
+        manager.send_metrics(0, 0, Vec::new());
+
+        metrics_rx
+            .changed()
+            .await
+            .expect("departed peer observation should be published");
+        let departed_metrics = metrics_rx.borrow_and_update().clone();
+        assert!(departed_metrics.peers.is_empty());
+        assert_eq!(departed_metrics.departed_peers.len(), 1);
+        assert_eq!(
+            departed_metrics.departed_peers[0].address,
+            peer_addr.to_string()
+        );
     }
 
     #[tokio::test]

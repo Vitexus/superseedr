@@ -645,7 +645,7 @@ pub fn reduce_peer_management_action(
     }
 
     if recompute_derived {
-        recompute_peer_management_derived_for_action(app_state, now);
+        recompute_peer_management_derived(app_state, now);
     }
     clamp_peer_column_state(app_state);
     result
@@ -771,24 +771,7 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
     rows
 }
 
-fn recompute_peer_management_derived_for_action(app_state: &mut AppState, now: SystemTime) {
-    recompute_peer_management_derived_with_selection(app_state, now, false);
-}
-
 pub(crate) fn recompute_peer_management_derived(app_state: &mut AppState, now: SystemTime) {
-    recompute_peer_management_derived_with_selection(app_state, now, true);
-}
-
-fn recompute_peer_management_derived_with_selection(
-    app_state: &mut AppState,
-    now: SystemTime,
-    preserve_selected_peer: bool,
-) {
-    let selected_ip = if preserve_selected_peer {
-        selected_peer_row(app_state, &app_state.peer_management_derived.rows).map(|row| row.ip)
-    } else {
-        None
-    };
     let rows = build_peer_rows_at(app_state, now);
     let next_restriction_expiry = app_state
         .peer_policy
@@ -798,13 +781,7 @@ fn recompute_peer_management_derived_with_selection(
             (restriction.blocked_until > now).then_some(restriction.blocked_until)
         })
         .min();
-    if let Some(selected_index) =
-        selected_ip.and_then(|ip| rows.iter().position(|row| row.ip == ip))
-    {
-        app_state.ui.peer_management.selected_index = selected_index;
-    } else {
-        reconcile_peer_selection(app_state, rows.len());
-    }
+    reconcile_peer_selection(app_state, rows.len());
     app_state.peer_management_derived = PeerManagementDerivedState {
         rows,
         next_restriction_expiry,
@@ -2413,8 +2390,8 @@ fn evidence_percent(observed: u64, threshold: u64) -> f64 {
 
 fn format_elapsed(now: SystemTime, time: SystemTime) -> String {
     let elapsed = now.duration_since(time).unwrap_or_default();
-    if elapsed < Duration::from_secs(5) {
-        "now".to_string()
+    if elapsed < Duration::from_secs(1) {
+        "<1s ago".to_string()
     } else {
         let label = format!("{} ago", compact_duration(elapsed));
         if fits_column(&label, LAST_SEEN_COLUMN_WIDTH) {
@@ -2752,31 +2729,65 @@ mod tests {
     }
 
     #[test]
-    fn telemetry_reorder_preserves_selected_peer_identity() {
-        let mut selected = tracked_peer("192.0.2.11", "Opal Ledger", 6);
-        selected.uploaded_evidence_bytes = 10;
-        let mut other = tracked_peer("192.0.2.12", "Sable Ledger", 7);
-        other.uploaded_evidence_bytes = 90;
-        let mut state = state_with_peers(vec![selected.clone(), other.clone()]);
+    fn telemetry_reorder_preserves_cursor_position() {
+        let mut first = tracked_peer("192.0.2.11", "Opal Ledger", 6);
+        first.uploaded_evidence_bytes = 10;
+        let mut second = tracked_peer("192.0.2.12", "Sable Ledger", 7);
+        second.uploaded_evidence_bytes = 90;
+        let mut state = state_with_peers(vec![first.clone(), second.clone()]);
         state.ui.peer_management.sort_column_index = peer_columns()
             .iter()
             .position(|column| column.id == PeerColumnId::Evidence);
         state.ui.peer_management.sort_direction = SortDirection::Descending;
         recompute_peer_management_derived(&mut state, test_now());
-        state.ui.peer_management.selected_index = 1;
+        reduce_peer_management_action(&mut state, PeerManagementAction::MoveDown);
+        assert_eq!(state.ui.peer_management.selected_index, 1);
+        assert_eq!(
+            selected_peer_row(&state, &state.peer_management_derived.rows).map(|row| row.ip),
+            Some(first.ip)
+        );
 
-        selected.uploaded_evidence_bytes = 95;
+        first.uploaded_evidence_bytes = 95;
         state.peer_manager_view = Arc::new(PeerManagerView {
             registered_torrents: 2,
             metrics_updates: 2,
-            tracked_peers: vec![selected, other],
+            tracked_peers: vec![first, second.clone()],
+        });
+        recompute_peer_management_derived(&mut state, test_now());
+
+        assert_eq!(state.ui.peer_management.selected_index, 1);
+        assert_eq!(
+            selected_peer_row(&state, &state.peer_management_derived.rows).map(|row| row.ip),
+            Some(second.ip)
+        );
+    }
+
+    #[test]
+    fn telemetry_reorder_keeps_top_cursor_at_top() {
+        let mut first = tracked_peer("192.0.2.11", "Opal Ledger", 6);
+        first.uploaded_evidence_bytes = 10;
+        let mut second = tracked_peer("192.0.2.12", "Sable Ledger", 7);
+        second.uploaded_evidence_bytes = 90;
+        let mut state = state_with_peers(vec![first.clone(), second.clone()]);
+        state.ui.peer_management.sort_column_index = peer_columns()
+            .iter()
+            .position(|column| column.id == PeerColumnId::Evidence);
+        state.ui.peer_management.sort_direction = SortDirection::Descending;
+        recompute_peer_management_derived(&mut state, test_now());
+        assert_eq!(state.peer_management_derived.rows[0].ip, second.ip);
+
+        first.uploaded_evidence_bytes = 95;
+        state.peer_manager_view = Arc::new(PeerManagerView {
+            registered_torrents: 2,
+            metrics_updates: 2,
+            tracked_peers: vec![first.clone(), second],
         });
         recompute_peer_management_derived(&mut state, test_now());
 
         assert_eq!(state.ui.peer_management.selected_index, 0);
         assert_eq!(
             selected_peer_row(&state, &state.peer_management_derived.rows).map(|row| row.ip),
-            Some("192.0.2.11".parse().unwrap())
+            Some(first.ip)
         );
     }
 
@@ -2910,27 +2921,30 @@ mod tests {
     }
 
     #[test]
-    fn torrents_are_numeric_and_torrent_count_sort_is_default() {
+    fn last_seen_is_default_sort_and_torrents_are_numeric() {
         let mut two_first = tracked_peer("192.0.2.21", "Zephyr Notebook", 9);
         two_first.uploaded_evidence_bytes = 90;
+        two_first.last_seen = Some(test_now() - Duration::from_secs(90));
         let mut one = tracked_peer("192.0.2.22", "Amber Notebook", 10);
         one.is_active = true;
+        one.last_seen = Some(test_now() - Duration::from_secs(10));
         let mut two_second = tracked_peer("192.0.2.21", "Cinder Notebook", 11);
         two_second.uploaded_evidence_bytes = 80;
+        two_second.last_seen = Some(test_now() - Duration::from_secs(60));
         let state = state_with_peers(vec![two_first, one, two_second]);
 
-        assert_eq!(state.ui.peer_management.selected_column_index, 2);
-        assert_eq!(state.ui.peer_management.sort_column_index, Some(2));
+        assert_eq!(state.ui.peer_management.selected_column_index, 5);
+        assert_eq!(state.ui.peer_management.sort_column_index, Some(5));
         assert_eq!(
             state.ui.peer_management.sort_direction,
             SortDirection::Descending
         );
         let rows = build_peer_rows_at(&state, test_now());
-        assert_eq!(rows[0].torrent_count, 2);
-        assert_eq!(rows[1].torrent_count, 1);
-        assert!(rows[1].is_active());
-        assert_eq!(peer_torrents_label(&rows[0]), "2");
-        assert_eq!(peer_torrents_label(&rows[1]), "1");
+        assert_eq!(rows[0].torrent_count, 1);
+        assert_eq!(rows[1].torrent_count, 2);
+        assert!(rows[0].is_active());
+        assert_eq!(peer_torrents_label(&rows[0]), "1");
+        assert_eq!(peer_torrents_label(&rows[1]), "2");
     }
 
     #[test]
@@ -3233,6 +3247,18 @@ mod tests {
         state.ui.peer_management.details_search_query.clear();
         state.ui.peer_management.search_query = "192.0.2.61".to_string();
         assert!(build_peer_rows_at(&state, test_now()).is_empty());
+    }
+
+    #[test]
+    fn subsecond_last_seen_is_not_rounded_to_now() {
+        let now = test_now();
+
+        assert_eq!(format_elapsed(now, now), "<1s ago");
+        assert_eq!(
+            format_elapsed(now, now - Duration::from_millis(999)),
+            "<1s ago"
+        );
+        assert_eq!(format_elapsed(now, now - Duration::from_secs(1)), "1s ago");
     }
 
     #[test]

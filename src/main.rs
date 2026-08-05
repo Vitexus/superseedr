@@ -3535,8 +3535,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn shared_env_guard() -> &'static std::sync::Mutex<()> {
-        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        GUARD.get_or_init(|| std::sync::Mutex::new(()))
+        crate::config::shared_env_guard_for_tests()
     }
 
     struct EnvVarRestore {
@@ -3577,6 +3576,14 @@ mod tests {
             root.join("data"),
         )));
         AppPathsRestore
+    }
+
+    #[test]
+    fn main_tests_use_the_process_wide_shared_environment_guard() {
+        assert!(std::ptr::eq(
+            shared_env_guard(),
+            crate::config::shared_env_guard_for_tests()
+        ));
     }
 
     fn assert_abs_opt(path: &Option<PathBuf>, label: &str) {
