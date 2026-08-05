@@ -2865,6 +2865,8 @@ pub struct App {
     peer_manager_shutdown_tx: broadcast::Sender<()>,
     pub persistence_tx: Option<watch::Sender<Option<PersistPayload>>>,
     pub persistence_task: Option<tokio::task::JoinHandle<()>>,
+    shared_recovery_backup_tx: Option<mpsc::Sender<()>>,
+    shared_recovery_backup_task: Option<tokio::task::JoinHandle<()>>,
     pub rss_sync_rx: Option<mpsc::Receiver<()>>,
     pub rss_downloaded_entry_rx: Option<mpsc::Receiver<RssHistoryEntry>>,
     pub rss_settings_rx: Option<watch::Receiver<Settings>>,
@@ -2896,6 +2898,9 @@ pub struct App {
 impl Drop for App {
     fn drop(&mut self) {
         if let Some(task) = self.persistence_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.shared_recovery_backup_task.take() {
             task.abort();
         }
     }
@@ -3235,6 +3240,35 @@ fn spawn_persistence_writer(
     (persistence_tx, persistence_task)
 }
 
+fn spawn_shared_recovery_backup_worker() -> (mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (request_tx, mut request_rx) = mpsc::channel::<()>(1);
+    let task = tokio::spawn(async move {
+        while request_rx.recv().await.is_some() {
+            let result =
+                tokio::task::spawn_blocking(refresh_shared_config_recovery_backup_now).await;
+
+            match result {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing_event!(
+                        Level::WARN,
+                        error = %error,
+                        "Failed to refresh scheduled shared config recovery backup"
+                    );
+                }
+                Err(error) => {
+                    tracing_event!(
+                        Level::ERROR,
+                        error = %error,
+                        "Scheduled shared config recovery backup worker failed"
+                    );
+                }
+            }
+        }
+    });
+    (request_tx, task)
+}
+
 fn build_app_dht_service_config(client_configs: &Settings) -> DhtServiceConfig {
     let config = DhtServiceConfig::from_settings(client_configs);
     #[cfg(test)]
@@ -3301,6 +3335,12 @@ impl App {
             let (persistence_tx, persistence_task) =
                 spawn_persistence_writer(app_command_tx.clone());
             (Some(persistence_tx), Some(persistence_task))
+        };
+        let (shared_recovery_backup_tx, shared_recovery_backup_task) = if shared_mode_enabled {
+            let (tx, task) = spawn_shared_recovery_backup_worker();
+            (Some(tx), Some(task))
+        } else {
+            (None, None)
         };
 
         let (limits, system_warning) = calculate_adaptive_limits(&client_configs);
@@ -3465,6 +3505,8 @@ impl App {
             peer_manager_shutdown_tx,
             persistence_tx,
             persistence_task,
+            shared_recovery_backup_tx,
+            shared_recovery_backup_task,
             rss_sync_rx: Some(rss_sync_rx),
             rss_downloaded_entry_rx: Some(rss_downloaded_entry_rx),
             rss_settings_rx: Some(rss_settings_rx),
@@ -3745,15 +3787,17 @@ impl App {
     }
 
     fn refresh_shared_recovery_backup_on_interval(&self) {
-        if !self.is_shared_mode_enabled() {
+        let Some(tx) = &self.shared_recovery_backup_tx else {
             return;
-        }
-        if let Err(error) = refresh_shared_config_recovery_backup_now() {
-            tracing_event!(
-                Level::WARN,
-                error = %error,
-                "Failed to refresh scheduled shared config recovery backup"
-            );
+        };
+        match tx.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => {}
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing_event!(
+                    Level::WARN,
+                    "Scheduled shared config recovery backup worker is unavailable"
+                );
+            }
         }
     }
 
@@ -4859,9 +4903,12 @@ impl App {
         let mut version_interval = time::interval(Duration::from_secs(24 * 60 * 60));
         let mut network_history_persist_interval =
             time::interval(Duration::from_secs(NETWORK_HISTORY_PERSIST_INTERVAL_SECS));
-        let mut shared_recovery_backup_interval = time::interval(Duration::from_secs(
-            SHARED_RECOVERY_BACKUP_REFRESH_INTERVAL_SECS,
-        ));
+        let shared_recovery_backup_period =
+            Duration::from_secs(SHARED_RECOVERY_BACKUP_REFRESH_INTERVAL_SECS);
+        let mut shared_recovery_backup_interval = time::interval_at(
+            time::Instant::now() + shared_recovery_backup_period,
+            shared_recovery_backup_period,
+        );
         let mut watch_folder_rescan_interval =
             time::interval(Duration::from_secs(WATCH_FOLDER_RESCAN_INTERVAL_SECS));
         let mut shared_role_retry_interval =
@@ -5115,6 +5162,7 @@ impl App {
         self.save_state_to_disk();
 
         self.shutdown_sequence(terminal).await;
+        self.flush_shared_recovery_backup_worker().await;
         self.flush_persistence_writer().await;
 
         Ok(())
@@ -5456,6 +5504,15 @@ impl App {
 
     async fn flush_persistence_writer(&mut self) {
         flush_persistence_writer_parts(&mut self.persistence_tx, &mut self.persistence_task).await;
+    }
+
+    async fn flush_shared_recovery_backup_worker(&mut self) {
+        self.shared_recovery_backup_tx = None;
+        if let Some(handle) = self.shared_recovery_backup_task.take() {
+            if let Err(error) = handle.await {
+                tracing_event!(Level::ERROR, %error, "Error joining recovery backup worker");
+            }
+        }
     }
 
     async fn shutdown_sequence<B: Backend>(&mut self, terminal: &mut Terminal<B>) {
