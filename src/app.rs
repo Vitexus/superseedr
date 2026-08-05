@@ -2407,6 +2407,7 @@ pub struct AppState {
     pub write_iops: u32,
 
     pub ui: UiState,
+    pub(crate) peer_management_derived: crate::tui::screens::peers::PeerManagementDerivedState,
     pub rss_runtime: RssRuntimeState,
     pub rss_derived: RssDerivedState,
     pub data_rate: DataRate,
@@ -2477,6 +2478,10 @@ fn sync_peer_manager_view_to_app_state(
     app_state.peer_manager_view = view;
     app_state.ui.needs_redraw = true;
     tracked_peers
+}
+
+fn should_sync_peer_manager_view(mode: &AppMode) -> bool {
+    matches!(mode, AppMode::PeerManagement)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4922,11 +4927,14 @@ impl App {
                             blocked_ips,
                             "App received peer policy"
                         );
+                        if matches!(self.app_state.mode, AppMode::PeerManagement) {
+                            self.refresh_peer_management_derived(SystemTime::now());
+                        }
                     } else {
                         self.peer_policy_open = false;
                     }
                 }
-                view_changed = self.peer_manager_view_rx.changed(), if self.peer_manager_view_open => {
+                view_changed = self.peer_manager_view_rx.changed(), if self.peer_manager_view_open && should_sync_peer_manager_view(&self.app_state.mode) => {
                     if view_changed.is_ok() {
                         let tracked_peers = sync_peer_manager_view_to_app_state(
                             &mut self.app_state,
@@ -4936,6 +4944,7 @@ impl App {
                             tracked_peers,
                             "App received peer manager view"
                         );
+                        self.refresh_peer_management_derived(SystemTime::now());
                     } else {
                         self.peer_manager_view_open = false;
                     }
@@ -4977,6 +4986,12 @@ impl App {
 
                 _ = stats_interval.tick() => {
                     self.calculate_stats(&mut sys).await;
+                    if matches!(self.app_state.mode, AppMode::PeerManagement) {
+                        crate::tui::screens::peers::refresh_peer_management_expiries(
+                            &mut self.app_state,
+                            SystemTime::now(),
+                        );
+                    }
                     self.app_state.ui.needs_redraw = true;
                 }
 
@@ -5664,6 +5679,16 @@ impl App {
 
     fn refresh_rss_derived(&mut self) {
         crate::tui::screens::rss::recompute_rss_derived(&mut self.app_state, &self.client_configs);
+    }
+
+    fn refresh_peer_management_derived(&mut self, now: SystemTime) {
+        crate::tui::screens::peers::recompute_peer_management_derived(&mut self.app_state, now);
+    }
+
+    pub(crate) fn refresh_peer_management_screen(&mut self) {
+        sync_peer_policy_to_app_state(&mut self.app_state, &mut self.peer_policy_rx);
+        sync_peer_manager_view_to_app_state(&mut self.app_state, &mut self.peer_manager_view_rx);
+        self.refresh_peer_management_derived(SystemTime::now());
     }
 
     fn active_running_torrents_for_dht_announce(&self) -> Vec<Vec<u8>> {
@@ -12379,6 +12404,14 @@ mod tests {
             vec!["Unknown (ZZ1234)".to_string()]
         );
         assert!(app_state.ui.needs_redraw);
+    }
+
+    #[test]
+    fn peer_manager_view_is_only_adopted_while_its_screen_is_open() {
+        assert!(!super::should_sync_peer_manager_view(&AppMode::Normal));
+        assert!(super::should_sync_peer_manager_view(
+            &AppMode::PeerManagement
+        ));
     }
 
     #[tokio::test]

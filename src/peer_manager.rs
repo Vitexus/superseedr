@@ -28,6 +28,7 @@ pub(crate) const RECONNECT_WINDOW: Duration = Duration::from_secs(10);
 const EXCESSIVE_TRANSFER_BLOCK_DURATION: Duration = Duration::from_secs(24 * 60 * 60);
 const RECONNECT_BLOCK_DURATION: Duration = Duration::from_secs(2 * 60 * 60);
 const HISTORY_RETENTION: Duration = Duration::from_secs(60 * 60);
+const VIEW_PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(not(test))]
 const PEER_POLICY_FILE_NAME: &str = "peer_policy.toml";
 const MAX_POLICY_RESTRICTIONS: usize = 1_000_000;
@@ -1336,6 +1337,10 @@ async fn run_service(
     let mut metrics_notification_cancellations = HashMap::<InfoHash, oneshot::Sender<()>>::new();
     let mut latest_metrics = HashMap::<InfoHash, TorrentMetrics>::new();
     let mut metrics_updates = 0_u64;
+    let first_view_publish = tokio::time::Instant::now() + VIEW_PUBLISH_INTERVAL;
+    let mut view_publish = tokio::time::interval_at(first_view_publish, VIEW_PUBLISH_INTERVAL);
+    view_publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut view_dirty = false;
     let first_checkpoint = tokio::time::Instant::now() + checkpoint_interval;
     let mut policy_checkpoint = tokio::time::interval_at(first_checkpoint, checkpoint_interval);
     policy_checkpoint.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1391,6 +1396,7 @@ async fn run_service(
                             metrics_updates,
                             &view_tx,
                         );
+                        view_dirty = false;
                     }
                     PeerManagerCommand::UnregisterTorrent { info_hash } => {
                         if let Some(cancel_tx) = metrics_notification_cancellations.remove(&info_hash) {
@@ -1421,6 +1427,7 @@ async fn run_service(
                             metrics_updates,
                             &view_tx,
                         );
+                        view_dirty = false;
                     }
                     PeerManagerCommand::Flush { response_tx } => {
                         let (policy_changed, view_changed) = drain_metrics_updates(
@@ -1442,6 +1449,7 @@ async fn run_service(
                                 metrics_updates,
                                 &view_tx,
                             );
+                            view_dirty = false;
                         }
                         persistence_state.queue_if_dirty(&reducer);
                         let _ = response_tx.send(());
@@ -1508,17 +1516,21 @@ async fn run_service(
                     publish_policy(&reducer, &policy_tx);
                 }
                 if view_changed {
-                    publish_view(
-                        &reducer,
-                        &latest_metrics,
-                        metrics_rxs.len(),
-                        metrics_updates,
-                        &view_tx,
-                    );
+                    view_dirty = true;
                 }
                 for processed_tx in processed_txs {
                     let _ = processed_tx.send(());
                 }
+            }
+            _ = view_publish.tick(), if view_dirty => {
+                publish_view(
+                    &reducer,
+                    &latest_metrics,
+                    metrics_rxs.len(),
+                    metrics_updates,
+                    &view_tx,
+                );
+                view_dirty = false;
             }
             _ = async {
                 match reconnect_expiry_delay {
@@ -1527,13 +1539,7 @@ async fn run_service(
                 }
             } => {
                 if reducer.prune_reconnect_evidence(SystemTime::now()) {
-                    publish_view(
-                        &reducer,
-                        &latest_metrics,
-                        metrics_rxs.len(),
-                        metrics_updates,
-                        &view_tx,
-                    );
+                    view_dirty = true;
                 }
             }
             _ = policy_checkpoint.tick() => {
@@ -1544,13 +1550,7 @@ async fn run_service(
                     publish_policy(&reducer, &policy_tx);
                 }
                 if reconnects_changed || reducer.history_count() != history_count {
-                    publish_view(
-                        &reducer,
-                        &latest_metrics,
-                        metrics_rxs.len(),
-                        metrics_updates,
-                        &view_tx,
-                    );
+                    view_dirty = true;
                 }
                 persistence_state.queue_if_dirty(&reducer);
             }
@@ -2225,10 +2225,13 @@ mod tests {
             .expect("policy should publish without a metrics timer")
             .expect("policy should remain published");
         assert!(policy_rx.borrow().blocks_ip(peer_ip, SystemTime::now()));
-        timeout(Duration::from_secs(1), view_rx.changed())
+        assert!(matches!(view_rx.has_changed(), Ok(false)));
+
+        tokio::time::advance(VIEW_PUBLISH_INTERVAL).await;
+        view_rx
+            .changed()
             .await
-            .expect("view should publish after metrics processing")
-            .expect("view should remain published");
+            .expect("view should publish on its coalescing cadence");
 
         let _ = shutdown_tx.send(());
         service.join().await;

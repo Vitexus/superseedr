@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 
 #[cfg(test)]
 std::thread_local! {
-    static PEER_ROW_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PEER_DERIVED_RECOMPUTE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,10 +202,10 @@ fn format_compact_scaled(value: f64, unit: &str) -> String {
 }
 
 #[derive(Clone, Debug)]
-struct PeerRowModel<'a> {
+struct PeerRowModel {
     ip: IpAddr,
-    tracked: Vec<&'a PeerManagerTrackedPeer>,
-    restriction: Option<&'a PeerRestriction>,
+    tracked_indices: Vec<usize>,
+    restriction: Option<PeerRestriction>,
     torrent_count: usize,
     is_active: bool,
     last_seen: Option<SystemTime>,
@@ -213,7 +213,7 @@ struct PeerRowModel<'a> {
     client_label: String,
 }
 
-impl PeerRowModel<'_> {
+impl PeerRowModel {
     fn is_active(&self) -> bool {
         self.is_active
     }
@@ -246,24 +246,31 @@ impl PeerRowModel<'_> {
         self.last_seen
     }
 
-    fn torrent_hashes(&self) -> BTreeSet<&[u8]> {
-        let mut hashes = self
-            .tracked
+    fn tracked<'a>(&self, app_state: &'a AppState) -> Vec<&'a PeerManagerTrackedPeer> {
+        self.tracked_indices
+            .iter()
+            .filter_map(|index| app_state.peer_manager_view.tracked_peers.get(*index))
+            .collect()
+    }
+
+    fn torrent_count(&self, tracked: &[&PeerManagerTrackedPeer]) -> usize {
+        let mut hashes = tracked
             .iter()
             .map(|peer| peer.torrent_info_hash.as_slice())
             .collect::<BTreeSet<_>>();
         if let Some(hash) = self
             .restriction
+            .as_ref()
             .and_then(|restriction| restriction.torrent_info_hash.as_deref())
         {
             hashes.insert(hash);
         }
-        hashes
+        hashes.len()
     }
 
-    fn endpoint_count(&self) -> usize {
-        self.tracked
-            .iter()
+    fn endpoint_count(&self, app_state: &AppState) -> usize {
+        self.tracked(app_state)
+            .into_iter()
             .flat_map(|peer| peer.endpoints.iter().map(|endpoint| &endpoint.address))
             .collect::<BTreeSet<_>>()
             .len()
@@ -272,6 +279,12 @@ impl PeerRowModel<'_> {
     fn strongest_evidence(&self) -> &PeerEvidence {
         &self.strongest_evidence
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PeerManagementDerivedState {
+    rows: Vec<PeerRowModel>,
+    next_restriction_expiry: Option<SystemTime>,
 }
 
 fn strongest_peer_evidence(
@@ -437,6 +450,7 @@ pub fn reduce_peer_management_action(
         redraw: true,
         effects: Vec::new(),
     };
+    let mut recompute_derived = false;
 
     match action {
         PeerManagementAction::ToNormal => {
@@ -450,27 +464,27 @@ pub fn reduce_peer_management_action(
             result.effects.push(PeerManagementEffect::ToNormal);
         }
         PeerManagementAction::MoveUp => {
-            let row_count = build_peer_rows_at(app_state, now).len();
+            let row_count = app_state.peer_management_derived.rows.len();
             move_peer_selection(app_state, row_count, -1);
         }
         PeerManagementAction::MoveDown => {
-            let row_count = build_peer_rows_at(app_state, now).len();
+            let row_count = app_state.peer_management_derived.rows.len();
             move_peer_selection(app_state, row_count, 1);
         }
         PeerManagementAction::MovePageUp => {
-            let row_count = build_peer_rows_at(app_state, now).len();
+            let row_count = app_state.peer_management_derived.rows.len();
             move_peer_selection(app_state, row_count, -(peer_page_rows(app_state) as isize));
         }
         PeerManagementAction::MovePageDown => {
-            let row_count = build_peer_rows_at(app_state, now).len();
+            let row_count = app_state.peer_management_derived.rows.len();
             move_peer_selection(app_state, row_count, peer_page_rows(app_state) as isize);
         }
         PeerManagementAction::MoveFirst => {
-            let row_count = build_peer_rows_at(app_state, now).len();
+            let row_count = app_state.peer_management_derived.rows.len();
             select_peer_index(app_state, row_count, 0);
         }
         PeerManagementAction::MoveLast => {
-            let row_count = build_peer_rows_at(app_state, now).len();
+            let row_count = app_state.peer_management_derived.rows.len();
             select_peer_index(app_state, row_count, row_count.saturating_sub(1));
         }
         PeerManagementAction::MoveColumnLeft => move_peer_column(app_state, -1),
@@ -486,14 +500,17 @@ pub fn reduce_peer_management_action(
                 app_state.ui.peer_management.sort_direction =
                     peer_column_default_direction(peer_columns()[selected].id);
             }
+            recompute_derived = true;
         }
         PeerManagementAction::FilterNext => {
             app_state.ui.peer_management.filter = app_state.ui.peer_management.filter.next();
             reset_peer_selection(app_state);
+            recompute_derived = true;
         }
         PeerManagementAction::FilterPrev => {
             app_state.ui.peer_management.filter = app_state.ui.peer_management.filter.prev();
             reset_peer_selection(app_state);
+            recompute_derived = true;
         }
         PeerManagementAction::StartSearch => {
             app_state.ui.peer_management.is_searching = true;
@@ -501,10 +518,12 @@ pub fn reduce_peer_management_action(
         PeerManagementAction::SearchInsert(c) => {
             app_state.ui.peer_management.search_query.push(c);
             reset_peer_selection(app_state);
+            recompute_derived = true;
         }
         PeerManagementAction::SearchBackspace => {
             app_state.ui.peer_management.search_query.pop();
             reset_peer_selection(app_state);
+            recompute_derived = true;
         }
         PeerManagementAction::SearchCommit => {
             app_state.ui.peer_management.is_searching = false;
@@ -513,6 +532,7 @@ pub fn reduce_peer_management_action(
             app_state.ui.peer_management.is_searching = false;
             app_state.ui.peer_management.search_query.clear();
             reset_peer_selection(app_state);
+            recompute_derived = true;
         }
         PeerManagementAction::ToggleSearchMode => {
             app_state.ui.peer_management.search_mode =
@@ -521,6 +541,7 @@ pub fn reduce_peer_management_action(
                     SearchMode::Regex => SearchMode::Fuzzy,
                 };
             reset_peer_selection(app_state);
+            recompute_derived = true;
         }
         PeerManagementAction::TogglePrivacy => {
             let enabling_privacy = !app_state.anonymize_torrent_names;
@@ -530,15 +551,16 @@ pub fn reduce_peer_management_action(
                 app_state.ui.peer_management.search_query.clear();
                 reset_peer_selection(app_state);
             }
+            recompute_derived = true;
         }
         PeerManagementAction::ToggleDetails => {
             if app_state.ui.peer_management.show_details {
                 app_state.ui.peer_management.show_details = false;
                 app_state.ui.peer_management.details_peer_ip = None;
             } else {
-                let rows = build_peer_rows_at(app_state, now);
                 app_state.ui.peer_management.details_peer_ip =
-                    selected_peer_row(app_state, &rows).map(|row| row.ip);
+                    selected_peer_row(app_state, &app_state.peer_management_derived.rows)
+                        .map(|row| row.ip);
                 app_state.ui.peer_management.show_details =
                     app_state.ui.peer_management.details_peer_ip.is_some();
             }
@@ -622,6 +644,9 @@ pub fn reduce_peer_management_action(
         }
     }
 
+    if recompute_derived {
+        recompute_peer_management_derived(app_state, now);
+    }
     clamp_peer_column_state(app_state);
     result
 }
@@ -645,7 +670,7 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
         search_visible,
         app_state.ui.peer_management.show_details,
     );
-    let rows = build_peer_rows_at(app_state, now);
+    let rows = &app_state.peer_management_derived.rows;
 
     f.render_widget(Clear, area);
     if let Some(search_area) = layout.search {
@@ -655,13 +680,13 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
 
     match layout.body {
         PeerBodyLayout::TableOnly { table } => {
-            draw_peer_table(f, app_state, &rows, table, now, ctx);
+            draw_peer_table(f, app_state, rows, table, now, ctx);
         }
         PeerBodyLayout::DetailsOnly { details } => {
             draw_peer_details(
                 f,
                 app_state,
-                pinned_peer_detail_row(app_state, &rows),
+                pinned_peer_detail_row(app_state, rows),
                 details,
                 now,
                 ctx,
@@ -671,18 +696,18 @@ pub fn draw(f: &mut Frame, screen: &ScreenContext<'_>) {
     draw_peer_footer(f, app_state, layout.footer, ctx);
 }
 
-fn build_peer_rows_at<'a>(app_state: &'a AppState, now: SystemTime) -> Vec<PeerRowModel<'a>> {
+fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel> {
     #[cfg(test)]
-    PEER_ROW_BUILD_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+    PEER_DERIVED_RECOMPUTE_COUNT.with(|count| count.set(count.get().saturating_add(1)));
 
-    let mut by_ip = BTreeMap::<IpAddr, PeerRowModel<'a>>::new();
-    for tracked in &app_state.peer_manager_view.tracked_peers {
+    let mut by_ip = BTreeMap::<IpAddr, PeerRowModel>::new();
+    for (tracked_index, tracked) in app_state.peer_manager_view.tracked_peers.iter().enumerate() {
         let ip = normalize_peer_ip(tracked.ip);
         by_ip
             .entry(ip)
             .or_insert_with(|| PeerRowModel {
                 ip,
-                tracked: Vec::new(),
+                tracked_indices: Vec::new(),
                 restriction: None,
                 torrent_count: 0,
                 is_active: false,
@@ -690,8 +715,8 @@ fn build_peer_rows_at<'a>(app_state: &'a AppState, now: SystemTime) -> Vec<PeerR
                 strongest_evidence: strongest_peer_evidence(&[], None),
                 client_label: String::new(),
             })
-            .tracked
-            .push(tracked);
+            .tracked_indices
+            .push(tracked_index);
     }
 
     for (policy_ip, restriction) in &app_state.peer_policy.restrictions {
@@ -701,7 +726,7 @@ fn build_peer_rows_at<'a>(app_state: &'a AppState, now: SystemTime) -> Vec<PeerR
         let ip = normalize_peer_ip(*policy_ip);
         let row = by_ip.entry(ip).or_insert_with(|| PeerRowModel {
             ip,
-            tracked: Vec::new(),
+            tracked_indices: Vec::new(),
             restriction: None,
             torrent_count: 0,
             is_active: false,
@@ -711,24 +736,28 @@ fn build_peer_rows_at<'a>(app_state: &'a AppState, now: SystemTime) -> Vec<PeerR
         });
         if row
             .restriction
+            .as_ref()
             .is_none_or(|current| restriction.blocked_until > current.blocked_until)
         {
-            row.restriction = Some(restriction);
+            row.restriction = Some(restriction.clone());
         }
     }
 
     let mut rows = by_ip.into_values().collect::<Vec<_>>();
     for row in &mut rows {
-        row.tracked.sort_by(|left, right| {
+        row.tracked_indices.sort_by(|left, right| {
+            let left = &app_state.peer_manager_view.tracked_peers[*left];
+            let right = &app_state.peer_manager_view.tracked_peers[*right];
             left.torrent_name
                 .cmp(&right.torrent_name)
                 .then_with(|| left.torrent_info_hash.cmp(&right.torrent_info_hash))
         });
-        row.torrent_count = row.torrent_hashes().len();
-        row.is_active = row.tracked.iter().any(|peer| peer.is_active);
-        row.last_seen = row.tracked.iter().filter_map(|peer| peer.last_seen).max();
-        row.strongest_evidence = strongest_peer_evidence(&row.tracked, row.restriction);
-        row.client_label = peer_client_label(&row.tracked);
+        let tracked = row.tracked(app_state);
+        row.torrent_count = row.torrent_count(&tracked);
+        row.is_active = tracked.iter().any(|peer| peer.is_active);
+        row.last_seen = tracked.iter().filter_map(|peer| peer.last_seen).max();
+        row.strongest_evidence = strongest_peer_evidence(&tracked, row.restriction.as_ref());
+        row.client_label = peer_client_label(&tracked);
     }
 
     rows.retain(|row| peer_matches_filter(row, app_state.ui.peer_management.filter));
@@ -742,6 +771,33 @@ fn build_peer_rows_at<'a>(app_state: &'a AppState, now: SystemTime) -> Vec<PeerR
     rows
 }
 
+pub(crate) fn recompute_peer_management_derived(app_state: &mut AppState, now: SystemTime) {
+    let rows = build_peer_rows_at(app_state, now);
+    let next_restriction_expiry = app_state
+        .peer_policy
+        .restrictions
+        .values()
+        .filter_map(|restriction| {
+            (restriction.blocked_until > now).then_some(restriction.blocked_until)
+        })
+        .min();
+    reconcile_peer_selection(app_state, rows.len());
+    app_state.peer_management_derived = PeerManagementDerivedState {
+        rows,
+        next_restriction_expiry,
+    };
+}
+
+pub(crate) fn refresh_peer_management_expiries(app_state: &mut AppState, now: SystemTime) {
+    if app_state
+        .peer_management_derived
+        .next_restriction_expiry
+        .is_some_and(|expiry| expiry <= now)
+    {
+        recompute_peer_management_derived(app_state, now);
+    }
+}
+
 fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(ipv6) => ipv6.to_ipv4_mapped().map_or(IpAddr::V6(ipv6), IpAddr::V4),
@@ -749,7 +805,7 @@ fn normalize_peer_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
-fn peer_matches_filter(row: &PeerRowModel<'_>, filter: PeerManagementFilter) -> bool {
+fn peer_matches_filter(row: &PeerRowModel, filter: PeerManagementFilter) -> bool {
     match filter {
         PeerManagementFilter::All => true,
         PeerManagementFilter::Active => row.is_active() && !row.is_restricted(),
@@ -810,14 +866,14 @@ impl PeerSearchMatcher {
     }
 }
 
-fn peer_search_text(row: &PeerRowModel<'_>, app_state: &AppState) -> String {
+fn peer_search_text(row: &PeerRowModel, app_state: &AppState) -> String {
     let privacy = app_state.anonymize_torrent_names;
     let mut fields = vec![
         display_ip(row.ip, privacy),
         row.state_label().to_string(),
         row.client_label.clone(),
     ];
-    for tracked in &row.tracked {
+    for tracked in row.tracked(app_state) {
         fields.push(if privacy {
             display_torrent_name(&tracked.torrent_name, true)
         } else {
@@ -1135,7 +1191,7 @@ fn peer_sort_column(app_state: &AppState) -> Option<PeerColumnId> {
         .and_then(|index| peer_columns().get(index).map(|column| column.id))
 }
 
-fn sort_peer_rows(app_state: &AppState, rows: &mut [PeerRowModel<'_>]) {
+fn sort_peer_rows(app_state: &AppState, rows: &mut [PeerRowModel]) {
     let column = peer_sort_column(app_state);
     let direction = app_state.ui.peer_management.sort_direction;
     rows.sort_by(|left, right| compare_peer_rows(column, direction, left, right));
@@ -1144,8 +1200,8 @@ fn sort_peer_rows(app_state: &AppState, rows: &mut [PeerRowModel<'_>]) {
 fn compare_peer_rows(
     column: Option<PeerColumnId>,
     direction: SortDirection,
-    left: &PeerRowModel<'_>,
-    right: &PeerRowModel<'_>,
+    left: &PeerRowModel,
+    right: &PeerRowModel,
 ) -> Ordering {
     let Some(column) = column else {
         return default_peer_order(left, right);
@@ -1181,13 +1237,13 @@ fn compare_peer_rows(
         .then_with(|| left.ip.cmp(&right.ip))
 }
 
-fn default_peer_order(left: &PeerRowModel<'_>, right: &PeerRowModel<'_>) -> Ordering {
+fn default_peer_order(left: &PeerRowModel, right: &PeerRowModel) -> Ordering {
     default_peer_order_values(left, right)
         .reverse()
         .then_with(|| left.ip.cmp(&right.ip))
 }
 
-fn default_peer_order_values(left: &PeerRowModel<'_>, right: &PeerRowModel<'_>) -> Ordering {
+fn default_peer_order_values(left: &PeerRowModel, right: &PeerRowModel) -> Ordering {
     left.is_restricted()
         .cmp(&right.is_restricted())
         .then_with(|| compare_evidence_ratio(left.strongest_evidence(), right.strongest_evidence()))
@@ -1256,7 +1312,7 @@ fn select_peer_index(app_state: &mut AppState, row_count: usize, index: usize) {
     app_state.ui.peer_management.selected_index = next;
 }
 
-fn selected_peer_index(app_state: &AppState, rows: &[PeerRowModel<'_>]) -> Option<usize> {
+fn selected_peer_index(app_state: &AppState, rows: &[PeerRowModel]) -> Option<usize> {
     if rows.is_empty() {
         return None;
     }
@@ -1269,17 +1325,17 @@ fn selected_peer_index(app_state: &AppState, rows: &[PeerRowModel<'_>]) -> Optio
     )
 }
 
-fn selected_peer_row<'a, 'state>(
+fn selected_peer_row<'a>(
     app_state: &AppState,
-    rows: &'a [PeerRowModel<'state>],
-) -> Option<&'a PeerRowModel<'state>> {
+    rows: &'a [PeerRowModel],
+) -> Option<&'a PeerRowModel> {
     selected_peer_index(app_state, rows).and_then(|index| rows.get(index))
 }
 
-fn pinned_peer_detail_row<'a, 'state>(
+fn pinned_peer_detail_row<'a>(
     app_state: &AppState,
-    rows: &'a [PeerRowModel<'state>],
-) -> Option<&'a PeerRowModel<'state>> {
+    rows: &'a [PeerRowModel],
+) -> Option<&'a PeerRowModel> {
     let ip = app_state.ui.peer_management.details_peer_ip?;
     rows.iter().find(|row| row.ip == ip)
 }
@@ -1344,14 +1400,13 @@ fn tracked_peer_detail_line_count(peer: &PeerManagerTrackedPeer) -> usize {
     }
 }
 
-fn matching_detail_torrents<'peer>(
-    app_state: &AppState,
-    row: &PeerRowModel<'peer>,
-) -> Vec<&'peer PeerManagerTrackedPeer> {
+fn matching_detail_torrents<'a>(
+    app_state: &'a AppState,
+    row: &PeerRowModel,
+) -> Vec<&'a PeerManagerTrackedPeer> {
     let matcher = PeerSearchMatcher::details(app_state);
-    row.tracked
-        .iter()
-        .copied()
+    row.tracked(app_state)
+        .into_iter()
         .filter(|peer| {
             matcher.matches(&display_torrent_name(
                 &peer.torrent_name,
@@ -1361,9 +1416,9 @@ fn matching_detail_torrents<'peer>(
         .collect()
 }
 
-fn peer_detail_line_count(app_state: &AppState, row: &PeerRowModel<'_>) -> usize {
+fn peer_detail_line_count(app_state: &AppState, row: &PeerRowModel) -> usize {
     let header_and_policy = if row.restriction.is_some() { 8 } else { 4 };
-    if row.tracked.is_empty() {
+    if row.tracked_indices.is_empty() {
         return header_and_policy + 2;
     }
     let matching = matching_detail_torrents(app_state, row);
@@ -1379,12 +1434,12 @@ fn peer_detail_line_count(app_state: &AppState, row: &PeerRowModel<'_>) -> usize
         + matching.len().saturating_sub(1)
 }
 
-fn peer_details_max_scroll_at(app_state: &AppState, now: SystemTime) -> usize {
+fn peer_details_max_scroll_at(app_state: &AppState, _now: SystemTime) -> usize {
     let Some(area) = peer_details_area_for_state(app_state) else {
         return 0;
     };
-    let rows = build_peer_rows_at(app_state, now);
-    let Some(row) = pinned_peer_detail_row(app_state, &rows) else {
+    let Some(row) = pinned_peer_detail_row(app_state, &app_state.peer_management_derived.rows)
+    else {
         return 0;
     };
     let line_count = peer_detail_line_count(app_state, row);
@@ -1622,7 +1677,7 @@ fn search_error(query: &str, mode: SearchMode) -> Option<String> {
 fn draw_peer_table(
     f: &mut Frame,
     app_state: &AppState,
-    rows: &[PeerRowModel<'_>],
+    rows: &[PeerRowModel],
     area: Rect,
     now: SystemTime,
     ctx: &ThemeContext,
@@ -1640,22 +1695,13 @@ fn draw_peer_table(
                 let column = &columns[*index];
                 let is_selected = *index == selected_column;
                 let is_sorting = app_state.ui.peer_management.sort_column_index == Some(*index);
-                let mut style =
-                    ctx.apply(Style::default().fg(peer_column_header_color(column.id, ctx)));
-                if is_sorting {
-                    style = style.bold();
-                }
-                if is_selected {
-                    style = ctx.apply(style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED));
-                }
-                let mut spans = vec![Span::styled(column.header, style)];
-                if is_sorting {
-                    spans.push(Span::styled(
-                        peer_sort_arrow(app_state.ui.peer_management.sort_direction),
-                        style,
-                    ));
-                }
-                Cell::from(Line::from(spans))
+                Cell::from(Line::from(peer_column_header_spans(
+                    column,
+                    is_selected,
+                    is_sorting,
+                    app_state.ui.peer_management.sort_direction,
+                    ctx,
+                )))
             })
             .collect::<Vec<_>>(),
     );
@@ -1704,6 +1750,29 @@ fn draw_peer_table(
     }
 }
 
+fn peer_column_header_spans(
+    column: &PeerColumnDefinition,
+    is_selected: bool,
+    is_sorting: bool,
+    sort_direction: SortDirection,
+    ctx: &ThemeContext,
+) -> Vec<Span<'static>> {
+    let mut style = ctx.apply(Style::default().fg(peer_column_header_color(column.id, ctx)));
+    if is_sorting {
+        style = style.bold();
+    }
+    let label_style = if is_selected {
+        ctx.apply(style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
+    } else {
+        style
+    };
+    let mut spans = vec![Span::styled(column.header, label_style)];
+    if is_sorting {
+        spans.push(Span::styled(peer_sort_arrow(sort_direction), style));
+    }
+    spans
+}
+
 fn peer_row_highlight_style(ctx: &ThemeContext) -> Style {
     ctx.apply(Style::default().fg(ctx.state_warning()).bold())
 }
@@ -1727,7 +1796,7 @@ fn peer_table_viewport(
 
 fn peer_table_row<'a>(
     app_state: &AppState,
-    row: &PeerRowModel<'_>,
+    row: &PeerRowModel,
     visible: &[usize],
     now: SystemTime,
     ctx: &ThemeContext,
@@ -1765,7 +1834,7 @@ fn peer_table_row<'a>(
     })
 }
 
-fn peer_state_style(row: &PeerRowModel<'_>, ctx: &ThemeContext) -> Style {
+fn peer_state_style(row: &PeerRowModel, ctx: &ThemeContext) -> Style {
     if row.is_restricted() {
         ctx.apply(Style::default().fg(ctx.state_error()).bold())
     } else if row.is_active() {
@@ -1794,7 +1863,7 @@ fn peer_sort_arrow(direction: SortDirection) -> &'static str {
     }
 }
 
-fn peer_torrents_label(row: &PeerRowModel<'_>) -> String {
+fn peer_torrents_label(row: &PeerRowModel) -> String {
     let label = row.torrent_count.to_string();
     if fits_column(&label, TORRENTS_COLUMN_WIDTH) {
         label
@@ -1808,11 +1877,11 @@ fn peer_torrents_label(row: &PeerRowModel<'_>) -> String {
 
 fn torrent_name_for_hash<'a>(
     app_state: &'a AppState,
-    row: &PeerRowModel<'a>,
+    row: &PeerRowModel,
     hash: &[u8],
 ) -> Option<&'a str> {
-    row.tracked
-        .iter()
+    row.tracked(app_state)
+        .into_iter()
         .find(|tracked| tracked.torrent_info_hash == hash)
         .map(|tracked| tracked.torrent_name.as_str())
         .or_else(|| {
@@ -1823,7 +1892,7 @@ fn torrent_name_for_hash<'a>(
         })
 }
 
-fn torrent_label_for_hash(app_state: &AppState, row: &PeerRowModel<'_>, hash: &[u8]) -> String {
+fn torrent_label_for_hash(app_state: &AppState, row: &PeerRowModel, hash: &[u8]) -> String {
     let name = torrent_name_for_hash(app_state, row, hash);
     let Some(name) = name else {
         return short_info_hash(hash, app_state.anonymize_torrent_names);
@@ -1834,7 +1903,7 @@ fn torrent_label_for_hash(app_state: &AppState, row: &PeerRowModel<'_>, hash: &[
 fn draw_peer_details(
     f: &mut Frame,
     app_state: &AppState,
-    row: Option<&PeerRowModel<'_>>,
+    row: Option<&PeerRowModel>,
     area: Rect,
     now: SystemTime,
     ctx: &ThemeContext,
@@ -1908,12 +1977,13 @@ fn draw_peer_details(
 
 fn peer_detail_lines(
     app_state: &AppState,
-    row: &PeerRowModel<'_>,
+    row: &PeerRowModel,
     now: SystemTime,
     available_width: u16,
     ctx: &ThemeContext,
 ) -> Vec<Line<'static>> {
     let privacy = app_state.anonymize_torrent_names;
+    let endpoint_count = row.endpoint_count(app_state);
     let mut lines = vec![Line::from(vec![
         Span::styled(
             display_ip(row.ip, privacy),
@@ -1928,8 +1998,8 @@ fn peer_detail_lines(
                 "  •  {} torrent{}  •  {} endpoint{}",
                 row.torrent_count,
                 plural_suffix(row.torrent_count),
-                row.endpoint_count(),
-                plural_suffix(row.endpoint_count())
+                endpoint_count,
+                plural_suffix(endpoint_count)
             ),
             ctx.apply(Style::default().fg(ctx.theme.semantic.subtext1)),
         ),
@@ -1976,7 +2046,7 @@ fn peer_detail_lines(
         )));
     }
 
-    if row.tracked.is_empty() {
+    if row.tracked_indices.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "Tracking history is unavailable for this restored policy entry.",
@@ -1989,7 +2059,7 @@ fn peer_detail_lines(
             &format!(
                 "Per-torrent evidence  •  {} of {}",
                 matching.len(),
-                row.tracked.len()
+                row.tracked_indices.len()
             ),
             ctx,
         ));
@@ -2447,6 +2517,7 @@ mod tests {
             metrics_updates: 1,
             tracked_peers: peers,
         });
+        recompute_peer_management_derived(&mut state, test_now());
         state
     }
 
@@ -2496,8 +2567,8 @@ mod tests {
             .join("\n")
     }
 
-    fn take_peer_row_build_count() -> usize {
-        PEER_ROW_BUILD_COUNT.with(|count| count.replace(0))
+    fn take_peer_derived_recompute_count() -> usize {
+        PEER_DERIVED_RECOMPUTE_COUNT.with(|count| count.replace(0))
     }
 
     #[test]
@@ -2511,7 +2582,7 @@ mod tests {
         let rows = build_peer_rows_at(&state, test_now());
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].tracked.len(), 2);
+        assert_eq!(rows[0].tracked_indices.len(), 2);
         assert_eq!(rows[0].strongest_evidence().observed, 60);
         assert_eq!(rows[0].strongest_evidence().threshold, 100);
         assert_eq!(rows[0].strongest_evidence().compact_label(), "UL 60%");
@@ -2542,7 +2613,7 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ip, live_ip);
-        assert!(rows[0].tracked.is_empty());
+        assert!(rows[0].tracked_indices.is_empty());
         assert!(rows[0].is_restricted());
     }
 
@@ -2735,16 +2806,55 @@ mod tests {
     }
 
     #[test]
-    fn navigation_derives_visible_rows_only_once_per_keypress() {
+    fn navigation_uses_the_existing_projection_without_recomputing() {
         let first = tracked_peer("192.0.2.11", "Cinder Atlas", 6);
         let second = tracked_peer("192.0.2.12", "Quartz Archive", 7);
         let mut state = state_with_peers(vec![first, second]);
-        take_peer_row_build_count();
+        take_peer_derived_recompute_count();
 
         reduce_peer_management_action(&mut state, PeerManagementAction::MoveDown);
 
-        assert_eq!(take_peer_row_build_count(), 1);
+        assert_eq!(take_peer_derived_recompute_count(), 0);
         assert_eq!(state.ui.peer_management.selected_index, 1);
+    }
+
+    #[test]
+    fn filter_changes_recompute_the_projection_once() {
+        let mut active = tracked_peer("192.0.2.11", "Cinder Atlas", 6);
+        active.is_active = true;
+        let recent = tracked_peer("192.0.2.12", "Quartz Archive", 7);
+        let mut state = state_with_peers(vec![active, recent]);
+        take_peer_derived_recompute_count();
+
+        reduce_peer_management_action(&mut state, PeerManagementAction::FilterNext);
+
+        assert_eq!(take_peer_derived_recompute_count(), 1);
+        assert_eq!(state.peer_management_derived.rows.len(), 1);
+        assert!(state.peer_management_derived.rows[0].is_active());
+    }
+
+    #[test]
+    fn restriction_expiry_recomputes_only_after_its_deadline() {
+        let mut state = state_with_peers(Vec::new());
+        state.peer_policy = Arc::new(PeerPolicy {
+            restrictions: HashMap::from([(
+                "192.0.2.20".parse().unwrap(),
+                restriction(
+                    test_now() + Duration::from_secs(5),
+                    PeerRestrictionReason::Manual,
+                ),
+            )]),
+        });
+        recompute_peer_management_derived(&mut state, test_now());
+        take_peer_derived_recompute_count();
+
+        refresh_peer_management_expiries(&mut state, test_now() + Duration::from_secs(4));
+        assert_eq!(take_peer_derived_recompute_count(), 0);
+        assert_eq!(state.peer_management_derived.rows.len(), 1);
+
+        refresh_peer_management_expiries(&mut state, test_now() + Duration::from_secs(5));
+        assert_eq!(take_peer_derived_recompute_count(), 1);
+        assert!(state.peer_management_derived.rows.is_empty());
     }
 
     #[test]
@@ -2860,6 +2970,22 @@ mod tests {
             let header = format!("{} ▼", column.header);
             assert!(fits_column(&header, column.min_width), "{header}");
         }
+    }
+
+    #[test]
+    fn selected_sort_header_underlines_only_the_column_label() {
+        let state = state_with_peers(Vec::new());
+        let ctx = ThemeContext::new(state.theme, 0.0);
+        let column = peer_columns()
+            .iter()
+            .find(|column| matches!(column.id, PeerColumnId::Torrents))
+            .expect("torrents column");
+
+        let spans = peer_column_header_spans(column, true, true, SortDirection::Descending, &ctx);
+
+        assert_eq!(spans.len(), 2);
+        assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!spans[1].style.add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

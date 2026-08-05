@@ -7035,6 +7035,7 @@ async fn execute_ui_effect(app: &mut App, effect: UiEffect) {
             app.app_state.mode = AppMode::Journal;
         }
         UiEffect::OpenPeerManagementScreen => {
+            app.refresh_peer_management_screen();
             app.app_state.ui.peer_management.selected_index = 0;
             app.app_state.ui.peer_management.show_details = false;
             app.app_state.ui.peer_management.status_message = None;
