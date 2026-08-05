@@ -68,6 +68,7 @@ pub fn parse_peer_client(peer_id: &[u8]) -> String {
         let client_code = &peer_id[1..3];
         let version = &peer_id[3..7];
         let client_name = match client_code {
+            b"BC" => "BitComet",
             b"TR" => "Transmission",
             b"UT" => "µTorrent",
             b"qB" => "qBittorrent",
@@ -91,7 +92,14 @@ pub fn parse_peer_client(peer_id: &[u8]) -> String {
             .iter()
             .all(|c| c.is_ascii_digit() || *c == b'-')
     {
-        return "BitComet".to_string();
+        let version = String::from_utf8_lossy(&peer_id[1..8])
+            .trim_matches('-')
+            .replace('-', ".");
+        return format!("Mainline {version}");
+    }
+
+    if peer_id.starts_with(b"exbc") && peer_id.len() >= 6 {
+        return format!("BitComet {}.{:02}", peer_id[4], peer_id[5]);
     }
 
     "Unknown".to_string()
@@ -1568,6 +1576,29 @@ mod tests {
     use tokio::time::timeout;
 
     const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn peer_client_parser_distinguishes_peer_id_families() {
+        let m_style = parse_peer_client(b"M4-3-6--abcdefghijkl");
+        let mut classic = b"exbc".to_vec();
+        classic.extend_from_slice(&[1, 2]);
+        classic.extend_from_slice(b"abcdefghijklmn");
+        let classic_style = parse_peer_client(&classic);
+        let dashed_style = parse_peer_client(b"-BC0100-abcdefghijkl");
+
+        assert_ne!(m_style, "Unknown");
+        assert_ne!(classic_style, "Unknown");
+        assert!(m_style.ends_with("4.3.6"));
+        assert!(classic_style.ends_with("1.02"));
+        assert_ne!(
+            m_style.split_whitespace().next(),
+            classic_style.split_whitespace().next()
+        );
+        assert_eq!(
+            classic_style.split_whitespace().next(),
+            dashed_style.split_whitespace().next()
+        );
+    }
 
     fn metrics_with_peer(
         info_hash: &[u8],
