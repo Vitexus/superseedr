@@ -1315,11 +1315,15 @@ impl TorrentState {
                 tx,
             } => {
                 let mut effects = Vec::new();
-                if self
-                    .pending_disconnects
-                    .iter()
-                    .any(|pending_peer_id| pending_peer_id == &peer_id)
-                {
+                let registering_ip = peer_addr.map(|addr| normalize_ip(addr.ip()));
+                let replaces_pending_session =
+                    self.pending_disconnects.iter().any(|pending_peer_id| {
+                        pending_peer_id == &peer_id
+                            || registering_ip.is_some_and(|ip| {
+                                self.peer_ip_by_id.get(pending_peer_id) == Some(&ip)
+                            })
+                    });
+                if replaces_pending_session {
                     effects.extend(self.update(Action::PeerDisconnected {
                         peer_id: String::new(),
                         force: true,
@@ -3342,6 +3346,59 @@ mod tests {
         assert!(effects.iter().any(|effect| {
             matches!(effect, Effect::DisconnectPeerSession { peer_id: disconnected, .. } if disconnected == &peer_id)
         }));
+    }
+
+    #[test]
+    fn rotating_source_ports_flush_pending_disconnects_and_count_reconnects() {
+        let mut state = create_empty_state();
+        let ip = "203.0.113.32";
+        let first_addr: SocketAddr = format!("{ip}:6881").parse().expect("valid peer address");
+        let mut current_peer_id = first_addr.to_string();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        state.update(Action::RegisterPeer {
+            peer_id: current_peer_id.clone(),
+            peer_addr: Some(first_addr),
+            tx: first_tx,
+        });
+
+        for reconnect in 1..=10 {
+            state.update(Action::PeerDisconnected {
+                peer_id: current_peer_id.clone(),
+                force: false,
+            });
+            assert_eq!(state.pending_disconnects, vec![current_peer_id.clone()]);
+
+            let next_addr: SocketAddr = format!("{ip}:{}", 6881 + reconnect)
+                .parse()
+                .expect("valid peer address");
+            let next_peer_id = next_addr.to_string();
+            let (next_tx, _next_rx) = mpsc::channel(1);
+            let effects = state.update(Action::RegisterPeer {
+                peer_id: next_peer_id.clone(),
+                peer_addr: Some(next_addr),
+                tx: next_tx,
+            });
+
+            assert!(state.pending_disconnects.is_empty());
+            assert!(!state.peers.contains_key(&current_peer_id));
+            assert!(state.peers.contains_key(&next_peer_id));
+            assert_eq!(state.peer_active_counts.get(&next_addr.ip()), Some(&1));
+            assert_eq!(
+                state.peer_reconnect_counts.get(&next_addr.ip()),
+                Some(&(reconnect as u64))
+            );
+            assert!(effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    Effect::DisconnectPeerSession {
+                        peer_id: disconnected,
+                        ..
+                    } if disconnected == &current_peer_id
+                )
+            }));
+
+            current_peer_id = next_peer_id;
+        }
     }
 
     #[test]
