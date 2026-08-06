@@ -3100,8 +3100,10 @@ impl PeerState {
     }
 
     pub(crate) fn network_address(&self) -> String {
-        self.peer_addr
-            .map_or_else(|| self.ip_port.clone(), |peer_addr| peer_addr.to_string())
+        self.peer_addr.map_or_else(
+            || self.ip_port.clone(),
+            |peer_addr| format!("{}://{peer_addr}", self.transport_kind),
+        )
     }
 }
 

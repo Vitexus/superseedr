@@ -318,12 +318,12 @@ impl PeerSession {
         if let Some(bitfield) = current_bitfield {
             self.peer_session_established = true;
             let _ = self.writer_tx.try_send(Message::Bitfield(bitfield));
-            let _ = self
-                .torrent_manager_tx
-                .try_send(TorrentCommand::SuccessfullyConnected(
-                    self.peer_ip_port.clone(),
-                ));
         }
+        let _ = self
+            .torrent_manager_tx
+            .try_send(TorrentCommand::SuccessfullyConnected(
+                self.peer_ip_port.clone(),
+            ));
 
         let (peer_msg_tx, mut peer_msg_rx) = mpsc::channel::<Message>(100);
         let reader_shutdown = self.shutdown_tx.subscribe();
@@ -1164,6 +1164,62 @@ mod tests {
                 .expect("cancelled session should close without peer I/O")
                 .expect("read cancelled session output");
         assert_eq!(bytes_read, 0, "cancelled session must not send a handshake");
+    }
+
+    #[tokio::test]
+    async fn metadata_only_session_reports_success_after_valid_handshake() {
+        let (client_socket, mut mock_peer_socket) = duplex(1024);
+        let infinite_bucket = Arc::new(TokenBucket::new(f64::INFINITY, f64::INFINITY));
+        let (manager_tx, mut manager_rx) = mpsc::channel(16);
+        let (_cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let peer_key = "metadata-peer:1337";
+
+        let session = PeerSession::new(PeerSessionParameters {
+            info_hash: [0u8; 20].to_vec(),
+            torrent_metadata_length: None,
+            connection_type: ConnectionType::Outgoing,
+            torrent_manager_rx: cmd_rx,
+            torrent_manager_tx: manager_tx,
+            peer_ip_port: peer_key.to_string(),
+            client_id: b"-SS1013-METADATA0000".to_vec(),
+            global_dl_bucket: infinite_bucket.clone(),
+            global_ul_bucket: infinite_bucket,
+            shutdown_tx: shutdown_tx.clone(),
+            session_cancel: watch::channel(false).1,
+        });
+        let session_task = tokio::spawn(session.run(client_socket, Vec::new(), None));
+
+        let mut handshake = vec![0u8; 68];
+        mock_peer_socket
+            .read_exact(&mut handshake)
+            .await
+            .expect("read outgoing handshake");
+        handshake[48..68].copy_from_slice(b"-SS1013-REMOTEPEER00");
+        mock_peer_socket
+            .write_all(&handshake)
+            .await
+            .expect("write valid handshake response");
+
+        let connected_peer = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match manager_rx.recv().await {
+                    Some(TorrentCommand::SuccessfullyConnected(peer)) => break peer,
+                    Some(_) => continue,
+                    None => panic!("metadata-only session closed its manager channel"),
+                }
+            }
+        })
+        .await
+        .expect("metadata-only session should report handshake success");
+        assert_eq!(connected_peer, peer_key);
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(1), session_task)
+            .await
+            .expect("metadata-only session should stop after shutdown")
+            .expect("metadata-only session task should not panic")
+            .expect("metadata-only session should exit cleanly");
     }
 
     fn build_session_for_extended_message_tests() -> (PeerSession, mpsc::Receiver<TorrentCommand>) {

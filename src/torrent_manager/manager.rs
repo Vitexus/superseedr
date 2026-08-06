@@ -4415,7 +4415,10 @@ mod resource_tests {
         assert!(!manager.state.peers.contains_key(&peer_key));
         assert!(metrics.peers.is_empty());
         assert_eq!(metrics.departed_peers.len(), 1);
-        assert_eq!(metrics.departed_peers[0].address, peer_key);
+        assert_eq!(
+            metrics.departed_peers[0].address,
+            format!("tcp://{peer_addr}")
+        );
         assert_eq!(metrics.departed_peers[0].total_downloaded, 12_345);
         assert_eq!(metrics.departed_peers[0].total_uploaded, 678);
     }
@@ -4456,7 +4459,10 @@ mod resource_tests {
         assert!(manager.state.peers.is_empty());
         assert!(metrics.peers.is_empty());
         assert_eq!(metrics.departed_peers.len(), 1);
-        assert_eq!(metrics.departed_peers[0].address, peer_key);
+        assert_eq!(
+            metrics.departed_peers[0].address,
+            format!("tcp://{peer_addr}")
+        );
         assert_eq!(metrics.departed_peers[0].total_downloaded, 4_096);
         assert_eq!(metrics.departed_peers[0].total_uploaded, 2_048);
     }
@@ -4512,7 +4518,7 @@ mod resource_tests {
         let metrics = metrics_rx.borrow_and_update().clone();
         assert_eq!(metrics.info_hash, manager.state.info_hash);
         assert_eq!(metrics.peers.len(), 1);
-        assert_eq!(metrics.peers[0].address, peer_addr.to_string());
+        assert_eq!(metrics.peers[0].address, format!("tcp://{peer_addr}"));
     }
 
     #[tokio::test]
@@ -4533,6 +4539,10 @@ mod resource_tests {
             peer_addr: Some(peer_addr),
             tx: session_tx,
         });
+        manager.apply_action(Action::PeerTransportSelected {
+            peer_id: peer_id.clone(),
+            transport: PeerTransportKind::Utp,
+        });
         manager.apply_action(Action::PeerSuccessfullyConnected {
             peer_id: peer_id.clone(),
         });
@@ -4544,7 +4554,10 @@ mod resource_tests {
             .expect("active peer observation should be published");
         let active_metrics = metrics_rx.borrow_and_update().clone();
         assert_eq!(active_metrics.peers.len(), 1);
-        assert_eq!(active_metrics.peers[0].address, peer_addr.to_string());
+        assert_eq!(
+            active_metrics.peers[0].address,
+            format!("utp://{peer_addr}")
+        );
         assert_eq!(active_metrics.peers[0].connection_count, 1);
         assert_eq!(active_metrics.peers[0].disconnect_count, 0);
 
@@ -4563,7 +4576,7 @@ mod resource_tests {
         assert_eq!(departed_metrics.departed_peers.len(), 1);
         assert_eq!(
             departed_metrics.departed_peers[0].address,
-            peer_addr.to_string()
+            format!("utp://{peer_addr}")
         );
         assert_eq!(departed_metrics.departed_peers[0].connection_count, 1);
         assert_eq!(departed_metrics.departed_peers[0].disconnect_count, 1);
