@@ -12805,6 +12805,9 @@ mod tests {
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("create app");
+        app.flush_persistence_writer().await;
+        let (persistence_tx, persistence_rx) = watch::channel(None);
+        app.persistence_tx = Some(persistence_tx);
         let bound_port = app
             .listener
             .as_ref()
@@ -12815,7 +12818,6 @@ mod tests {
         fixed_settings.randomize_client_port = false;
 
         app.apply_settings_update(fixed_settings, true).await;
-        app.flush_persistence_writer().await;
 
         assert_eq!(
             app.listener.as_ref().and_then(ListenerSet::local_port),
@@ -12825,9 +12827,12 @@ mod tests {
         assert!(!app.client_configs.randomize_client_port);
         assert!(app.app_state.system_error.is_none());
 
-        let persisted = crate::config::load_settings().expect("reload persisted settings");
-        assert_eq!(persisted.client_port, bound_port);
-        assert!(!persisted.randomize_client_port);
+        let persisted = persistence_rx
+            .borrow()
+            .clone()
+            .expect("settings update should queue persistence");
+        assert_eq!(persisted.settings.client_port, bound_port);
+        assert!(!persisted.settings.randomize_client_port);
 
         let _ = app.shutdown_tx.send(());
     }
@@ -12844,6 +12849,9 @@ mod tests {
         let mut app = App::new(settings, AppRuntimeMode::Normal)
             .await
             .expect("create app");
+        app.flush_persistence_writer().await;
+        let (persistence_tx, persistence_rx) = watch::channel(None);
+        app.persistence_tx = Some(persistence_tx);
         let probe_listener = super::bind_peer_listener(0)
             .await
             .expect("reserve forwarded port");
@@ -12856,7 +12864,6 @@ mod tests {
         std::fs::write(&port_file, forwarded_port.to_string()).expect("write forwarded port file");
 
         app.handle_port_change(port_file).await;
-        app.flush_persistence_writer().await;
 
         assert_eq!(app.client_configs.client_port, forwarded_port);
         assert!(!app.client_configs.randomize_client_port);
@@ -12865,9 +12872,12 @@ mod tests {
             Some(forwarded_port)
         );
 
-        let persisted = crate::config::load_settings().expect("reload persisted settings");
-        assert_eq!(persisted.client_port, forwarded_port);
-        assert!(!persisted.randomize_client_port);
+        let persisted = persistence_rx
+            .borrow()
+            .clone()
+            .expect("forwarded port update should queue persistence");
+        assert_eq!(persisted.settings.client_port, forwarded_port);
+        assert!(!persisted.settings.randomize_client_port);
 
         let _ = app.shutdown_tx.send(());
     }
