@@ -1201,6 +1201,10 @@ pub struct PeerInfo {
     pub upload_speed_bps: u64,
     pub total_downloaded: u64,
     pub total_uploaded: u64,
+    #[serde(default)]
+    pub connection_count: u64,
+    #[serde(default)]
+    pub disconnect_count: u64,
     pub last_action: String,
 }
 
@@ -2231,8 +2235,8 @@ impl Default for PeerManagementUiState {
             is_searching: false,
             search_query: String::new(),
             search_mode: SearchMode::Regex,
-            selected_column_index: 5,
-            sort_column_index: Some(5),
+            selected_column_index: 9,
+            sort_column_index: Some(9),
             sort_direction: SortDirection::Descending,
             show_details: false,
             details_peer_ip: None,
@@ -12435,6 +12439,10 @@ mod tests {
                 endpoints: Vec::new(),
                 downloaded_evidence_bytes: 1_024,
                 uploaded_evidence_bytes: 2_048,
+                total_downloaded_bytes: 1_024,
+                total_uploaded_bytes: 2_048,
+                connection_count: 2,
+                disconnect_count: 1,
                 transfer_threshold_bytes: 256 * 1024 * 1024,
                 reconnect_count: 1,
                 reconnect_limit: 10,

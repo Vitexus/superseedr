@@ -2792,6 +2792,8 @@ impl TorrentManager {
                         peer_id: departed.peer_id.clone(),
                         total_downloaded: departed.total_downloaded,
                         total_uploaded: departed.total_uploaded,
+                        connection_count: departed.connection_count,
+                        disconnect_count: departed.disconnect_count,
                         last_action: "Disconnected".to_string(),
                         ..Default::default()
                     }),
@@ -2919,6 +2921,8 @@ impl TorrentManager {
                     total_uploaded: peer
                         .transfer_base_uploaded
                         .saturating_add(peer.total_bytes_uploaded),
+                    connection_count: peer.connection_count,
+                    disconnect_count: peer.disconnect_count,
                     last_action,
                 }
             })
@@ -4529,6 +4533,9 @@ mod resource_tests {
             peer_addr: Some(peer_addr),
             tx: session_tx,
         });
+        manager.apply_action(Action::PeerSuccessfullyConnected {
+            peer_id: peer_id.clone(),
+        });
         manager.send_metrics(0, 0, Vec::new());
 
         metrics_rx
@@ -4538,6 +4545,8 @@ mod resource_tests {
         let active_metrics = metrics_rx.borrow_and_update().clone();
         assert_eq!(active_metrics.peers.len(), 1);
         assert_eq!(active_metrics.peers[0].address, peer_addr.to_string());
+        assert_eq!(active_metrics.peers[0].connection_count, 1);
+        assert_eq!(active_metrics.peers[0].disconnect_count, 0);
 
         manager.apply_action(Action::PeerDisconnected {
             peer_id,
@@ -4556,6 +4565,8 @@ mod resource_tests {
             departed_metrics.departed_peers[0].address,
             peer_addr.to_string()
         );
+        assert_eq!(departed_metrics.departed_peers[0].connection_count, 1);
+        assert_eq!(departed_metrics.departed_peers[0].disconnect_count, 1);
     }
 
     #[tokio::test]

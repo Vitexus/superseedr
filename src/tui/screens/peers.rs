@@ -82,17 +82,23 @@ enum PeerColumnId {
     Address,
     Torrents,
     Client,
+    Connects,
+    Disconnects,
+    Downloaded,
+    Uploaded,
     Evidence,
     LastSeen,
-    Restriction,
 }
 
-const STATE_COLUMN_WIDTH: u16 = 10;
+const STATE_COLUMN_WIDTH: u16 = 18;
 const TORRENTS_COLUMN_WIDTH: u16 = 10;
+const CONNECTS_COLUMN_WIDTH: u16 = 10;
+const DISCONNECTS_COLUMN_WIDTH: u16 = 13;
+const TRANSFER_COLUMN_WIDTH: u16 = 11;
 const EVIDENCE_COLUMN_WIDTH: u16 = 18;
 const EVIDENCE_CONTENT_WIDTH: u16 = EVIDENCE_COLUMN_WIDTH - 1;
 const LAST_SEEN_COLUMN_WIDTH: u16 = 12;
-const RESTRICTION_COLUMN_WIDTH: u16 = 12;
+const RESTRICTION_REMAINING_WIDTH: u16 = 12;
 
 #[derive(Clone, Debug)]
 struct PeerColumnDefinition {
@@ -176,6 +182,23 @@ fn compact_count(value: u64) -> String {
     value.to_string()
 }
 
+fn compact_transfer_bytes(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 6] = [
+        (1 << 60, "EB"),
+        (1 << 50, "PB"),
+        (1 << 40, "TB"),
+        (1 << 30, "GB"),
+        (1 << 20, "MB"),
+        (1 << 10, "KB"),
+    ];
+    for (threshold, unit) in UNITS {
+        if bytes >= threshold {
+            return format!("{:.2} {unit}", bytes as f64 / threshold as f64);
+        }
+    }
+    format!("{bytes} B")
+}
+
 fn compact_magnitude(value: f64) -> String {
     const UNITS: [(f64, &str); 8] = [
         (1e24, "Y"),
@@ -213,6 +236,10 @@ struct PeerRowModel {
     last_seen: Option<SystemTime>,
     strongest_evidence: PeerEvidence,
     client_label: String,
+    connection_count: u64,
+    disconnect_count: u64,
+    total_downloaded_bytes: u64,
+    total_uploaded_bytes: u64,
 }
 
 impl PeerRowModel {
@@ -231,6 +258,26 @@ impl PeerRowModel {
             "ACTIVE"
         } else {
             "RECENT"
+        }
+    }
+
+    fn state_column_label(&self, now: SystemTime) -> String {
+        let Some(restriction) = &self.restriction else {
+            return self.state_label().to_string();
+        };
+        let remaining = restriction
+            .blocked_until
+            .duration_since(now)
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            return "BLOCKED expired".to_string();
+        }
+        let compact = compact_duration(remaining);
+        let label = format!("BLOCKED {compact}");
+        if fits_column(&label, STATE_COLUMN_WIDTH) {
+            label
+        } else {
+            "BLOCKED >999d".to_string()
         }
     }
 
@@ -716,6 +763,10 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
                 last_seen: None,
                 strongest_evidence: strongest_peer_evidence(&[], None),
                 client_label: String::new(),
+                connection_count: 0,
+                disconnect_count: 0,
+                total_downloaded_bytes: 0,
+                total_uploaded_bytes: 0,
             })
             .tracked_indices
             .push(tracked_index);
@@ -735,6 +786,10 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
             last_seen: None,
             strongest_evidence: strongest_peer_evidence(&[], None),
             client_label: String::new(),
+            connection_count: 0,
+            disconnect_count: 0,
+            total_downloaded_bytes: 0,
+            total_uploaded_bytes: 0,
         });
         if row
             .restriction
@@ -760,6 +815,21 @@ fn build_peer_rows_at(app_state: &AppState, now: SystemTime) -> Vec<PeerRowModel
         row.last_seen = tracked.iter().filter_map(|peer| peer.last_seen).max();
         row.strongest_evidence = strongest_peer_evidence(&tracked, row.restriction.as_ref());
         row.client_label = peer_client_label(&tracked);
+        let (connections, disconnects, downloaded, uploaded) = tracked.iter().fold(
+            (0u64, 0u64, 0u64, 0u64),
+            |(connections, disconnects, downloaded, uploaded), peer| {
+                (
+                    connections.saturating_add(peer.connection_count),
+                    disconnects.saturating_add(peer.disconnect_count),
+                    downloaded.saturating_add(peer.total_downloaded_bytes),
+                    uploaded.saturating_add(peer.total_uploaded_bytes),
+                )
+            },
+        );
+        row.connection_count = connections;
+        row.disconnect_count = disconnects;
+        row.total_downloaded_bytes = downloaded;
+        row.total_uploaded_bytes = uploaded;
     }
 
     rows.retain(|row| peer_matches_filter(row, app_state.ui.peer_management.filter));
@@ -1008,7 +1078,7 @@ fn evidence_ratio_parts(evidence: &PeerEvidence) -> (u128, u128) {
 }
 
 fn peer_columns() -> &'static [PeerColumnDefinition] {
-    static COLUMNS: [PeerColumnDefinition; 7] = [
+    static COLUMNS: [PeerColumnDefinition; 10] = [
         PeerColumnDefinition {
             id: PeerColumnId::State,
             header: "State",
@@ -1038,6 +1108,34 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
             constraint: Constraint::Fill(1),
         },
         PeerColumnDefinition {
+            id: PeerColumnId::Connects,
+            header: "Connects",
+            min_width: CONNECTS_COLUMN_WIDTH,
+            priority: 1,
+            constraint: Constraint::Length(CONNECTS_COLUMN_WIDTH),
+        },
+        PeerColumnDefinition {
+            id: PeerColumnId::Disconnects,
+            header: "Disconnects",
+            min_width: DISCONNECTS_COLUMN_WIDTH,
+            priority: 1,
+            constraint: Constraint::Length(DISCONNECTS_COLUMN_WIDTH),
+        },
+        PeerColumnDefinition {
+            id: PeerColumnId::Downloaded,
+            header: "DL",
+            min_width: TRANSFER_COLUMN_WIDTH,
+            priority: 1,
+            constraint: Constraint::Length(TRANSFER_COLUMN_WIDTH),
+        },
+        PeerColumnDefinition {
+            id: PeerColumnId::Uploaded,
+            header: "UL",
+            min_width: TRANSFER_COLUMN_WIDTH,
+            priority: 1,
+            constraint: Constraint::Length(TRANSFER_COLUMN_WIDTH),
+        },
+        PeerColumnDefinition {
             id: PeerColumnId::Evidence,
             header: "Evidence",
             min_width: EVIDENCE_COLUMN_WIDTH,
@@ -1050,13 +1148,6 @@ fn peer_columns() -> &'static [PeerColumnDefinition] {
             min_width: LAST_SEEN_COLUMN_WIDTH,
             priority: 1,
             constraint: Constraint::Length(LAST_SEEN_COLUMN_WIDTH),
-        },
-        PeerColumnDefinition {
-            id: PeerColumnId::Restriction,
-            header: "Restricted",
-            min_width: RESTRICTION_COLUMN_WIDTH,
-            priority: 1,
-            constraint: Constraint::Length(RESTRICTION_COLUMN_WIDTH),
         },
     ];
     &COLUMNS
@@ -1179,9 +1270,12 @@ fn peer_column_default_direction(column: PeerColumnId) -> SortDirection {
         PeerColumnId::Address | PeerColumnId::Client => SortDirection::Ascending,
         PeerColumnId::State
         | PeerColumnId::Torrents
+        | PeerColumnId::Connects
+        | PeerColumnId::Disconnects
+        | PeerColumnId::Downloaded
+        | PeerColumnId::Uploaded
         | PeerColumnId::Evidence
-        | PeerColumnId::LastSeen
-        | PeerColumnId::Restriction => SortDirection::Descending,
+        | PeerColumnId::LastSeen => SortDirection::Descending,
     }
 }
 
@@ -1208,27 +1302,31 @@ fn compare_peer_rows(
     let Some(column) = column else {
         return default_peer_order(left, right);
     };
-    let ordering = match column {
+    let column_ordering = match column {
         PeerColumnId::State => left.state_sort_rank().cmp(&right.state_sort_rank()),
         PeerColumnId::Address => left.ip.cmp(&right.ip),
         PeerColumnId::Torrents => left.torrent_count.cmp(&right.torrent_count),
         PeerColumnId::Client => left.client_label.cmp(&right.client_label),
+        PeerColumnId::Connects => left.connection_count.cmp(&right.connection_count),
+        PeerColumnId::Disconnects => left.disconnect_count.cmp(&right.disconnect_count),
+        PeerColumnId::Downloaded => left
+            .total_downloaded_bytes
+            .cmp(&right.total_downloaded_bytes),
+        PeerColumnId::Uploaded => left.total_uploaded_bytes.cmp(&right.total_uploaded_bytes),
         PeerColumnId::Evidence => {
             compare_evidence_ratio(left.strongest_evidence(), right.strongest_evidence())
         }
         PeerColumnId::LastSeen => left.last_seen().cmp(&right.last_seen()),
-        PeerColumnId::Restriction => left
-            .restriction
-            .as_ref()
-            .map(|restriction| restriction.blocked_until)
-            .cmp(
-                &right
-                    .restriction
-                    .as_ref()
-                    .map(|restriction| restriction.blocked_until),
-            ),
     };
-    apply_sort_direction(ordering, direction)
+    let ordering = if matches!(column, PeerColumnId::State) {
+        right
+            .is_restricted()
+            .cmp(&left.is_restricted())
+            .then_with(|| apply_sort_direction(column_ordering, direction))
+    } else {
+        apply_sort_direction(column_ordering, direction)
+    };
+    ordering
         .then_with(|| {
             if matches!(column, PeerColumnId::LastSeen) {
                 Ordering::Equal
@@ -1807,23 +1905,25 @@ fn peer_table_row<'a>(
     let cells = visible
         .iter()
         .map(|index| match columns[*index].id {
-            PeerColumnId::State => Cell::from(row.state_label()).style(peer_state_style(row, ctx)),
+            PeerColumnId::State => {
+                Cell::from(row.state_column_label(now)).style(peer_state_style(row, ctx))
+            }
             PeerColumnId::Address => {
                 Cell::from(display_ip(row.ip, app_state.anonymize_torrent_names))
             }
             PeerColumnId::Torrents => Cell::from(peer_torrents_label(row)),
             PeerColumnId::Client => Cell::from(sanitize_text(&row.client_label)),
+            PeerColumnId::Connects => Cell::from(compact_count(row.connection_count)),
+            PeerColumnId::Disconnects => Cell::from(compact_count(row.disconnect_count)),
+            PeerColumnId::Downloaded => {
+                Cell::from(compact_transfer_bytes(row.total_downloaded_bytes))
+            }
+            PeerColumnId::Uploaded => Cell::from(compact_transfer_bytes(row.total_uploaded_bytes)),
             PeerColumnId::Evidence => Cell::from(row.strongest_evidence().compact_label()),
             PeerColumnId::LastSeen => Cell::from(
                 row.last_seen()
                     .map(|last_seen| format_elapsed(now, last_seen))
                     .unwrap_or_else(|| "policy only".to_string()),
-            ),
-            PeerColumnId::Restriction => Cell::from(
-                row.restriction
-                    .as_ref()
-                    .map(|restriction| format_remaining(now, restriction.blocked_until))
-                    .unwrap_or_else(|| "-".to_string()),
             ),
         })
         .collect::<Vec<_>>();
@@ -1852,9 +1952,12 @@ fn peer_column_header_color(column: PeerColumnId, ctx: &ThemeContext) -> Color {
         PeerColumnId::Address => ctx.accent_sky(),
         PeerColumnId::Torrents => ctx.accent_teal(),
         PeerColumnId::Client => ctx.accent_sapphire(),
+        PeerColumnId::Connects => ctx.state_success(),
+        PeerColumnId::Disconnects => ctx.state_warning(),
+        PeerColumnId::Downloaded => ctx.accent_sky(),
+        PeerColumnId::Uploaded => ctx.accent_teal(),
         PeerColumnId::Evidence => ctx.state_warning(),
         PeerColumnId::LastSeen => ctx.state_info(),
-        PeerColumnId::Restriction => ctx.state_error(),
     }
 }
 
@@ -2410,7 +2513,7 @@ fn format_remaining(now: SystemTime, deadline: SystemTime) -> String {
         "expired".to_string()
     } else {
         let label = format!("{} left", compact_duration(remaining));
-        if fits_column(&label, RESTRICTION_COLUMN_WIDTH) {
+        if fits_column(&label, RESTRICTION_REMAINING_WIDTH) {
             label
         } else {
             ">99d left".to_string()
@@ -2496,6 +2599,10 @@ mod tests {
             endpoints: Vec::new(),
             downloaded_evidence_bytes: 0,
             uploaded_evidence_bytes: 0,
+            total_downloaded_bytes: 0,
+            total_uploaded_bytes: 0,
+            connection_count: 0,
+            disconnect_count: 0,
             transfer_threshold_bytes: 100,
             reconnect_count: 0,
             reconnect_limit: 10,
@@ -2577,8 +2684,16 @@ mod tests {
     fn normalized_ip_rows_keep_per_torrent_evidence_separate() {
         let mut first = tracked_peer("192.0.2.10", "Quartz Archive", 1);
         first.uploaded_evidence_bytes = 60;
+        first.connection_count = 2;
+        first.disconnect_count = 1;
+        first.total_downloaded_bytes = 1_024;
+        first.total_uploaded_bytes = 2_048;
         let mut second = tracked_peer("::ffff:192.0.2.10", "Cinder Atlas", 2);
         second.downloaded_evidence_bytes = 55;
+        second.connection_count = 3;
+        second.disconnect_count = 2;
+        second.total_downloaded_bytes = 4_096;
+        second.total_uploaded_bytes = 8_192;
         let state = state_with_peers(vec![first, second]);
 
         let rows = build_peer_rows_at(&state, test_now());
@@ -2588,6 +2703,10 @@ mod tests {
         assert_eq!(rows[0].strongest_evidence().observed, 60);
         assert_eq!(rows[0].strongest_evidence().threshold, 100);
         assert_eq!(rows[0].strongest_evidence().compact_label(), "UL 60%");
+        assert_eq!(rows[0].connection_count, 5);
+        assert_eq!(rows[0].disconnect_count, 3);
+        assert_eq!(rows[0].total_downloaded_bytes, 5_120);
+        assert_eq!(rows[0].total_uploaded_bytes, 10_240);
     }
 
     #[test]
@@ -2669,6 +2788,28 @@ mod tests {
 
         assert_eq!(evidence, "Reconnect 10/10");
         assert!(fits_column(&evidence, EVIDENCE_CONTENT_WIDTH));
+    }
+
+    #[test]
+    fn restricted_peer_countdown_is_combined_into_state() {
+        let ip: IpAddr = "192.0.2.47".parse().unwrap();
+        let mut state = state_with_peers(vec![tracked_peer("192.0.2.47", "Ember Field Notes", 47)]);
+        state.peer_policy = Arc::new(PeerPolicy {
+            restrictions: HashMap::from([(
+                ip,
+                restriction(
+                    test_now() + Duration::from_secs(12 * 60),
+                    PeerRestrictionReason::Manual,
+                ),
+            )]),
+        });
+
+        let rows = build_peer_rows_at(&state, test_now());
+
+        assert_eq!(rows[0].state_column_label(test_now()), "BLOCKED 12m");
+        assert!(!peer_columns()
+            .iter()
+            .any(|column| column.header == "Restricted"));
     }
 
     #[test]
@@ -2961,8 +3102,8 @@ mod tests {
         two_second.last_seen = Some(test_now() - Duration::from_secs(60));
         let state = state_with_peers(vec![two_first, one, two_second]);
 
-        assert_eq!(state.ui.peer_management.selected_column_index, 5);
-        assert_eq!(state.ui.peer_management.sort_column_index, Some(5));
+        assert_eq!(state.ui.peer_management.selected_column_index, 9);
+        assert_eq!(state.ui.peer_management.sort_column_index, Some(9));
         assert_eq!(
             state.ui.peer_management.sort_direction,
             SortDirection::Descending
@@ -2973,6 +3114,38 @@ mod tests {
         assert!(rows[0].is_active());
         assert_eq!(peer_torrents_label(&rows[0]), "1");
         assert_eq!(peer_torrents_label(&rows[1]), "2");
+    }
+
+    #[test]
+    fn state_sort_keeps_blocked_peers_first_in_both_directions() {
+        let blocked_ip: IpAddr = "192.0.2.41".parse().unwrap();
+        let blocked = tracked_peer("192.0.2.41", "Ember Field Notes", 41);
+        let mut active = tracked_peer("192.0.2.42", "Quartz Field Notes", 42);
+        active.is_active = true;
+        let recent = tracked_peer("192.0.2.43", "Copper Field Notes", 43);
+        let mut state = state_with_peers(vec![recent, blocked, active]);
+        state.peer_policy = Arc::new(PeerPolicy {
+            restrictions: HashMap::from([(
+                blocked_ip,
+                restriction(
+                    test_now() + Duration::from_secs(600),
+                    PeerRestrictionReason::Manual,
+                ),
+            )]),
+        });
+        state.ui.peer_management.sort_column_index = peer_columns()
+            .iter()
+            .position(|column| column.id == PeerColumnId::State);
+
+        state.ui.peer_management.sort_direction = SortDirection::Descending;
+        let descending = build_peer_rows_at(&state, test_now());
+        assert_eq!(descending[0].ip, blocked_ip);
+        assert!(descending[1].is_active());
+
+        state.ui.peer_management.sort_direction = SortDirection::Ascending;
+        let ascending = build_peer_rows_at(&state, test_now());
+        assert_eq!(ascending[0].ip, blocked_ip);
+        assert!(!ascending[1].is_active());
     }
 
     #[test]
@@ -3028,6 +3201,16 @@ mod tests {
             assert_eq!(torrents, "999999999+");
         }
 
+        assert!(fits_column(&compact_count(u64::MAX), CONNECTS_COLUMN_WIDTH));
+        assert!(fits_column(
+            &compact_count(u64::MAX),
+            DISCONNECTS_COLUMN_WIDTH
+        ));
+        assert!(fits_column(
+            &compact_transfer_bytes(u64::MAX),
+            TRANSFER_COLUMN_WIDTH
+        ));
+
         let reconnect = PeerEvidence {
             kind: EvidenceKind::Reconnect,
             observed: u64::MAX,
@@ -3055,7 +3238,7 @@ mod tests {
 
         let restricted = format_remaining(now, now + Duration::from_secs(1_000_000 * 86_400));
         assert_eq!(restricted, ">99d left");
-        assert!(fits_column(&restricted, RESTRICTION_COLUMN_WIDTH));
+        assert!(fits_column(&restricted, RESTRICTION_REMAINING_WIDTH));
 
         for column in peer_columns()
             .iter()
@@ -3325,7 +3508,7 @@ mod tests {
 
     #[test]
     fn wide_table_splits_remaining_space_evenly_between_address_and_client() {
-        let (constraints, visible) = compute_visible_peer_management_columns(140);
+        let (constraints, visible) = compute_visible_peer_management_columns(160);
         let columns = peer_columns();
         let constraint_for = |column_id| {
             visible
@@ -3342,6 +3525,21 @@ mod tests {
             constraint_for(PeerColumnId::Client),
             Some(Constraint::Fill(1))
         );
+    }
+
+    #[test]
+    fn standard_table_exposes_all_peer_activity_columns() {
+        let (_, visible) = compute_visible_peer_management_columns(140);
+        let columns = peer_columns();
+        let ids = visible
+            .into_iter()
+            .map(|index| columns[index].id)
+            .collect::<Vec<_>>();
+
+        assert!(ids.contains(&PeerColumnId::Connects));
+        assert!(ids.contains(&PeerColumnId::Disconnects));
+        assert!(ids.contains(&PeerColumnId::Downloaded));
+        assert!(ids.contains(&PeerColumnId::Uploaded));
     }
 
     #[test]

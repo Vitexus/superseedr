@@ -339,6 +339,8 @@ pub(crate) struct DepartedPeerTransfer {
     pub peer_id: Vec<u8>,
     pub total_downloaded: u64,
     pub total_uploaded: u64,
+    pub connection_count: u64,
+    pub disconnect_count: u64,
     departed_at: Instant,
 }
 
@@ -559,6 +561,8 @@ impl TorrentState {
                 peer_id: peer.peer_id.clone(),
                 total_downloaded: 0,
                 total_uploaded: 0,
+                connection_count: 0,
+                disconnect_count: 0,
                 departed_at,
             });
         if !peer.peer_id.is_empty() {
@@ -566,6 +570,8 @@ impl TorrentState {
         }
         pending.total_downloaded = pending.total_downloaded.max(total_downloaded);
         pending.total_uploaded = pending.total_uploaded.max(total_uploaded);
+        pending.connection_count = pending.connection_count.max(peer.connection_count);
+        pending.disconnect_count = pending.disconnect_count.max(peer.disconnect_count);
         pending.departed_at = departed_at;
         self.maintain_peer_reconnect_baselines();
     }
@@ -1333,6 +1339,8 @@ impl TorrentState {
                 if let Some(pending) = self.pending_departed_peer_transfers.remove(&peer_id) {
                     peer_state.transfer_base_downloaded = pending.total_downloaded;
                     peer_state.transfer_base_uploaded = pending.total_uploaded;
+                    peer_state.connection_count = pending.connection_count;
+                    peer_state.disconnect_count = pending.disconnect_count;
                 }
                 if let Some(peer_addr) = peer_addr {
                     self.record_peer_registration(&peer_id, peer_addr);
@@ -1356,6 +1364,13 @@ impl TorrentState {
             // --- Peer Lifecycle Actions ---
             Action::PeerSuccessfullyConnected { peer_id } => {
                 self.timed_out_peers.remove(&peer_id);
+
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    if !peer.successfully_connected {
+                        peer.successfully_connected = true;
+                        peer.connection_count = peer.connection_count.saturating_add(1);
+                    }
+                }
 
                 if !self.has_made_first_connection {
                     self.has_made_first_connection = true;
@@ -1388,8 +1403,12 @@ impl TorrentState {
                 self.last_activity = TorrentActivity::ProcessingPeers(self.peers.len());
 
                 for pid in batch {
-                    if let Some(removed_peer) = self.peers.remove(&pid) {
+                    if let Some(mut removed_peer) = self.peers.remove(&pid) {
                         self.record_peer_removal(&pid);
+                        if removed_peer.successfully_connected {
+                            removed_peer.disconnect_count =
+                                removed_peer.disconnect_count.saturating_add(1);
+                        }
                         self.record_departed_peer_transfer(&removed_peer);
                         for piece_index in removed_peer.pending_requests {
                             if self.piece_manager.bitfield.get(piece_index as usize)
@@ -3007,6 +3026,9 @@ pub fn calculate_deletion_lists(
 pub struct PeerState {
     pub ip_port: String,
     pub peer_addr: Option<SocketAddr>,
+    pub successfully_connected: bool,
+    pub connection_count: u64,
+    pub disconnect_count: u64,
     pub transport_kind: PeerTransportKind,
     pub peer_id: Vec<u8>,
     pub bitfield: Vec<bool>,
@@ -3043,6 +3065,9 @@ impl PeerState {
         Self {
             ip_port,
             peer_addr: None,
+            successfully_connected: false,
+            connection_count: 0,
+            disconnect_count: 0,
             transport_kind: PeerTransportKind::Tcp,
             peer_id: Vec::new(),
             bitfield: Vec::new(),
@@ -3318,6 +3343,55 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_counts_track_connected_sessions_and_exclude_pause_teardown() {
+        let mut state = create_empty_state();
+        let peer_addr: SocketAddr = "203.0.113.31:6881".parse().expect("valid peer address");
+        let peer_id = peer_addr.to_string();
+        let (first_tx, _first_rx) = mpsc::channel(1);
+        state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: Some(peer_addr),
+            tx: first_tx,
+        });
+
+        state.update(Action::PeerSuccessfullyConnected {
+            peer_id: peer_id.clone(),
+        });
+        state.update(Action::PeerSuccessfullyConnected {
+            peer_id: peer_id.clone(),
+        });
+        assert_eq!(state.peers[&peer_id].connection_count, 1);
+
+        state.update(Action::PeerDisconnected {
+            peer_id: peer_id.clone(),
+            force: true,
+        });
+        let departed = state
+            .pending_departed_peer_transfers
+            .get(&peer_id)
+            .expect("departed session totals");
+        assert_eq!(departed.connection_count, 1);
+        assert_eq!(departed.disconnect_count, 1);
+
+        let (second_tx, _second_rx) = mpsc::channel(1);
+        state.update(Action::RegisterPeer {
+            peer_id: peer_id.clone(),
+            peer_addr: Some(peer_addr),
+            tx: second_tx,
+        });
+        state.update(Action::PeerSuccessfullyConnected { peer_id });
+        assert_eq!(state.peers[&peer_addr.to_string()].connection_count, 2);
+
+        state.update(Action::Pause);
+        let paused = state
+            .pending_departed_peer_transfers
+            .get(&peer_addr.to_string())
+            .expect("paused session totals");
+        assert_eq!(paused.connection_count, 2);
+        assert_eq!(paused.disconnect_count, 1);
+    }
+
+    #[test]
     fn pause_resume_cycles_do_not_create_reconnect_evidence() {
         let mut state = create_empty_state();
         let peer_addr: SocketAddr = "203.0.113.29:6881".parse().expect("valid peer address");
@@ -3439,6 +3513,8 @@ mod tests {
                     peer_id: Vec::new(),
                     total_downloaded: 0,
                     total_uploaded: 0,
+                    connection_count: 0,
+                    disconnect_count: 0,
                     departed_at: state.now,
                 },
             );

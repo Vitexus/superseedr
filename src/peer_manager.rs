@@ -35,6 +35,8 @@ const MAX_POLICY_RESTRICTIONS: usize = 1_000_000;
 const MAX_PEER_HISTORIES: usize = 1_000_000;
 const MAX_POLICY_FILE_BYTES: u64 = 1024 * 1024 * 1024;
 const PERSISTENCE_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(20 * 60);
+const SUPERSEEDR_CLIENT_CODE: &[u8; 2] = b"SS";
+const SUPERSEEDR_CLIENT_NAME: &str = "Superseedr";
 
 type InfoHash = Vec<u8>;
 
@@ -59,6 +61,57 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
     }
 }
 
+fn encode_superseedr_peer_version(major: u64, minor: u64, patch: u64) -> Option<String> {
+    (major <= 9 && minor <= 9 && patch <= 99).then(|| format!("{major}{minor}{patch:02}"))
+}
+
+fn superseedr_peer_version_code() -> String {
+    let major = env!("CARGO_PKG_VERSION_MAJOR")
+        .parse()
+        .expect("Cargo package major version must be numeric");
+    let minor = env!("CARGO_PKG_VERSION_MINOR")
+        .parse()
+        .expect("Cargo package minor version must be numeric");
+    let patch = env!("CARGO_PKG_VERSION_PATCH")
+        .parse()
+        .expect("Cargo package patch version must be numeric");
+    encode_superseedr_peer_version(major, minor, patch)
+        .expect("Superseedr peer IDs support major/minor <= 9 and patch <= 99")
+}
+
+pub(crate) fn superseedr_peer_id_prefix() -> String {
+    format!(
+        "-{}{}-",
+        String::from_utf8_lossy(SUPERSEEDR_CLIENT_CODE),
+        superseedr_peer_version_code()
+    )
+}
+
+pub(crate) fn refresh_superseedr_peer_id_version(client_id: &str) -> Option<String> {
+    let bytes = client_id.as_bytes();
+    let is_superseedr_peer_id = bytes.len() == 20
+        && bytes.first() == Some(&b'-')
+        && bytes.get(1..3) == Some(SUPERSEEDR_CLIENT_CODE.as_slice())
+        && bytes.get(7) == Some(&b'-');
+    if !is_superseedr_peer_id {
+        return None;
+    }
+
+    let prefix = superseedr_peer_id_prefix();
+    (!client_id.starts_with(&prefix)).then(|| format!("{prefix}{}", &client_id[8..]))
+}
+
+fn format_superseedr_peer_version(version: &[u8]) -> String {
+    if version.len() == 4 && version.iter().all(u8::is_ascii_digit) {
+        let major = version[0] - b'0';
+        let minor = version[1] - b'0';
+        let patch = (version[2] - b'0') * 10 + (version[3] - b'0');
+        format!("{major}.{minor}.{patch}")
+    } else {
+        String::from_utf8_lossy(version).into_owned()
+    }
+}
+
 pub fn parse_peer_client(peer_id: &[u8]) -> String {
     if peer_id.len() < 8 {
         return "Unknown".to_string();
@@ -67,6 +120,12 @@ pub fn parse_peer_client(peer_id: &[u8]) -> String {
     if peer_id[0] == b'-' && peer_id[7] == b'-' {
         let client_code = &peer_id[1..3];
         let version = &peer_id[3..7];
+        if client_code == SUPERSEEDR_CLIENT_CODE {
+            return format!(
+                "{SUPERSEEDR_CLIENT_NAME} {}",
+                format_superseedr_peer_version(version)
+            );
+        }
         let client_name = match client_code {
             b"BC" => "BitComet",
             b"TR" => "Transmission",
@@ -278,6 +337,8 @@ fn load_peer_policy_from_path_at_limit(
 struct EndpointTransferTotals {
     downloaded: u64,
     uploaded: u64,
+    connection_count: u64,
+    disconnect_count: u64,
 }
 
 #[derive(Debug, Default)]
@@ -288,6 +349,10 @@ struct PeerTorrentHistory {
     endpoint_transfers: HashMap<String, EndpointTransferTotals>,
     downloaded_bytes: u64,
     uploaded_bytes: u64,
+    total_downloaded_bytes: u64,
+    total_uploaded_bytes: u64,
+    connection_count: u64,
+    disconnect_count: u64,
     reconnects: VecDeque<SystemTime>,
     last_seen: Option<SystemTime>,
     clients: BTreeSet<String>,
@@ -309,6 +374,10 @@ pub struct PeerManagerTrackedPeer {
     pub endpoints: Vec<PeerManagerEndpointView>,
     pub downloaded_evidence_bytes: u64,
     pub uploaded_evidence_bytes: u64,
+    pub total_downloaded_bytes: u64,
+    pub total_uploaded_bytes: u64,
+    pub connection_count: u64,
+    pub disconnect_count: u64,
     pub transfer_threshold_bytes: u64,
     pub reconnect_count: u32,
     pub reconnect_limit: u32,
@@ -347,6 +416,8 @@ impl PeerTorrentHistory {
                     .is_some_and(|previous| {
                         totals.downloaded < previous.downloaded
                             || totals.uploaded < previous.uploaded
+                            || totals.connection_count < previous.connection_count
+                            || totals.disconnect_count < previous.disconnect_count
                     })
             });
         if is_present
@@ -377,8 +448,23 @@ impl PeerTorrentHistory {
             } else {
                 totals.uploaded
             };
+            let connection_delta = if totals.connection_count >= previous.connection_count {
+                totals.connection_count - previous.connection_count
+            } else {
+                totals.connection_count
+            };
+            let disconnect_delta = if totals.disconnect_count >= previous.disconnect_count {
+                totals.disconnect_count - previous.disconnect_count
+            } else {
+                totals.disconnect_count
+            };
             self.downloaded_bytes = self.downloaded_bytes.saturating_add(downloaded_delta);
             self.uploaded_bytes = self.uploaded_bytes.saturating_add(uploaded_delta);
+            self.total_downloaded_bytes =
+                self.total_downloaded_bytes.saturating_add(downloaded_delta);
+            self.total_uploaded_bytes = self.total_uploaded_bytes.saturating_add(uploaded_delta);
+            self.connection_count = self.connection_count.saturating_add(connection_delta);
+            self.disconnect_count = self.disconnect_count.saturating_add(disconnect_delta);
         }
         self.endpoint_transfers = endpoint_transfers;
         if !clients.is_empty() {
@@ -467,7 +553,6 @@ impl PeerPolicyReducer {
             let total = reconnect_counts.entry(normalize_ip(*ip)).or_default();
             *total = total.saturating_add(*count);
         }
-
         for (peer, is_active) in metrics
             .peers
             .iter()
@@ -490,6 +575,8 @@ impl PeerPolicyReducer {
             let totals = endpoint_transfers.entry(peer.address.clone()).or_default();
             totals.downloaded = totals.downloaded.max(peer.total_downloaded);
             totals.uploaded = totals.uploaded.max(peer.total_uploaded);
+            totals.connection_count = totals.connection_count.max(peer.connection_count);
+            totals.disconnect_count = totals.disconnect_count.max(peer.disconnect_count);
         }
 
         let transfer_limit = transfer_abuse_limit(metrics.total_size);
@@ -632,6 +719,10 @@ impl PeerPolicyReducer {
                     endpoints,
                     downloaded_evidence_bytes: history.downloaded_bytes,
                     uploaded_evidence_bytes: history.uploaded_bytes,
+                    total_downloaded_bytes: history.total_downloaded_bytes,
+                    total_uploaded_bytes: history.total_uploaded_bytes,
+                    connection_count: history.connection_count,
+                    disconnect_count: history.disconnect_count,
                     transfer_threshold_bytes,
                     reconnect_count: history.reconnects.len() as u32,
                     reconnect_limit: RECONNECT_LIMIT as u32,
@@ -1600,6 +1691,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn peer_client_parser_recognizes_superseedr_versions() {
+        let legacy = parse_peer_client(b"-SS1000-abcdefghijkl");
+        let current_peer_id = format!("{}abcdefghijkl", superseedr_peer_id_prefix());
+        let current = parse_peer_client(current_peer_id.as_bytes());
+
+        assert_eq!(legacy, format!("{SUPERSEEDR_CLIENT_NAME} 1.0.0"));
+        assert_eq!(
+            current,
+            format!(
+                "{SUPERSEEDR_CLIENT_NAME} {}.{}.{}",
+                env!("CARGO_PKG_VERSION_MAJOR"),
+                env!("CARGO_PKG_VERSION_MINOR"),
+                env!("CARGO_PKG_VERSION_PATCH")
+            )
+        );
+    }
+
+    #[test]
+    fn package_version_drives_superseedr_peer_id_prefix() {
+        assert_eq!(
+            encode_superseedr_peer_version(1, 0, 13).as_deref(),
+            Some("1013")
+        );
+        assert_eq!(
+            superseedr_peer_id_prefix(),
+            format!("-SS{}-", superseedr_peer_version_code())
+        );
+        assert!(encode_superseedr_peer_version(10, 0, 0).is_none());
+        assert!(encode_superseedr_peer_version(1, 10, 0).is_none());
+        assert!(encode_superseedr_peer_version(1, 0, 100).is_none());
+    }
+
+    #[test]
+    fn refreshing_superseedr_peer_id_updates_only_the_version_prefix() {
+        let old = "-SS1000-abcdefghijkl";
+        let refreshed = refresh_superseedr_peer_id_version(old).unwrap_or_else(|| old.to_string());
+
+        assert_eq!(refreshed.len(), 20);
+        assert!(refreshed.starts_with(&superseedr_peer_id_prefix()));
+        assert!(refreshed.ends_with("abcdefghijkl"));
+        assert_eq!(refresh_superseedr_peer_id_version(&refreshed), None);
+        assert_eq!(refresh_superseedr_peer_id_version("custom-client-id"), None);
+    }
+
     fn metrics_with_peer(
         info_hash: &[u8],
         total_size: u64,
@@ -2103,6 +2239,8 @@ mod tests {
         );
         metrics.torrent_name = "Nebula Archive".to_string();
         metrics.peers[0].peer_id = b"-ZZ1234-abcdefghijkl".to_vec();
+        metrics.peers[0].connection_count = 2;
+        metrics.peers[0].disconnect_count = 1;
         let mut reducer = PeerPolicyReducer::default();
 
         assert!(!reducer.reduce_metrics(&info_hash, &metrics, now));
@@ -2119,6 +2257,10 @@ mod tests {
         assert!(tracked.is_active);
         assert_eq!(tracked.downloaded_evidence_bytes, 64 * MIB);
         assert_eq!(tracked.uploaded_evidence_bytes, 32 * MIB);
+        assert_eq!(tracked.total_downloaded_bytes, 64 * MIB);
+        assert_eq!(tracked.total_uploaded_bytes, 32 * MIB);
+        assert_eq!(tracked.connection_count, 2);
+        assert_eq!(tracked.disconnect_count, 1);
         assert_eq!(tracked.transfer_threshold_bytes, 256 * MIB);
         assert_eq!(tracked.reconnect_count, 0);
         assert_eq!(tracked.reconnect_limit, RECONNECT_LIMIT as u32);
@@ -2145,6 +2287,10 @@ mod tests {
         assert_eq!(tracked.last_seen, Some(now));
         assert_eq!(tracked.downloaded_evidence_bytes, 64 * MIB);
         assert_eq!(tracked.uploaded_evidence_bytes, 32 * MIB);
+        assert_eq!(tracked.total_downloaded_bytes, 64 * MIB);
+        assert_eq!(tracked.total_uploaded_bytes, 32 * MIB);
+        assert_eq!(tracked.connection_count, 2);
+        assert_eq!(tracked.disconnect_count, 1);
         assert_eq!(tracked.clients, vec!["Unknown (ZZ1234)".to_string()]);
     }
 
