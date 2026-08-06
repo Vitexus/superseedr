@@ -15,7 +15,7 @@ use crate::tui::screen_context::ScreenContext;
 use crate::tui::screens::input_panel::draw_prompt_panel;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
-use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEventKind};
+use ratatui::crossterm::event::{Event as CrosstermEvent, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Alignment, Constraint, Rect};
 use ratatui::prelude::{Color, Frame, Line, Modifier, Span, Style};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState};
@@ -391,11 +391,7 @@ pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
     let CrosstermEvent::Key(key) = event else {
         return;
     };
-    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-        return;
-    }
-
-    let Some(action) = map_key_to_peer_management_action(key.code, app_state) else {
+    let Some(action) = map_key_event_to_peer_management_action(key, app_state) else {
         return;
     };
     let result = reduce_peer_management_action(app_state, action);
@@ -403,6 +399,50 @@ pub fn handle_event(event: CrosstermEvent, app_state: &mut AppState) {
         app_state.ui.needs_redraw = true;
     }
     execute_peer_management_effects(app_state, result.effects);
+}
+
+fn map_key_event_to_peer_management_action(
+    key: KeyEvent,
+    app_state: &AppState,
+) -> Option<PeerManagementAction> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+
+    let action = map_key_to_peer_management_action(key.code, app_state)?;
+    if matches!(key.kind, KeyEventKind::Repeat)
+        && (!peer_management_action_allows_repeat(&action)
+            || matches!(
+                action,
+                PeerManagementAction::SearchInsert('/')
+                    | PeerManagementAction::DetailsSearchInsert('/')
+            ))
+    {
+        return None;
+    }
+    Some(action)
+}
+
+fn peer_management_action_allows_repeat(action: &PeerManagementAction) -> bool {
+    matches!(
+        action,
+        PeerManagementAction::MoveUp
+            | PeerManagementAction::MoveDown
+            | PeerManagementAction::MovePageUp
+            | PeerManagementAction::MovePageDown
+            | PeerManagementAction::MoveFirst
+            | PeerManagementAction::MoveLast
+            | PeerManagementAction::MoveColumnLeft
+            | PeerManagementAction::MoveColumnRight
+            | PeerManagementAction::SearchInsert(_)
+            | PeerManagementAction::SearchBackspace
+            | PeerManagementAction::ScrollDetailsUp
+            | PeerManagementAction::ScrollDetailsDown
+            | PeerManagementAction::ScrollDetailsPageUp
+            | PeerManagementAction::ScrollDetailsPageDown
+            | PeerManagementAction::DetailsSearchInsert(_)
+            | PeerManagementAction::DetailsSearchBackspace
+    )
 }
 
 fn map_key_to_peer_management_action(
@@ -2571,7 +2611,7 @@ mod tests {
     use super::*;
     use crate::peer_manager::{PeerManagerEndpointView, PeerManagerView, PeerPolicy};
     use ratatui::backend::TestBackend;
-    use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::KeyModifiers;
     use ratatui::Terminal;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2637,6 +2677,50 @@ mod tests {
             torrent_info_hash: None,
             reason,
         }
+    }
+
+    #[test]
+    fn repeat_events_are_limited_to_navigation_and_text_editing() {
+        let mut state = state_with_peers(vec![tracked_peer("192.0.2.31", "Amber Field Notes", 31)]);
+
+        for code in [
+            KeyCode::Char('s'),
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Char('/'),
+            KeyCode::Char('x'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+        ] {
+            let repeat = KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Repeat);
+            assert_eq!(
+                map_key_event_to_peer_management_action(repeat, &state),
+                None,
+                "repeat should be ignored for {code:?}"
+            );
+        }
+
+        let navigation_repeat =
+            KeyEvent::new_with_kind(KeyCode::Down, KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert_eq!(
+            map_key_event_to_peer_management_action(navigation_repeat, &state),
+            Some(PeerManagementAction::MoveDown)
+        );
+
+        reduce_peer_management_action(&mut state, PeerManagementAction::StartSearch);
+        let text_repeat =
+            KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert_eq!(
+            map_key_event_to_peer_management_action(text_repeat, &state),
+            Some(PeerManagementAction::SearchInsert('a'))
+        );
+
+        let slash_repeat =
+            KeyEvent::new_with_kind(KeyCode::Char('/'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        assert_eq!(
+            map_key_event_to_peer_management_action(slash_repeat, &state),
+            None
+        );
     }
 
     fn line_text(line: &Line<'_>) -> String {
