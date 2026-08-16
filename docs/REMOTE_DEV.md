@@ -1,7 +1,7 @@
 # Remote Agentic Development
 
 This document describes how to create a disposable remote development
-environment for Superseedr using an EC2 Spot instance.
+environment for Superseedr using an EC2 instance.
 
 The goal is to make cloud development machines disposable:
 
@@ -26,7 +26,7 @@ The initial tested configuration is:
 |---|---|
 | OS | Debian 13 |
 | Architecture | x86_64 / AMD64 |
-| Purchase option | Spot |
+| Purchase option | On-Demand |
 | Instance type | `m8a.xlarge` |
 | vCPU | 4 |
 | RAM | 16 GiB |

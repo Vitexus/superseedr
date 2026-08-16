@@ -207,12 +207,7 @@ Manual steps remaining:
 
    codex login
 
-3. Restrict credential permissions afterwards:
-
-   chmod -R go-rwx ~/.config/gh 2>/dev/null || true
-   chmod -R go-rwx ~/.codex 2>/dev/null || true
-
-4. Start a persistent Codex session:
+3. Start a persistent Codex session:
 
    cd ~/superseedr
    source .venv/bin/activate
